@@ -68,6 +68,8 @@ type Slot = Arc<OnceLock<Result<Arc<Pcm>, String>>>;
 
 struct Voice {
     key: u64,
+    /// Which media the audio came from.
+    media_key: u64,
     audio: Option<Slot>,
     spec: VoiceSpec,
     t: f64,
@@ -192,7 +194,9 @@ pub struct Player {
     mixer: Arc<Mutex<Mixer>>,
     last_tick: Option<f64>,
     idle_since: Option<f64>,
-    cache: HashMap<u64, Slot>,
+    /// Decoded audio by media key. The entry holds the encoded bytes too, so a key derived from
+    /// their address stays theirs while the entry lives.
+    cache: HashMap<u64, (Bytes, Slot)>,
 }
 
 impl Player {
@@ -214,27 +218,29 @@ impl Player {
     fn slot(&mut self, media_key: u64, bytes: &Bytes) -> Slot {
         if self.cache.len() > 16 {
             // Forget audio no voice uses.
-            let used: Vec<u64> = self.cache.iter().filter(|(_, s)| Arc::strong_count(s) > 1).map(|(k, _)| *k).collect();
+            let used: Vec<u64> = self.cache.iter().filter(|(_, (_, s))| Arc::strong_count(s) > 1).map(|(k, _)| *k).collect();
             self.cache.retain(|k, _| used.contains(k));
         }
-        self.cache
-            .entry(media_key)
-            .or_insert_with(|| {
-                let slot: Slot = Arc::new(OnceLock::new());
-                let (s, b) = (slot.clone(), bytes.clone());
-                let job = move || {
-                    let _ = s.set(crate::audio::decode(&b).map(Arc::new).map_err(|e| e.to_string()));
-                };
-                if crate::THREADS {
-                    if std::thread::Builder::new().name("deckcraft-audio-decode".into()).spawn(job).is_err() {
-                        let _ = slot.set(Err("couldn't start the decoder".into()));
-                    }
-                } else {
-                    job();
-                }
-                slot
-            })
-            .clone()
+        // A key now naming other bytes (the caller reused it) decodes those bytes afresh.
+        if let Some((b, s)) = self.cache.get(&media_key)
+            && Arc::ptr_eq(b, bytes)
+        {
+            return s.clone();
+        }
+        let slot: Slot = Arc::new(OnceLock::new());
+        let (s, b) = (slot.clone(), bytes.clone());
+        let job = move || {
+            let _ = s.set(crate::audio::decode(&b).map(Arc::new).map_err(|e| e.to_string()));
+        };
+        if crate::THREADS {
+            if std::thread::Builder::new().name("deckcraft-audio-decode".into()).spawn(job).is_err() {
+                let _ = slot.set(Err("couldn't start the decoder".into()));
+            }
+        } else {
+            job();
+        }
+        self.cache.insert(media_key, (bytes.clone(), slot.clone()));
+        slot
     }
 
     /// Play voice `key` (a shape) from `from` seconds (default: the trimmed start). Resumes a
@@ -244,7 +250,12 @@ impl Player {
         self.with(|m| {
             if let Some(v) = m.voices.iter_mut().find(|v| v.key == key) {
                 v.spec = spec;
-                if v.audio.is_none() {
+                if v.media_key != media_key {
+                    // Other media now: its own audio, from its own start.
+                    v.media_key = media_key;
+                    v.audio = audio;
+                    v.t = spec.clip.range(v.duration()).0;
+                } else if v.audio.is_none() {
                     v.audio = audio;
                 }
                 if let Some(t) = from {
@@ -255,7 +266,7 @@ impl Player {
                 v.state = PlayState::Playing;
             } else {
                 let t = from.unwrap_or(spec.clip.range(spec.duration).0);
-                m.voices.push(Voice { key, audio, spec, t, state: PlayState::Playing });
+                m.voices.push(Voice { key, media_key, audio, spec, t, state: PlayState::Playing });
             }
         });
         self.ensure_stream();
@@ -459,6 +470,7 @@ mod tests {
         let mut m = Mixer {
             voices: vec![Voice {
                 key: 1,
+                media_key: 1,
                 audio: Some(slot),
                 spec: VoiceSpec { clip, looping: false, duration: 1.0, audio: true },
                 t: 0.0,
@@ -501,5 +513,39 @@ mod tests {
         }
         let pos = p.status(3).map(|s| s.position).unwrap_or(-1.0);
         assert!((pos - 0.1).abs() < 1e-6, "{pos}");
+    }
+
+    #[test]
+    fn replacing_the_media_of_a_voice_replaces_its_audio() {
+        let mut p = Player::new(None);
+        let a: Bytes = Arc::new(b"not audio a".to_vec());
+        let b: Bytes = Arc::new(b"not audio b".to_vec());
+        let mut s = spec(5.0, false);
+        s.audio = true;
+        p.play(1, 10, &a, s, None);
+        assert!(p.wait_loaded(1, std::time::Duration::from_secs(5)));
+        p.tick(0.0);
+        p.tick(0.2);
+        assert!(p.status(1).map(|s| s.position).unwrap_or(0.0) > 0.0);
+        let old = p.with(|m| m.voices.first().and_then(|v| v.audio.clone()));
+        p.play(1, 20, &b, s, None);
+        let new = p.with(|m| m.voices.first().and_then(|v| v.audio.clone()));
+        assert!(matches!((&old, &new), (Some(o), Some(n)) if !Arc::ptr_eq(o, n)));
+        // The new clip plays from its own start.
+        assert_eq!(p.status(1).map(|s| s.position), Some(0.0));
+    }
+
+    #[test]
+    fn a_reused_media_key_with_other_bytes_decodes_them() {
+        let mut p = Player::new(None);
+        let a: Bytes = Arc::new(b"a".to_vec());
+        let b: Bytes = Arc::new(b"b".to_vec());
+        let sa = p.slot(5, &a);
+        let sa2 = p.slot(5, &a);
+        assert!(Arc::ptr_eq(&sa, &sa2));
+        let sb = p.slot(5, &b);
+        assert!(!Arc::ptr_eq(&sa, &sb));
+        // The cache keeps the bytes it was keyed for alive.
+        assert!(p.cache.get(&5).is_some_and(|(k, _)| Arc::ptr_eq(k, &b)));
     }
 }

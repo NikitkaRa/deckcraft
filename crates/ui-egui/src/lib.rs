@@ -991,6 +991,7 @@ impl SlideApp {
 
     /// Media clocks and video textures; the editor's media stops when its slide is left.
     fn tick_media(&mut self, ctx: &egui::Context) {
+        self.media.set_document(self.session.active().map(|d| d.uid));
         if !self.media.any_active() {
             self.session.media_status.clear();
             return;

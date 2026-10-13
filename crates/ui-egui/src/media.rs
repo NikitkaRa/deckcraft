@@ -29,8 +29,12 @@ pub struct MediaHost {
     player: Player,
     owners: HashMap<ShapeId, (Owner, MediaClip)>,
     videos: HashMap<ShapeId, Video>,
-    /// Probed durations by media bytes (for media imported without a probe).
-    durations: HashMap<usize, f64>,
+    /// Probed durations by media bytes (for media imported without a probe). The entry holds the
+    /// bytes, so the address it is keyed by can't be reused by other media while it lives.
+    durations: HashMap<usize, (Bytes, f64)>,
+    /// The document (`DocState::uid`) the voices, videos and GIF clocks belong to: shape ids are
+    /// only unique within one presentation.
+    doc_uid: Option<u64>,
     /// Animated GIF clocks: when each started and, while paused, the time it holds.
     gifs: HashMap<ShapeId, (f64, Option<f64>)>,
 }
@@ -51,13 +55,25 @@ impl Default for MediaHost {
     }
 }
 
+/// Most probed durations kept (each holds its media bytes).
+const MAX_DURATIONS: usize = 16;
+
+type Bytes = Arc<Vec<u8>>;
+
 fn key(id: ShapeId) -> u64 {
     id.0 as u64
 }
 
 impl MediaHost {
     pub fn new(out: Option<Box<dyn AudioOut>>) -> MediaHost {
-        MediaHost { player: Player::new(out), owners: HashMap::new(), videos: HashMap::new(), durations: HashMap::new(), gifs: HashMap::new() }
+        MediaHost {
+            player: Player::new(out),
+            owners: HashMap::new(),
+            videos: HashMap::new(),
+            durations: HashMap::new(),
+            gifs: HashMap::new(),
+            doc_uid: None,
+        }
     }
 
     /// The animated GIF pictures directly on slide `index` at `now`: each plays from when it was
@@ -81,6 +97,34 @@ impl MediaHost {
             }
         }
         out
+    }
+
+    /// Scope playback to the document `uid` (the active one; `None`: no document). Switching to
+    /// another document, or closing the last one, stops everything the previous one played, so a
+    /// shape with the same id in the new deck never inherits its media or GIF clock.
+    pub fn set_document(&mut self, uid: Option<u64>) {
+        if self.doc_uid == uid {
+            return;
+        }
+        self.doc_uid = uid;
+        self.player.stop_all();
+        self.owners.clear();
+        self.videos.clear();
+        self.gifs.clear();
+    }
+
+    /// The probed duration of `bytes` (seconds; 0 when unknown), cached by address.
+    fn duration(&mut self, bytes: &Bytes) -> f64 {
+        let k = Arc::as_ptr(bytes) as usize;
+        if let Some((_, d)) = self.durations.get(&k) {
+            return *d;
+        }
+        if self.durations.len() >= MAX_DURATIONS {
+            self.durations.clear();
+        }
+        let d = deckcraft_media::probe(bytes).map(|i| i.duration()).unwrap_or(0.0);
+        self.durations.insert(k, (bytes.clone(), d));
+        d
     }
 
     /// Replace the audio output (the host injects cpal after start-up).
@@ -118,17 +162,17 @@ impl MediaHost {
         let Some(item) = doc.media(clip.media) else { return };
         let bytes = item.data.clone();
         let media_key = Arc::as_ptr(&bytes) as usize;
-        let duration = if clip.duration_ms > 0 {
-            clip.duration_ms as f64 / 1000.0
-        } else {
-            *self.durations.entry(media_key).or_insert_with(|| deckcraft_media::probe(&bytes).map(|i| i.duration()).unwrap_or(0.0))
-        };
+        let duration = if clip.duration_ms > 0 { clip.duration_ms as f64 / 1000.0 } else { self.duration(&bytes) };
         let spec = VoiceSpec {
             clip: ClipParams::from_ms(clip.trim_start_ms, clip.trim_end_ms, clip.fade_in_ms, clip.fade_out_ms, clip.volume),
             looping: clip.loop_play,
             duration,
             audio: clip.volume > 0.0,
         };
+        // The shape now plays other media (its clip was replaced): start its video over.
+        if self.owners.get(&id).is_some_and(|(_, old)| old.media != clip.media) {
+            self.videos.remove(&id);
+        }
         if clip.video && !self.videos.contains_key(&id) {
             let feed = match VideoFeed::new(bytes.clone()) {
                 Ok(f) => Some(f),
@@ -420,4 +464,49 @@ pub fn control_bar(ui: &mut Ui, rect: Rect, status: Option<&VoiceStatus>, clip: 
         );
     }
     action
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn deck(bytes: &[u8]) -> (Presentation, MediaClip) {
+        let mut doc = Presentation::default();
+        let media = doc.add_media("clip.mp3", "audio/mpeg", bytes.to_vec());
+        (doc, MediaClip { media, duration_ms: 2000, volume: 0.0, ..Default::default() })
+    }
+
+    #[test]
+    fn switching_or_closing_the_document_stops_its_media() {
+        let mut host = MediaHost::default();
+        let (a, clip_a) = deck(b"a");
+        let (b, clip_b) = deck(b"b");
+        let id = ShapeId(3);
+        host.set_document(Some(1));
+        host.play(&a, id, &clip_a, Some(1.0), Owner::Show);
+        assert!(host.is_playing(id));
+        host.set_document(Some(1));
+        assert!(host.is_playing(id), "same document keeps playing");
+        // Another deck with a shape of the same id doesn't inherit deck 1's voice.
+        host.set_document(Some(2));
+        assert!(!host.any_active() && host.status(id).is_none());
+        host.play(&b, id, &clip_b, None, Owner::Show);
+        assert_eq!(host.status(id).map(|s| s.position), Some(0.0));
+        // Closing the last document stops everything, including slide-show voices.
+        host.set_document(None);
+        assert!(!host.any_active() && host.status(id).is_none());
+    }
+
+    #[test]
+    fn probed_durations_hold_their_bytes_and_stay_bounded() {
+        let mut host = MediaHost::default();
+        let first: Bytes = Arc::new(vec![1]);
+        host.duration(&first);
+        assert!(host.durations.get(&(Arc::as_ptr(&first) as usize)).is_some_and(|(b, _)| Arc::ptr_eq(b, &first)));
+        let keep: Vec<Bytes> = (0..40u8).map(|i| Arc::new(vec![i])).collect();
+        for b in &keep {
+            host.duration(b);
+        }
+        assert!(host.durations.len() <= MAX_DURATIONS);
+    }
 }
