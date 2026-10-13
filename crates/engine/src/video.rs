@@ -4,8 +4,8 @@
 //! encoded with DeckCraft's own H.264 encoder ([`deckcraft_h264::Encoder`]: intra-coded changes,
 //! skipped unchanged macroblocks); the sound of the slides' audio and video clips (narration is
 //! recorded as such clips) and of transitions is mixed and encoded as AAC ([`deckcraft_aac`]), or
-//! kept as PCM in a MOV. Everything is muxed by [`deckcraft_isobmff::Mp4Writer`]; no external
-//! tool is needed. Video clips show their poster frame.
+//! kept as PCM in a MOV. Video clips play their pictures (decoded by [`deckcraft_media`]) while
+//! they play. Everything is muxed by [`deckcraft_isobmff::Mp4Writer`]; no external tool is needed.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -87,6 +87,12 @@ pub struct AudioCue {
     pub fade_in: f64,
     pub fade_out: f64,
     pub looped: bool,
+    /// The video clip whose pictures play with this cue: (slide index, shape).
+    pub picture: Option<(usize, ShapeId)>,
+    /// Back to the poster frame when the clip ends.
+    pub rewind: bool,
+    /// The clip's length (0: unknown, play until the pictures run out).
+    pub length: f64,
 }
 
 /// The video's frames and sounds.
@@ -117,7 +123,7 @@ fn secs(ms: u32) -> f64 {
 }
 
 /// The clip a cue plays, from a media shape.
-fn clip_cue(c: &deckcraft_model::MediaClip, start: f64, until: f64) -> AudioCue {
+fn clip_cue(c: &deckcraft_model::MediaClip, index: usize, shape: ShapeId, start: f64, until: f64) -> AudioCue {
     AudioCue {
         media: c.media,
         start,
@@ -128,6 +134,9 @@ fn clip_cue(c: &deckcraft_model::MediaClip, start: f64, until: f64) -> AudioCue 
         fade_in: secs(c.fade_in_ms),
         fade_out: secs(c.fade_out_ms),
         looped: c.loop_play,
+        picture: c.video.then_some((index, shape)),
+        rewind: c.rewind,
+        length: secs(c.duration_ms),
     }
 }
 
@@ -189,6 +198,9 @@ pub fn plan(pres: &Presentation, opts: &VideoOpts) -> Plan {
                         fade_in: 0.0,
                         fade_out: 0.0,
                         looped: false,
+                        picture: None,
+                        rewind: false,
+                        length: 0.0,
                     },
                     false,
                 ));
@@ -209,7 +221,7 @@ pub fn plan(pres: &Presentation, opts: &VideoOpts) -> Plan {
             if let ShapeKind::Media(c) = &sh.kind
                 && c.autoplay
             {
-                cues.push((clip_cue(c, content_start, f64::MAX), !c.play_across_slides));
+                cues.push((clip_cue(c, index, sh.id, content_start, f64::MAX), !c.play_across_slides));
                 started.push(sh.id);
             }
         }
@@ -225,7 +237,7 @@ pub fn plan(pres: &Presentation, opts: &VideoOpts) -> Plan {
                     continue;
                 }
                 if let Some(ShapeKind::Media(c)) = slide.shape(e.shape).map(|s| &s.kind) {
-                    cues.push((clip_cue(c, step_start + e.start.max(0.0), f64::MAX), !c.play_across_slides));
+                    cues.push((clip_cue(c, index, e.shape, step_start + e.start.max(0.0), f64::MAX), !c.play_across_slides));
                     started.push(e.shape);
                 }
             }
@@ -313,15 +325,136 @@ fn state_for(tl: &Timeline, id: ShapeId, step: usize, t: f64) -> ShapeState {
 }
 
 /// Every frame of `steps`, in order, handed to `sink` (RGBA, `w`×`h`). A still or held slide
-/// is rendered once. Stops at the first error `sink` returns.
+/// is rendered once. Stops at the first error `sink` returns. Video clips show their poster.
 pub fn frames(pres: &Presentation, steps: &[Step], (w, h): (u32, u32), sink: &mut dyn FnMut(&[u8]) -> Result<(), String>) -> Result<u64, String> {
-    let animate = !pres.show.without_animation;
-    let mut timelines: HashMap<usize, Arc<Timeline>> = HashMap::new();
-    let mut tl_of =
-        |i: usize| timelines.entry(i).or_insert_with(|| Arc::new(if animate { ShowState::timeline(pres, i) } else { Timeline::default() })).clone();
+    let mut r = Renderer::new(pres, &[], 30, (w, h));
     let mut n: u64 = 0;
     for step in steps {
-        let tl = tl_of(step.index());
+        n = n.saturating_add(r.step(step, sink)?);
+    }
+    Ok(n)
+}
+
+/// A video clip's pictures, decoded in order as the export reaches them.
+struct ClipPictures {
+    dec: deckcraft_media::VideoDecoder,
+    cur: Option<deckcraft_media::Frame>,
+    next: Option<deckcraft_media::Frame>,
+    done: bool,
+}
+
+impl ClipPictures {
+    /// The picture shown `t` seconds into the media (the first one before it starts).
+    fn at(&mut self, t: f64) -> Option<&deckcraft_media::Frame> {
+        const EPS: f64 = 1e-6;
+        if self.cur.as_ref().is_some_and(|c| c.time > t + EPS) {
+            self.dec.seek(t);
+            self.cur = None;
+            self.next = None;
+            self.done = false;
+        }
+        loop {
+            if self.next.is_none() && !self.done {
+                match self.dec.next_frame() {
+                    Ok(Some(f)) => self.next = Some(f),
+                    // The end, or a broken stream: keep the last picture.
+                    Ok(None) | Err(_) => self.done = true,
+                }
+            }
+            match &self.next {
+                Some(n) if n.time <= t + EPS || self.cur.is_none() => {
+                    let late = n.time > t + EPS;
+                    self.cur = self.next.take();
+                    if late {
+                        break;
+                    }
+                }
+                _ => break,
+            }
+        }
+        self.cur.as_ref()
+    }
+}
+
+/// Renders steps in order, knowing where on the video's clock each frame falls so playing
+/// video clips show the right picture.
+struct Renderer<'p> {
+    pres: &'p Presentation,
+    cues: Vec<AudioCue>,
+    fps: u32,
+    size: (u32, u32),
+    /// Frames rendered so far: the clock.
+    at: u64,
+    timelines: HashMap<usize, Arc<Timeline>>,
+    pictures: HashMap<MediaId, Option<ClipPictures>>,
+    warnings: Vec<String>,
+}
+
+impl<'p> Renderer<'p> {
+    fn new(pres: &'p Presentation, cues: &[AudioCue], fps: u32, size: (u32, u32)) -> Self {
+        let cues = cues.iter().filter(|c| c.picture.is_some()).cloned().collect();
+        Renderer { pres, cues, fps: fps.max(1), size, at: 0, timelines: HashMap::new(), pictures: HashMap::new(), warnings: vec![] }
+    }
+
+    /// Where in its media each video clip of slide `index` is at `t` seconds of the video.
+    fn clip_times(&self, index: usize, t: f64) -> Vec<(ShapeId, MediaId, f64)> {
+        let mut out = vec![];
+        for c in &self.cues {
+            let Some((i, shape)) = c.picture else { continue };
+            if i != index || t < c.start || t >= c.until {
+                continue;
+            }
+            let local = t - c.start;
+            let span = (c.length - c.trim_start - c.trim_end).max(0.0);
+            let pos = if c.length <= 0.0 {
+                local
+            } else if c.looped && span > 0.0 {
+                local % span
+            } else if local >= span && c.rewind {
+                continue;
+            } else {
+                local.min(span)
+            };
+            out.push((shape, c.media, c.trim_start + pos));
+        }
+        out
+    }
+
+    /// Whether any clip of slide `index` plays during `n` frames from the clock.
+    fn plays_during(&self, index: usize, n: u64) -> bool {
+        let fps = f64::from(self.fps);
+        let (t0, t1) = (self.at as f64 / fps, self.at.saturating_add(n) as f64 / fps);
+        self.cues.iter().any(|c| c.picture.is_some_and(|p| p.0 == index) && c.start < t1 && c.until > t0)
+    }
+
+    fn pictures_for(&mut self, media: MediaId) -> Option<&mut ClipPictures> {
+        let pres = self.pres;
+        let warnings = &mut self.warnings;
+        self.pictures
+            .entry(media)
+            .or_insert_with(|| {
+                let m = pres.media(media)?;
+                match deckcraft_media::VideoDecoder::open(m.data.clone()) {
+                    Ok(dec) => Some(ClipPictures { dec, cur: None, next: None, done: false }),
+                    Err(e) => {
+                        warnings.push(format!("{}: the video shows its poster frame ({e})", m.name));
+                        None
+                    }
+                }
+            })
+            .as_mut()
+    }
+
+    /// Render one step's frames into `sink`.
+    fn step(&mut self, step: &Step, sink: &mut dyn FnMut(&[u8]) -> Result<(), String>) -> Result<u64, String> {
+        let pres = self.pres;
+        let animate = !pres.show.without_animation;
+        let index = step.index();
+        let tl = self
+            .timelines
+            .entry(index)
+            .or_insert_with(|| Arc::new(if animate { ShowState::timeline(pres, index) } else { Timeline::default() }))
+            .clone();
         let (st, t) = match step {
             Step::Transition { .. } => (0, 0.0),
             Step::Anim { step, t, .. } => (*step, *t),
@@ -329,22 +462,39 @@ pub fn frames(pres: &Presentation, steps: &[Step], (w, h): (u32, u32), sink: &mu
             Step::Hold { .. } => (tl.steps(), 0.0),
         };
         // During a transition only the incoming slide's shapes take its starting state.
-        let incoming = pres.slides.get(step.index()).cloned();
+        let incoming = pres.slides.get(index).cloned();
         let f = move |id: ShapeId| {
             if incoming.as_ref().is_some_and(|s| s.shape(id).is_some()) { state_for(&tl, id, st, t) } else { ShapeState::default() }
         };
-        let opts = render_opts(pres, h, Some(&f));
-        let img = match step {
-            Step::Transition { index, t } => deckcraft_render::render_transition(pres, *index, *t, &opts),
-            _ => deckcraft_render::render_slide(pres, step.index(), &opts),
-        };
-        let px = fit(&img, w, h);
-        for _ in 0..step.frames() {
+        let total = step.frames();
+        // A still slide is drawn once, unless a video clip on it is playing.
+        let each = total > 1 && self.plays_during(index, total);
+        let mut px = vec![];
+        for k in 0..total {
+            if k == 0 || each {
+                let now = self.at as f64 / f64::from(self.fps);
+                let times = self.clip_times(index, now);
+                let mut held: Vec<(ShapeId, deckcraft_media::Frame)> = vec![];
+                for (shape, media, ct) in times {
+                    if let Some(p) = self.pictures_for(media).and_then(|p| p.at(ct)) {
+                        held.push((shape, p.clone()));
+                    }
+                }
+                let vf: Vec<(ShapeId, deckcraft_render::VideoFrame)> =
+                    held.iter().map(|(s, f)| (*s, deckcraft_render::VideoFrame { width: f.width, height: f.height, rgba: &f.rgba })).collect();
+                let mut opts = render_opts(pres, self.size.1, Some(&f));
+                opts.video_frames = &vf;
+                let img = match step {
+                    Step::Transition { index, t } => deckcraft_render::render_transition(pres, *index, *t, &opts),
+                    _ => deckcraft_render::render_slide(pres, index, &opts),
+                };
+                px = fit(&img, self.size.0, self.size.1);
+            }
             sink(&px)?;
-            n = n.saturating_add(1);
+            self.at = self.at.saturating_add(1);
         }
+        Ok(total)
     }
-    Ok(n)
 }
 
 /// Decoded clips at [`AUDIO_RATE`], interleaved stereo, by media id (`None`: undecodable).
@@ -461,6 +611,7 @@ pub fn encode(pres: &Presentation, format: &str, opts: &VideoOpts) -> Result<Enc
     let key_every = u64::from(fps * KEY_EVERY_S);
     let mut since_key: u64 = 0;
     let mut total: u64 = 0;
+    let mut renderer = Renderer::new(pres, &plan.cues, fps, (w, h));
     for (i, step) in plan.steps.iter().enumerate() {
         // A key frame starts each slide (at its transition), so the file seeks by slide.
         let mut start = i.checked_sub(1).and_then(|p| plan.steps.get(p)).is_none_or(|p| p.index() != step.index());
@@ -471,10 +622,10 @@ pub fn encode(pres: &Presentation, format: &str, opts: &VideoOpts) -> Result<Enc
             let data = pic.length_prefixed();
             mux.write_sample(track, WriteSample { data: &data, duration: 1, composition_offset: 0, is_sync: pic.key }).map_err(|e| e.to_string())
         };
-        total = total.saturating_add(frames(pres, std::slice::from_ref(step), (w, h), &mut sink)?);
+        total = total.saturating_add(renderer.step(step, &mut sink)?);
     }
     // Sound.
-    let mut warnings = vec![];
+    let mut warnings = std::mem::take(&mut renderer.warnings);
     let mut audio_seconds = 0.0;
     if opts.audio != AudioFormat::None && !plan.cues.is_empty() {
         let clips = decode_clips(pres, &plan.cues, &mut warnings);
@@ -721,5 +872,51 @@ mod tests {
         let f = deckcraft_isobmff::open(v.bytes.as_slice()).unwrap();
         assert!(matches!(f.tracks[1].entries.first().map(|e| &e.codec), Some(deckcraft_isobmff::CodecConfig::Pcm(_))));
         assert!(encode(&p, "mp4", &VideoOpts { audio: AudioFormat::Pcm, ..o }).is_err());
+    }
+
+    /// A 64×64 H.264 MP4 at 10 fps: one second red, then one second blue.
+    fn red_then_blue() -> Vec<u8> {
+        use deckcraft_isobmff::{AvcConfig, Brand, CodecConfig, FourCc, Mp4Writer, SampleEntry, TrackConfig, WriteSample, WriterOptions};
+        let mut enc = deckcraft_h264::Encoder::new(deckcraft_h264::EncoderConfig { width: 64, height: 64, fps: 10, qp: 20 }).unwrap();
+        let avc = AvcConfig::new(vec![enc.sps()], vec![enc.pps()], 4);
+        let entry = SampleEntry::video(FourCc::new(b"avc1"), CodecConfig::Avc(avc), 64, 64);
+        let mut mux = Mp4Writer::new(std::io::Cursor::new(Vec::new()), WriterOptions::new(Brand::Mp4)).unwrap();
+        let t = mux.add_track(TrackConfig::new(entry, 10)).unwrap();
+        for k in 0..20 {
+            let c = if k < 10 { [230u8, 20, 20, 255] } else { [20, 20, 230, 255] };
+            let px: Vec<u8> = std::iter::repeat_n(c, 64 * 64).flatten().collect();
+            let pic = enc.encode_rgba(&px, k == 0 || k == 10);
+            mux.write_sample(t, WriteSample { data: &pic.length_prefixed(), duration: 1, composition_offset: 0, is_sync: pic.key }).unwrap();
+        }
+        mux.finish().unwrap().into_inner()
+    }
+
+    #[test]
+    fn video_clips_play_their_pictures() {
+        use serde_json::json;
+        let mut s = crate::Session::with_new();
+        s.execute("slide.new", &json!({"layout": "blank"})).unwrap();
+        let data = crate::cmd::base64_encode(&red_then_blue());
+        s.execute("insert.video", &json!({"data": data, "name": "clip.mp4", "rect": [0, 0, 960, 540]})).unwrap();
+        s.execute("media.options", &json!({"autoplay": true})).unwrap();
+        let mut p = (*s.doc().unwrap().doc).clone();
+        p.slides.retain(|sl| sl.shapes.iter().any(|sh| matches!(sh.kind, ShapeKind::Media(_))));
+        for sl in &mut p.slides {
+            Arc::make_mut(sl).transition = None;
+        }
+        let o = VideoOpts { fps: 10, seconds_per_slide: 3.0, height: 64, audio: AudioFormat::None, ..Default::default() };
+        let v = encode(&p, "mp4", &o).unwrap();
+        assert_eq!(v.frames, 30);
+        let mut dec = deckcraft_media::VideoDecoder::open(Arc::new(v.bytes)).unwrap();
+        let mut centre = vec![];
+        while let Some(f) = dec.next_frame().unwrap() {
+            let i = ((f.height / 2 * f.width + f.width / 2) * 4) as usize;
+            centre.push([f.rgba[i], f.rgba[i + 1], f.rgba[i + 2]]);
+        }
+        let red = |c: &[u8; 3]| c[0] > 150 && c[2] < 100;
+        let blue = |c: &[u8; 3]| c[2] > 150 && c[0] < 100;
+        // Red for the first second, blue for the second, then the last picture held.
+        assert!(centre[..9].iter().all(red), "{centre:?}");
+        assert!(centre[11..].iter().all(blue), "{centre:?}");
     }
 }
