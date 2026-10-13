@@ -2074,7 +2074,10 @@ fn slide_show(app: &mut SlideApp, ui: &mut Ui) {
                 s.rehearse = true;
             }
         }
-        if big_button(ui, Icon::Record, "Record", true).clicked() {
+        if big_button(ui, Icon::Record, "Record", true)
+            .on_hover_text("Records slide timings, the microphone and pen ink. Laser follows the pointer.")
+            .clicked()
+        {
             let _ = app.run("show.record", json!({}));
         }
     });
