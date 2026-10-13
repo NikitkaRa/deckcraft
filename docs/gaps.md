@@ -141,10 +141,11 @@ Detail in [file-format-parity.md](file-format-parity.md).
 ### The animated GIF has no transitions or builds
 - **Evidence:** `file.export` writes MP4/MOV with transitions, in-slide animations on the
   slide-show timeline, video clips playing their pictures (decoded by `deckcraft-media`), and a
-  sound track (AAC or PCM in .mov). The animated GIF (#171) still has one frame per slide, and
-  there is no Export dialog page for video yet.
+  sound track (AAC or PCM in .mov); File › Export › Create a Video sets the options and runs it
+  in the background with progress and Cancel. The animated GIF (#171) still has one frame per
+  slide.
 - **Impact:** small; GIF is a niche export.
-- **Estimate:** 2–3 h (an Export dialog page; the GIF can reuse the video's timeline frames).
+- **Estimate:** 2–4 h (reuse the video's timeline frames for the GIF).
 
 ### Embedded MicroType Express font subsets aren't drawn
 - **Evidence:** `p:embeddedFontLst` is read and written. A raw TrueType/OpenType face, or one inside an Embedded OpenType wrapper, is loaded and used to draw. A MicroType Express subset (`application/x-fontdata` with neither form) is kept and written back, and the text still uses a stand-in.

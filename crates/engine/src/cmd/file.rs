@@ -550,8 +550,9 @@ fn export(s: &mut Session, p: &Value) -> Result<Value> {
     }
 }
 
-/// File › Export › Create a Video.
-fn video_export(doc: &deckcraft_model::Presentation, path: &str, format: &str, p: &Value) -> Result<Value> {
+/// The `file.export` video options (`height`, `fps`, `secondsPerSlide`, `secondsPerClick`,
+/// `includeHidden`, `audio`: aac|pcm|none) as [`crate::video::VideoOpts`].
+pub fn video_opts(p: &Value) -> Result<crate::video::VideoOpts> {
     use crate::video::AudioFormat;
     let d = crate::video::VideoOpts::default();
     let audio = match str_param(p, "audio") {
@@ -560,14 +561,19 @@ fn video_export(doc: &deckcraft_model::Presentation, path: &str, format: &str, p
         Some("none") => AudioFormat::None,
         Some(other) => return Err(bad("file.export", format!("audio “{other}”: use aac, pcm (.mov) or none"))),
     };
-    let opts = crate::video::VideoOpts {
+    Ok(crate::video::VideoOpts {
         height: usize_param(p, "height").map(|h| h.clamp(2, 4320) as u32).unwrap_or(d.height),
         fps: usize_param(p, "fps").map(|f| f.clamp(1, 60) as u32).unwrap_or(d.fps),
         seconds_per_slide: f64_or(p, "secondsPerSlide", d.seconds_per_slide).clamp(0.1, 3600.0),
         seconds_per_click: f64_or(p, "secondsPerClick", d.seconds_per_click).clamp(0.0, 3600.0),
         include_hidden: bool_or(p, "includeHidden", false),
         audio,
-    };
+    })
+}
+
+/// File › Export › Create a Video.
+fn video_export(doc: &deckcraft_model::Presentation, path: &str, format: &str, p: &Value) -> Result<Value> {
+    let opts = video_opts(p)?;
     let v = crate::video::encode(doc, format, &opts).map_err(|e| bad("file.export", e))?;
     write_file(path, &v.bytes)?;
     let fps = opts.fps.clamp(1, 60);

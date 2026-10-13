@@ -592,6 +592,15 @@ pub struct Encoded {
 
 /// Encode the deck as `mp4` or `mov`. The file is assembled in memory.
 pub fn encode(pres: &Presentation, format: &str, opts: &VideoOpts) -> Result<Encoded, String> {
+    encode_with(pres, format, opts, &mut |_, _| true)
+}
+
+/// What [`encode_with`] fails with when its progress callback asks it to stop.
+pub const CANCELLED: &str = "the video export was cancelled";
+
+/// [`encode`], calling `progress(frames done, frames in all)` after each frame; when it returns
+/// `false` the export stops with [`CANCELLED`].
+pub fn encode_with(pres: &Presentation, format: &str, opts: &VideoOpts, progress: &mut dyn FnMut(u64, u64) -> bool) -> Result<Encoded, String> {
     use deckcraft_isobmff::{AvcConfig, Brand, CodecConfig, FourCc, Mp4Writer, PcmConfig, SampleEntry, TrackConfig, WriteSample, WriterOptions};
     if opts.audio == AudioFormat::Pcm && format != "mov" {
         return Err("PCM sound needs a .mov file; use AAC for .mp4".into());
@@ -611,16 +620,20 @@ pub fn encode(pres: &Presentation, format: &str, opts: &VideoOpts) -> Result<Enc
     let key_every = u64::from(fps * KEY_EVERY_S);
     let mut since_key: u64 = 0;
     let mut total: u64 = 0;
+    let mut done: u64 = 0;
     let mut renderer = Renderer::new(pres, &plan.cues, fps, (w, h));
     for (i, step) in plan.steps.iter().enumerate() {
         // A key frame starts each slide (at its transition), so the file seeks by slide.
         let mut start = i.checked_sub(1).and_then(|p| plan.steps.get(p)).is_none_or(|p| p.index() != step.index());
+        let all = plan.frames;
         let mut sink = |px: &[u8]| -> Result<(), String> {
             let pic = enc.encode_rgba(px, start || since_key >= key_every);
             start = false;
             since_key = if pic.key { 1 } else { since_key.saturating_add(1) };
             let data = pic.length_prefixed();
-            mux.write_sample(track, WriteSample { data: &data, duration: 1, composition_offset: 0, is_sync: pic.key }).map_err(|e| e.to_string())
+            mux.write_sample(track, WriteSample { data: &data, duration: 1, composition_offset: 0, is_sync: pic.key }).map_err(|e| e.to_string())?;
+            done = done.saturating_add(1);
+            if progress(done, all) { Ok(()) } else { Err(CANCELLED.to_string()) }
         };
         total = total.saturating_add(renderer.step(step, &mut sink)?);
     }
@@ -918,5 +931,21 @@ mod tests {
         // Red for the first second, blue for the second, then the last picture held.
         assert!(centre[..9].iter().all(red), "{centre:?}");
         assert!(centre[11..].iter().all(blue), "{centre:?}");
+    }
+
+    #[test]
+    fn progress_counts_frames_and_can_cancel() {
+        let p = animated_deck();
+        let o = VideoOpts { fps: 10, seconds_per_slide: 1.0, seconds_per_click: 0.5, height: 64, audio: AudioFormat::None, ..Default::default() };
+        let mut seen = vec![];
+        let v = encode_with(&p, "mp4", &o, &mut |d, n| {
+            seen.push((d, n));
+            true
+        })
+        .unwrap();
+        assert_eq!(seen.len() as u64, v.frames);
+        assert_eq!(seen.last(), Some(&(v.frames, v.frames)));
+        let r = encode_with(&p, "mp4", &o, &mut |d, _| d < 3);
+        assert_eq!(r.err().as_deref(), Some(CANCELLED));
     }
 }
