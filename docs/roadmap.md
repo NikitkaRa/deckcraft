@@ -1,6 +1,6 @@
 # DeckCraft roadmap: milestones and what's next
 
-> **Last reviewed:** 2026-10-10 · **Last updated:** 2026-10-10 · **Change:** minor (core-workflow alpha gate added; stage stays alpha; previous: major, created; milestones carried from the local execution plan, the beta plan built from gaps.md) · **Target:** Microsoft PowerPoint for Mac 16.113 (Microsoft 365)
+> **Last reviewed:** 2026-10-10 · **Last updated:** 2026-10-13 · **Change:** minor (macOS menu bar leaves the beta list; hours ~120–210 → ~117–207; stage stays alpha) · **Target:** Microsoft PowerPoint for Mac 16.113 (Microsoft 365)
 
 Forward-looking: where DeckCraft is going and in what order. The one-page summary is
 [ROADMAP.md](../ROADMAP.md); every shortfall is in [gaps.md](gaps.md); numbers are in
@@ -31,7 +31,7 @@ points and lead the beta plan.
 3. **Review the open PRs:** equations (#55), browser print (#66), Morph alignment (#67), macOS
    open-with (#68), font lookup (#80), Ukrainian (#34, after the catalog exists). 4–8 h.
 
-## Plan to beta (~120–210 h; ~40–70 h wall clock with 3–4 agents)
+## Plan to beta (~117–207 h; ~40–70 h wall clock with 3–4 agents)
 
 Beta means ~75% ready for real work and opening and saving PowerPoint's `.pptx` reliably
 (craftrules `standards/progress-docs.md`). Ranked:
@@ -48,9 +48,9 @@ Beta means ~75% ready for real work and opening and saving PowerPoint's `.pptx` 
 | 8 | Charts: data grid, elements | 6–10 | Features |
 | 9 | Animation Pane timeline, preview, effect options | 5–8 | Features |
 | 10 | Presenter view on the right display, timer controls | 3–5 | Hardware, Slide show |
-| 11 | Native macOS menu bar, Format Shape pane depth, start screen and window chrome fixes | 13–22 | UI/UX 60 → 75% |
+| 11 | Format Shape pane depth, start screen and window chrome fixes | 10–17 | UI/UX 60 → 75% |
 | 12 | Performance baseline and the obvious fixes | 4–8 | Performance |
-| **Total** | | **~120–210** | Ready ~55% → ~75% |
+| **Total** | | **~117–207** | Ready ~55% → ~75% |
 
 Parallelizes well: 1 (engine/app), 2–5 (pptx, render, pdf), 6 (ui-egui catalogs), 8–11 (UI)
 touch different crates. Needs a human: the owner opening PPTX outputs in PowerPoint and making
@@ -109,5 +109,6 @@ plan above.
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-10-13 | minor | macOS menu bar is in (DeckCraft's commands). Beta item 11 is Format Shape, the start screen and window chrome; hours ~120–210 → ~117–207 |
 | 2026-10-10 | minor | Added the alpha gate (six core workflows): all pass, two with partial depth; stage stays alpha |
 | 2026-10-10 | major | Created: current focus, ranked beta plan with hours, milestones M0–M14 with status, the old alpha checklist as history |

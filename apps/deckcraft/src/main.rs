@@ -17,24 +17,38 @@ mod control_server;
 #[cfg(any(target_os = "windows", test))]
 mod graphics;
 mod logging;
+mod menu;
 
 use deckcraft_engine::Session;
 use deckcraft_ui_egui::{Services, SlideApp};
 
-struct App(SlideApp);
+struct App {
+    slide: SlideApp,
+    /// `None` until the first frame, when the macOS menu bar is installed.
+    menu: Option<menu::MenuBar>,
+}
 
 impl eframe::App for App {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        self.0.logic(ctx);
+        if self.menu.is_none() {
+            self.menu = Some(menu::MenuBar::new());
+        }
+        if let Some(menu) = &self.menu {
+            menu.dispatch(&mut self.slide, ctx);
+        }
+        self.slide.logic(ctx);
+        if let Some(menu) = &self.menu {
+            menu.sync(&self.slide);
+        }
     }
     fn raw_input_hook(&mut self, _ctx: &egui::Context, raw: &mut egui::RawInput) {
-        self.0.raw_input_hook(raw);
+        self.slide.raw_input_hook(raw);
     }
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        self.0.ui(ui);
+        self.slide.ui(ui);
     }
     fn on_exit(&mut self) {
-        save_prefs(&self.0);
+        save_prefs(&self.slide);
     }
 }
 
@@ -224,7 +238,7 @@ fn main() -> eframe::Result {
             if show {
                 app.start_show(0, false);
             }
-            Ok(Box::new(App(app)))
+            Ok(Box::new(App { slide: app, menu: None }))
         }),
     )
 }

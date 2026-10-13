@@ -265,3 +265,23 @@ pub fn menu_tree() -> Vec<(&'static str, Vec<(&'static str, &'static str)>)> {
         ("Help", vec![("About DeckCraft", "app.about"), ("Command Palette", "app.palette")]),
     ]
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_menu_entry_names_a_command() {
+        for (menu, items) in menu_tree() {
+            assert!(!menu.is_empty(), "a menu needs a name");
+            for (label, id) in items {
+                if id.is_empty() {
+                    assert_eq!(label, "-", "{menu} has a blank entry that is not a separator");
+                    continue;
+                }
+                let known = deckcraft_engine::find_command(id).is_some() || crate::UI_COMMANDS.iter().any(|c| c.0 == id);
+                assert!(known, "{menu} / {label} ({id}) is not a command");
+            }
+        }
+    }
+}

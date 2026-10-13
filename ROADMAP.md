@@ -1,8 +1,8 @@
 # DeckCraft roadmap
 
-**Stage: alpha** · next: beta, ~20 points and ~120–210 h away
+**Stage: alpha** · next: beta, ~20 points and ~117–207 h away
 
-> **Last reviewed:** 2026-10-10 · **Last updated:** 2026-10-10 · **Change:** minor (hours to ~95% per audience added; ready 56% → 55%; stage stays alpha; previous: major, full re-measure against PowerPoint for Mac 16.113.4; restructured to the craftrules progress-docs standard) · **Target:** Microsoft PowerPoint for Mac 16.113 (Microsoft 365)
+> **Last reviewed:** 2026-10-10 · **Last updated:** 2026-10-13 · **Change:** minor (breadth 79% → 80% after the macOS menu bar; P2 headline matched to the checklist at 38%; ready stays ~55%; stage stays alpha) · **Target:** Microsoft PowerPoint for Mac 16.113 (Microsoft 365)
 
 DeckCraft aims at full PowerPoint parity, and to be better: faster, open (a documented zip+JSON
 format plus PPTX), scriptable by agents (CLI, JSON control channel, MCP), and available everywhere
@@ -14,12 +14,12 @@ format plus PPTX), scriptable by agents (CLI, JSON control channel, MCP), and av
 
 | | Value | Kind |
 |---|---|---|
-| **Feature breadth** | **79%** weighted over 191 PowerPoint features (P0 92%, P1 75%, P2 36%) | measured: `cargo xtask parity` over [docs/parity-checklist.md](docs/parity-checklist.md) |
+| **Feature breadth** | **80%** weighted over 191 PowerPoint features (P0 92%, P1 75%, P2 38%) | measured: `cargo xtask parity` over [docs/parity-checklist.md](docs/parity-checklist.md) |
 | Menu-bar coverage | 59% of 217 app-specific PowerPoint menu items matched by name (lower bound) | measured: script over the PowerPoint menu dump and the 226 commands |
 | **Ready for real work** | **~55%** | estimated: weighted dimensions below |
 | Mainstream practitioner | ~53% | estimated: weekly-use areas × discounts for interaction (×0.92), stability (×0.92) and `.pptx` exchange (×0.88), [method](docs/target-app-parity.md#mainstream-practitioner-and-essentials-user) |
 | Essentials user | ~62% | estimated: core features × discounts for launch (×0.90), clarity (×0.95) and opening received files (×0.90), [method](docs/target-app-parity.md#mainstream-practitioner-and-essentials-user) |
-| Hours to beta | **~120–210** Opus 5.5 agent hours (~40–70 h with 3–4 agents) | estimated, [docs/roadmap.md](docs/roadmap.md) |
+| Hours to beta | **~117–207** Opus 5.5 agent hours (~40–70 h with 3–4 agents) | estimated, [docs/roadmap.md](docs/roadmap.md) |
 | Hours to full parity | **~365–650** Opus 5.5 agent hours | estimated, [docs/target-app-parity.md](docs/target-app-parity.md) |
 
 ### Readiness by audience
@@ -45,7 +45,7 @@ EMF/SVG pictures, the data-loss and startup-crash bugs (#60, #40, #59) and the b
 
 | Dimension | Ready | Hours to full | Doc |
 |---|---:|---|---|
-| Features (breadth 79% measured, with depth) | ~62% | 140–240 | [docs/parity-checklist.md](docs/parity-checklist.md) |
+| Features (breadth 80% measured, with depth) | ~62% | 140–240 | [docs/parity-checklist.md](docs/parity-checklist.md) |
 | UI/UX fidelity | ~60% | 30–50 | [docs/ui-parity.md](docs/ui-parity.md) |
 | File formats (PPTX, PDF, legacy, export) | ~58% | 60–110 | [docs/file-format-parity.md](docs/file-format-parity.md) |
 | Hardware (GPU raster, video decode, displays, pens) | ~40% | 25–45 | [docs/hardware-parity.md](docs/hardware-parity.md) |
@@ -61,7 +61,7 @@ EMF/SVG pictures, the data-loss and startup-crash bugs (#60, #40, #59) and the b
 
 | Area | Breadth (measured) | Ready (est.) | Hours | Doc |
 |---|---:|---:|---|---|
-| Application shell | 71% | ~55% | 8–14 | [ui-parity](docs/ui-parity.md) |
+| Application shell | 81% | ~65% | 5–9 | [ui-parity](docs/ui-parity.md) |
 | Slides and sections | 90% | ~85% | 3–5 | [checklist](docs/parity-checklist.md) |
 | Views | 90% | ~80% | 3–6 | [ui-parity](docs/ui-parity.md) |
 | Masters and themes | 85% | ~70% | 8–14 | [checklist](docs/parity-checklist.md) |
@@ -128,6 +128,7 @@ app's JSON control channel (`deckcraft --control PORT`).
 
 | Date | What landed |
 |---|---|
+| 2026-10-13 | macOS menu bar: File, Edit, View, Insert, Format, Arrange, Slide Show and Help, plus About, Preferences and Quit. Quit asks to save. Cmd+P still opens the print page. Breadth 79% → 80% |
 | 2026-10-13 | Slide transitions like PowerPoint: every transition and option measured frame by frame against PowerPoint's video export and retuned (curves, directions, soft edges, 3-D perspective, contents moving over backgrounds); PowerPoint's own XML elements and defaults read and written (diagonal Wipe, Zoom, Shape In/Out, Glitter Hexagons, Shred In/Out, Page Curl Single); `deckcraft-cli render-transition` renders frames headless |
 | 2026-10-13 | Wild text cases measured against PowerPoint (102 synthetic slides): bidi by run language, East Asian vertical text upright, mongolianVert/wordArtVert/wordArtVertRtl, underline styles and strikethrough at the font's metrics, centre/right/decimal tabs, East Asian, Thai, Hindi, Arabic and Hebrew numbering, small caps, all-caps "ß", transparent text, soft hyphens, kinsoku, rtlCol and just/dist anchoring, emoji presentation, fallback faces that no longer move the baseline |
 | 2026-10-13 | Render matches PowerPoint more closely on wild shape, picture and table cases: even-odd custom paths, dashes and caps, arrowheads, radial and path gradients, tile rects, rotWithShape, gradient lines, shadows cast by what is drawn (group and perspective too), group fill, picture borders, tiles, reflection, recolour (biLevel, alphaInv, brightness/contrast), table borders and grid default, 20+ preset shapes by their ECMA formulas, default miter joins, and approximate 3-D bevels, cameras and face lighting |
@@ -150,7 +151,7 @@ app's JSON control channel (`deckcraft --control PORT`).
 
 | Date | Change | Summary |
 |---|---|---|
-| 2026-10-13 | trivial | Progress log: wild text cases |
+| 2026-10-13 | minor | Breadth 79% → 80% (macOS menu bar partial). P2 in the headline set to the checklist's 38%. Ready stays ~55% |
 | 2026-10-12 | trivial | Progress log: File tab (Backstage, #76) |
 | 2026-10-12 | trivial | Progress log: lines in scaled groups (#233) |
 | 2026-10-10 | minor | Readiness-by-audience table with hours to ~95% for full, mainstream and essentials |

@@ -1,6 +1,6 @@
 # Where DeckCraft falls short of PowerPoint
 
-> **Last reviewed:** 2026-10-10 · **Last updated:** 2026-10-13 · **Change:** minor (3-D bevel, camera and face lighting rendered; previous: minor, IME composition and CJK interface text landed, #101; previous: minor, core-workflow alpha gate added; stage stays alpha; before that: major, first itemized gap list; full re-measure against PowerPoint for Mac 16.113.4 and the open GitHub issues) · **Target:** Microsoft PowerPoint for Mac 16.113 (Microsoft 365)
+> **Last reviewed:** 2026-10-10 · **Last updated:** 2026-10-13 · **Change:** minor (macOS menu bar installed from the command tree; previous: minor, 3-D bevel, camera and face lighting rendered; previous: minor, IME composition and CJK interface text landed, #101) · **Target:** Microsoft PowerPoint for Mac 16.113 (Microsoft 365)
 
 Every known shortfall, one entry each, ranked by how much it stops someone who presents with
 PowerPoint from switching. This is the work list: pick from the top. Numbers are summarized in
@@ -29,9 +29,9 @@ revision history.
 | 10 | Animation Pane: no timeline, thin preview; 64 of ~190 effects | Feature | B (pane) | 10–16 | [animation-parity.md](animation-parity.md) |
 | 11 | Charts: data grid editing, elements, `chartex` types | Feature | B (data, elements) | 12–20 | [parity-checklist.md](parity-checklist.md) |
 | 12 | Format Shape pane thinner than PowerPoint's | UI/UX | B | 6–10 | [ui-parity.md](ui-parity.md) |
-| 13 | No native macOS menu bar | UI/UX | B | 3–5 | [ui-parity.md](ui-parity.md) |
-| 14 | PDF export rasterizes slide artwork | File format | B | 5–8 | [file-format-parity.md](file-format-parity.md) |
-| 15 | Slides rasterize on the CPU; no performance baseline | Performance / hardware | | 15–30 | [hardware-parity.md](hardware-parity.md) |
+| 13 | PDF export rasterizes slide artwork | File format | B | 5–8 | [file-format-parity.md](file-format-parity.md) |
+| 14 | Slides rasterize on the CPU; no performance baseline | Performance / hardware | | 15–30 | [hardware-parity.md](hardware-parity.md) |
+| 15 | Embedded fonts aren't read or written | File format | | 3–5 | [file-format-parity.md](file-format-parity.md) |
 
 ## Stability
 
@@ -194,8 +194,6 @@ encryption), ink to shape/text (6–10 h), icons and 3-D models (8–14 h, needs
 
 Detail in [ui-parity.md](ui-parity.md).
 
-- **No native macOS menu bar.** `menus::menu_tree()` exists but nothing installs it. 3–5 h. **Beta
-  blocker.**
 - **Format Shape pane thinner than PowerPoint's** (Fill/Line/Effects/Size/Text Box pages, picture
   and texture options, 3-D). 6–10 h. **Beta blocker.**
 - **File tab depth** (#76 landed the Backstage): no online templates, cloud places, printer
@@ -256,6 +254,7 @@ Detail in [localization-parity.md](localization-parity.md).
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-10-13 | minor | macOS menu bar installed from the command tree (File through Help, plus About, Preferences and Quit). Tools, Window and the unmatched PowerPoint items remain |
 | 2026-10-13 | minor | Shape, picture and table rendering checked against PowerPoint on ~150 synthetic edge-case slides; 3-D bevels, cameras and face lighting now render approximately (gap narrowed to extrusion, rigs and the 3-D pane) |
 | 2026-10-12 | minor | IME composition in slide text and notes, and CJK interface text with real glyphs (#101): the IME gap is now Korean on the web and table-cell underlines |
 | 2026-10-12 | minor | EMF/WMF text, pattern and hatch brushes drawn; legacy OLE and ActiveX previews shown; the SVG gap keeps only EMF clip regions |

@@ -1,6 +1,6 @@
 # DeckCraft vs Microsoft PowerPoint: parity assessment
 
-> **Last reviewed:** 2026-10-10 · **Last updated:** 2026-10-10 · **Change:** minor (hours to ~95% per audience added; ready recomputed from written weights, 56% → 55%; stage stays alpha; previous: major, full re-measure against PowerPoint for Mac 16.113.4; replaces the parity sections of ROADMAP.md) · **Target:** Microsoft PowerPoint for Mac 16.113 (Microsoft 365)
+> **Last reviewed:** 2026-10-10 · **Last updated:** 2026-10-13 · **Change:** minor (breadth 79% → 80% after the macOS menu bar; ready stays ~55%; stage stays alpha) · **Target:** Microsoft PowerPoint for Mac 16.113 (Microsoft 365)
 
 The authoritative answer to "how close is DeckCraft to PowerPoint, and how much work is left?".
 [ROADMAP.md](../ROADMAP.md) summarizes it; [gaps.md](gaps.md) itemizes every shortfall;
@@ -11,13 +11,13 @@ number.
 
 | Number | Value | Kind |
 |---|---|---|
-| **Feature breadth** (weighted checklist) | **79%** over 191 features (P0 92%, P1 75%, P2 36%) | **measured**: `cargo xtask parity` formula over [parity-checklist.md](parity-checklist.md), rows re-scored 2026-10-10 |
+| **Feature breadth** (weighted checklist) | **80%** over 191 features (P0 92%, P1 75%, P2 38%) | **measured**: `cargo xtask parity` formula over [parity-checklist.md](parity-checklist.md), rows re-scored 2026-10-13 |
 | Menu-bar coverage | **59%** (128 of 217 app-specific PowerPoint menu items have a DeckCraft command or UI label of the same name) | **measured** (heuristic lower bound): script matching the 2026-10-07 PowerPoint menu dump against the 226 engine command labels and the UI's strings; excludes the app, Window and Help menus and the subtitle language lists |
 | **Ready for real work** | **~55%** | **estimated**: weighted dimension table below (was ~56% until the features row was recomputed from written area weights) |
 | **Mainstream practitioner** | **~53%** | **estimated**: [method below](#mainstream-practitioner-and-essentials-user) |
 | **Essentials user** | **~62%** | **estimated**: [method below](#mainstream-practitioner-and-essentials-user) |
-| Stage | **alpha** (beta is ~20 points and ~120–210 h away) | judgement against craftrules `standards/progress-docs.md`: ~55% is in the alpha band and all six core workflows pass the [alpha gate](roadmap.md#alpha-gate-powerpoints-core-workflows) |
-| Remaining effort to beta | **~120–210 Opus 5.5 agent hours** | estimated, itemized in [roadmap.md](roadmap.md) |
+| Stage | **alpha** (beta is ~20 points and ~117–207 h away) | judgement against craftrules `standards/progress-docs.md`: ~55% is in the alpha band and all six core workflows pass the [alpha gate](roadmap.md#alpha-gate-powerpoints-core-workflows) |
+| Remaining effort to beta | **~117–207 Opus 5.5 agent hours** | estimated, itemized in [roadmap.md](roadmap.md) |
 | Remaining effort to full parity | **~365–650 Opus 5.5 agent hours** | estimated, by dimension below |
 
 The menu figure is lower than the checklist figure because PowerPoint's menu bar lists every chart
@@ -64,9 +64,9 @@ The weights are what those users actually depend on, written down so the total c
 
 | Dimension | Weight | Ready | Hours to full | Doc | Evidence |
 |---|---:|---:|---|---|---|
-| Features (breadth × depth) | 30% | ~62% | 140–240 | [parity-checklist.md](parity-checklist.md), [animation-parity.md](animation-parity.md), [slideshow-parity.md](slideshow-parity.md) | Breadth 79% measured. Depth lags: 37 of 191 rows are partial, and users found depth bugs in rows scored done within two days (#53, #60, #69, #70, #74, #77, #78) |
+| Features (breadth × depth) | 30% | ~62% | 140–240 | [parity-checklist.md](parity-checklist.md), [animation-parity.md](animation-parity.md), [slideshow-parity.md](slideshow-parity.md) | Breadth 80% measured. Depth lags: 48 of 191 rows are partial |
 | File formats | 20% | ~58% | 60–110 | [file-format-parity.md](file-format-parity.md) | PPTX reads and writes every main part and keeps unknown objects; files open in PowerPoint without repair. But it has never met a corpus of real decks, EMF/WMF/SVG pictures don't decode, comments/media/rewind settings are lost on round trip, and there is no `.ppt`, `.pptm`, `.odp`, video or GIF export |
-| UI/UX fidelity | 15% | ~60% | 30–50 | [ui-parity.md](ui-parity.md) | All 10 ribbon tabs and the contextual tabs exist; Format Shape pane, Animation Pane, dialogs and menus are thinner than PowerPoint's; no native macOS menu bar; user reports #17, #71, #73, #76 |
+| UI/UX fidelity | 15% | ~60% | 30–50 | [ui-parity.md](ui-parity.md) | All 10 ribbon tabs and the contextual tabs exist; Format Shape pane, Animation Pane, dialogs and menus are thinner than PowerPoint's; the macOS menu bar covers DeckCraft's commands (not Tools, Window, or every PowerPoint item); user reports #17, #71, #73, #76 |
 | Stability | 10% | ~60% | 10–20 | [gaps.md](gaps.md) | Never-crash rules, a panic guard round every command, PPTX fuzz/malformed tests. But startup crashes on some Windows GPUs (#40, #59) and Close discards edits without asking (#60) |
 | Performance | 5% | ~55% | 10–20 | [hardware-parity.md](hardware-parity.md) | Unmeasured against PowerPoint. Slides rasterize on the CPU (`vello_cpu`); Morph re-aligns outlines every frame (#67) |
 | Hardware | 5% | ~40% | 25–45 | [hardware-parity.md](hardware-parity.md) | GPU-composited window (wgpu), but CPU slide raster, software-only video decode, presenter view not placed on the second display, no pen pressure, no pinch zoom |
@@ -116,7 +116,7 @@ PowerPoint is taken out of the areas and charged once, as a discount.
 
 | Discount | Factor | Evidence |
 |---|---:|---|
-| Interaction fidelity | ×0.92 | No native macOS menu bar, thinner Format Shape pane, Tab ends text entry (#78), font faces (#69), window chrome (#71) |
+| Interaction fidelity | ×0.92 | macOS menu covers DeckCraft's commands but not Tools, Window or every PowerPoint item; thinner Format Shape pane; Tab ends text entry (#78); font faces (#69); window chrome (#71) |
 | Stability on real machines | ×0.92 | Startup crashes on some Windows GPUs (#40, #59); Close discards edits (#60, fix in PR #75); video stalls in the editor on Ubuntu (#91); arrows reported dead in the show on Linux Mint (#17) |
 | File exchange with PowerPoint users | ×0.88 | Harsher than VectorCraft's ×0.92 because swapping `.pptx` is daily work for this user: never tested on real decks, EMF pictures blank, icons from PowerPoint don't come through (#56), comment threads, media options and rewind lost on save (#70, #74, #77) |
 
@@ -150,7 +150,7 @@ mainstream number leaves out.
 | Discount | Factor | Evidence |
 |---|---:|---|
 | Launch and stability | ×0.90 | Some Windows PCs can't start the app (#40, #59), and the workaround is an environment variable; Close loses work (#60) |
-| Discoverability and UI clarity | ×0.95 | Familiar ribbon and tabs; no native menu bar, start-screen glitches, a command palette whose default entry fails (#79) |
+| Discoverability and UI clarity | ×0.95 | Familiar ribbon and tabs; the macOS menu is DeckCraft's commands, not every PowerPoint menu; start-screen glitches; a command palette whose default entry fails (#79) |
 | Opening files people send them | ×0.90 | `.pptx` opens, but real decks are untested and EMF pictures and PowerPoint icons can come in blank (#56) |
 
 80.1 × 0.90 × 0.95 × 0.90 = **61.6 → ~62%**.
@@ -174,12 +174,12 @@ mainstream number leaves out.
 
 Breadth is measured from the checklist; "ready" adds depth and is estimated. Hours are to
 PowerPoint parity for that area. **Weight** is how much a PowerPoint user relies on the area
-(points out of 110); the total "ready" is the weighted mean of the rows (6,865 / 110 = 62.4%), and
+(points out of 110); the total "ready" is the weighted mean of the rows (6,915 / 110 = 62.9%), and
 it is the Features row of the dimension table. Automation and Platforms are scored elsewhere.
 
 | Area | Weight | Breadth (measured) | Ready (est.) | Hours | Main shortfalls | Doc |
 |---|---:|---:|---:|---|---|---|
-| Application shell | 5 | 71% | ~55% | 8–14 | No native macOS menu bar, thin start screen (templates, recent), one window per presentation missing | [ui-parity.md](ui-parity.md) |
+| Application shell | 5 | 81% | ~65% | 5–9 | Thin start screen (templates, recent), one window per presentation missing. The macOS menu bar is installed for DeckCraft's commands (no Tools or Window menu) | [ui-parity.md](ui-parity.md) |
 | Files (commands) | 4 | 69% | ~50% | see file formats | Print, reuse slides, passwords, legacy and macro formats | [file-format-parity.md](file-format-parity.md) |
 | Slides and sections | 6 | 90% | ~85% | 3–5 | Zoom (summary/section/slide), copying slides between decks keeps formatting only partly | [parity-checklist.md](parity-checklist.md) |
 | Views | 4 | 90% | ~80% | 3–6 | Snap to grid and grid options, New Window | [ui-parity.md](ui-parity.md) |
@@ -276,7 +276,7 @@ scored done (16 open issues).
 
 | Date | Change | Summary |
 |---|---|---|
-| 2026-10-10 | minor | Added the readiness-by-audience table: each number gets its own hours to ~95% (full 340–600, mainstream 150–250, essentials 50–90). The full number stays an additive weighted sum; no change to the percentages |
+| 2026-10-13 | minor | Breadth 79% → 80% (macOS menu bar partial). Application shell breadth 71% → 81%, ready ~55% → ~65%. Headline ready stays ~55%. Discounts unchanged |
 | 2026-10-10 | minor | Added the mainstream practitioner (~53%) and essentials user (~62%) numbers with written weights, discounts and user evidence. Features dimension recomputed from written area weights (66% judgement → 62.4% weighted mean), which moves ready for real work from ~56% to ~55%; stage unchanged |
 | 2026-10-10 | minor | Stage checked against the core-workflow gate (all six pass); stays alpha |
 | 2026-10-10 | major | Created from ROADMAP.md's "How far from full parity" and "Status" sections; full re-measure against PowerPoint for Mac 16.113.4 (Info.plist, lproj, menu dump), 226 commands, 191-row checklist (79%), weighted dimension table (~56% ready), hours recalibrated from git history |
