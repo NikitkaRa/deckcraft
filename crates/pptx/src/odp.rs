@@ -2,7 +2,8 @@
 //!
 //! A first slice: slides, their size, text frames (paragraphs, lists, spans with font, size,
 //! bold, italic, underline, colour, alignment), rectangles, ellipses and the common custom shapes
-//! with their fill and outline, lines, pictures, groups (flattened), rotation and speaker notes.
+//! with their fill and outline, lines, pictures, tables, groups (flattened), rotation and speaker
+//! notes. Each master page becomes a layout carrying its background and decorative shapes.
 //! Everything else is skipped. Sizes, counts and depths are bounded as in the PPTX reader.
 
 use std::collections::HashMap;
@@ -11,6 +12,7 @@ use std::sync::Arc;
 
 use deckcraft_color::Rgba;
 use deckcraft_geom::{Size, Xfrm};
+use deckcraft_model::table::{Cell, Row, Table};
 use deckcraft_model::text::{Align, Anchor, Bullet, Paragraph, Run, RunProps, TextBody};
 use deckcraft_model::{ColorRef, Fill, Geom, LayoutType, Line, Presentation, Shape, ShapeId, ShapeKind, defaults};
 
@@ -23,6 +25,8 @@ const MAX_MEDIA: u64 = 200 << 20;
 const MAX_PAGES: usize = 5_000;
 const MAX_SHAPES: usize = 20_000;
 const MAX_GROUP_DEPTH: usize = 16;
+const MAX_MASTERS: usize = 200;
+const MAX_TABLE: usize = 1_000;
 
 /// Is this an OpenDocument presentation (zip whose `mimetype` says so)?
 pub fn sniff(bytes: &[u8]) -> bool {
@@ -146,17 +150,47 @@ pub fn import(bytes: &[u8]) -> Result<Presentation, PptxError> {
             size = Size::new(w.min(4000.0), h.min(4000.0));
         }
     }
-    if let Some(a) = content.root.child("automatic-styles") {
-        styles.add_from(a);
-    }
     let mut p = defaults::blank_presentation(size, Default::default(), false);
     let layout = defaults::layout_of_kind(&p, LayoutType::Blank).or_else(|| p.masters.first().and_then(|m| m.layouts.first().map(|l| l.id)));
     let Some(layout) = layout else { return Err(PptxError::Unsupported("no layout".into())) };
     let mut cx = Ctx { styles, zip, shapes: 0 };
+    // Master pages use styles.xml's automatic styles, whose names content.xml may reuse: read
+    // them before content's styles are added.
+    let mut master_layouts: HashMap<String, deckcraft_model::LayoutId> = HashMap::new();
+    if let Some(ms) = styles_doc.as_ref().and_then(|d| d.root.child("master-styles")) {
+        for mp in ms.children_named("master-page").take(MAX_MASTERS) {
+            let Some(name) = mp.attr("name") else { continue };
+            let Some(base) = p.layout(layout).map(|(_, l)| l.clone()) else { break };
+            let mut shapes = Vec::new();
+            for el in mp.elements() {
+                // Placeholders only describe where slide text goes; slides carry their own.
+                if el.attr("class").is_none() && !el.is("notes") {
+                    shapes_of(&mut cx, &mut p, el, &mut shapes, 0);
+                }
+            }
+            let Some(id) = p.alloc_id().map(deckcraft_model::LayoutId) else { break };
+            let lay = deckcraft_model::Layout {
+                id,
+                name: mp.attr("display-name").unwrap_or(name).to_string(),
+                shapes,
+                background: page_background(&cx, mp.attr("style-name")),
+                ..base
+            };
+            if let Some(m) = p.masters.first_mut() {
+                Arc::make_mut(m).layouts.push(lay);
+                master_layouts.insert(name.to_string(), id);
+            }
+        }
+    }
+    if let Some(a) = content.root.child("automatic-styles") {
+        cx.styles.add_from(a);
+    }
     let pres = content.root.path(&["body", "presentation"]).ok_or_else(|| PptxError::NotPptx("no office:presentation".into()))?;
     for page in pres.children_named("page").take(MAX_PAGES) {
-        let Some(mut slide) = defaults::new_slide(&mut p, layout) else { break };
+        let lay = page.attr("master-page-name").and_then(|m| master_layouts.get(m)).copied().unwrap_or(layout);
+        let Some(mut slide) = defaults::new_slide(&mut p, lay) else { break };
         slide.shapes.clear();
+        slide.background = page_background(&cx, page.attr("style-name"));
         slide.name = page.attr("name").unwrap_or("").to_string();
         for el in page.elements() {
             if el.is("notes") {
@@ -179,6 +213,16 @@ pub fn import(bytes: &[u8]) -> Result<Presentation, PptxError> {
         p.slides.push(Arc::new(s));
     }
     Ok(p)
+}
+
+/// A page's or master page's solid background from its `drawing-page` style.
+fn page_background(cx: &Ctx, style: Option<&str>) -> Option<deckcraft_model::Background> {
+    style?;
+    let g = |k: &str| cx.styles.get("drawing-page", style, k);
+    match g("fill").as_deref() {
+        Some("solid") => g("fill-color").and_then(|c| color(&c)).map(|c| deckcraft_model::Background::Fill { fill: Fill::solid(c) }),
+        _ => None,
+    }
 }
 
 /// The box of a drawing element: `svg:x/y/width/height`, turned by `draw:transform`.
@@ -311,6 +355,13 @@ fn shapes_of(cx: &mut Ctx, p: &mut Presentation, el: &El, out: &mut Vec<Shape>, 
                 out.push(sh);
                 return;
             }
+            if let Some(t) = el.child("table") {
+                let Some(mut sh) = new_shape(p, name, x) else { return };
+                sh.kind = ShapeKind::Table(table(cx, t));
+                cx.shapes += 1;
+                out.push(sh);
+                return;
+            }
             if let Some(tb) = el.child("text-box") {
                 let class = el.attr("class").unwrap_or("");
                 let pstyle = el.attr("presentation:style-name").or(style);
@@ -365,6 +416,87 @@ fn shapes_of(cx: &mut Ctx, p: &mut Presentation, el: &El, out: &mut Vec<Shape>, 
         }
         _ => {}
     }
+}
+
+/// A `table:table`: column widths, row heights, cell text and fill, and merged cells.
+fn table(cx: &Ctx, t: &El) -> Table {
+    let mut cols = Vec::new();
+    for c in t.elements().flat_map(|e| {
+        if e.is("table-columns") {
+            e.children_named("table-column").collect()
+        } else if e.is("table-column") {
+            vec![e]
+        } else {
+            vec![]
+        }
+    }) {
+        let n = c.attr("number-columns-repeated").and_then(|v| v.parse::<usize>().ok()).unwrap_or(1).clamp(1, MAX_TABLE);
+        let w = cx.styles.get("table-column", c.attr("style-name"), "column-width").and_then(|v| length(&v)).filter(|w| *w > 0.0).unwrap_or(72.0);
+        for _ in 0..n {
+            if cols.len() < MAX_TABLE {
+                cols.push(w.min(4000.0));
+            }
+        }
+    }
+    let mut rows: Vec<Row> = Vec::new();
+    let row_els = t.elements().flat_map(|e| {
+        if e.is("table-rows") {
+            e.children_named("table-row").collect()
+        } else if e.is("table-row") {
+            vec![e]
+        } else {
+            vec![]
+        }
+    });
+    for r in row_els.take(MAX_TABLE) {
+        let height = cx
+            .styles
+            .get("table-row", r.attr("style-name"), "row-height")
+            .or_else(|| cx.styles.get("table-row", r.attr("style-name"), "min-row-height"));
+        let mut row = Row { height: height.and_then(|v| length(&v)).unwrap_or(0.0).clamp(0.0, 4000.0), cells: vec![] };
+        for c in r.elements().filter(|e| e.is("table-cell") || e.is("covered-table-cell")).take(MAX_TABLE) {
+            let mut cell = Cell::new("");
+            if c.is("covered-table-cell") {
+                cell.h_merge = true;
+            } else {
+                cell.text = text_body(cx, c, false);
+                let st = c.attr("style-name");
+                let g = |k: &str| cx.styles.get("table-cell", st, k).or_else(|| cx.styles.get("graphic", st, k));
+                cell.fill = match g("fill").as_deref() {
+                    Some("none") => Some(Fill::None),
+                    _ => g("fill-color").and_then(|v| color(&v)).map(Fill::solid),
+                };
+                cell.grid_span = c.attr("number-columns-spanned").and_then(|v| v.parse().ok()).unwrap_or(1).clamp(1, MAX_TABLE as u32);
+                cell.row_span = c.attr("number-rows-spanned").and_then(|v| v.parse().ok()).unwrap_or(1).clamp(1, MAX_TABLE as u32);
+                match g("textarea-vertical-align").or_else(|| g("vertical-align")).as_deref() {
+                    Some("middle") => cell.anchor = Some(Anchor::Middle),
+                    Some("bottom") => cell.anchor = Some(Anchor::Bottom),
+                    _ => {}
+                }
+            }
+            row.cells.push(cell);
+        }
+        rows.push(row);
+    }
+    // A covered cell under a vertical merge is v_merge, not h_merge.
+    for ri in 0..rows.len() {
+        for ci in 0..rows[ri].cells.len() {
+            let span = rows[ri].cells[ci].row_span as usize;
+            for below in rows.iter_mut().skip(ri + 1).take(span.saturating_sub(1)) {
+                if let Some(c) = below.cells.get_mut(ci) {
+                    c.h_merge = false;
+                    c.v_merge = true;
+                }
+            }
+        }
+    }
+    let n = rows.iter().map(|r| r.cells.len()).max().unwrap_or(0);
+    while cols.len() < n {
+        cols.push(72.0);
+    }
+    let mut table = Table { cols, rows, style: "grid".into(), first_row: false, band_row: false, ..Default::default() };
+    table.normalize();
+    table
 }
 
 /// Insets and vertical alignment from a frame's style.
