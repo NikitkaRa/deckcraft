@@ -99,19 +99,27 @@ fn duotone_rgb(a: &PictureAdjust) -> Option<(deckcraft_color::Rgba, deckcraft_co
     Some((rgb(d, deckcraft_color::Rgba::BLACK), rgb(l, deckcraft_color::Rgba::WHITE)))
 }
 
-/// Decode encoded bytes (PNG, JPEG, GIF, WebP, BMP, TIFF; WMF and EMF drawn at
+/// Decode encoded bytes (PNG, JPEG, GIF, WebP, BMP, TIFF, SVG; WMF and EMF drawn at
 /// [`crate::metafile::DEFAULT_SIDE`]) to straight RGBA.
 pub fn decode(bytes: &[u8]) -> Option<image::RgbaImage> {
     decode_at(bytes, crate::metafile::DEFAULT_SIDE)
 }
 
-/// [`decode`], with a metafile drawn with its longer side `side` px.
+/// [`decode`], with a metafile or SVG drawn with its longer side `side` px.
 fn decode_at(bytes: &[u8], side: u32) -> Option<image::RgbaImage> {
     if bytes.len() > 512 << 20 {
         return None;
     }
     if crate::metafile::is_metafile(bytes) {
         return crate::metafile::rasterize(bytes, side);
+    }
+    if deckcraft_svg::is_svg(bytes) {
+        return deckcraft_svg::rasterize(bytes, side);
+    }
+    if deckcraft_svg::is_svgz(bytes)
+        && let Some(img) = deckcraft_svg::rasterize(bytes, side)
+    {
+        return Some(img);
     }
     let img = image::load_from_memory(bytes).ok()?;
     let (w, h) = (img.width(), img.height());
@@ -298,6 +306,14 @@ mod tests {
     #![allow(clippy::expect_used)]
 
     use super::*;
+
+    #[test]
+    fn an_svg_picture_decodes_to_its_fill() {
+        let svg = br#"<svg xmlns="http://www.w3.org/2000/svg" width="8" height="8"><rect width="8" height="8" fill="blue"/></svg>"#;
+        let img = decode(svg).expect("svg");
+        let p = img.get_pixel(0, 0).0;
+        assert!(p[2] > 200 && p[0] < 30 && p[1] < 30, "{p:?}");
+    }
 
     #[test]
     fn duotone_maps_luminance_between_its_two_colours() {

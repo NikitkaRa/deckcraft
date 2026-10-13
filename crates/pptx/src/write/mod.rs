@@ -40,6 +40,8 @@ pub struct Exp<'a> {
     pub p: &'a Presentation,
     pub pkg: PackageOut,
     media_parts: HashMap<MediaId, String>,
+    /// PNG raster of an SVG, keyed by the SVG's media id.
+    svg_png: HashMap<MediaId, String>,
     n_image: u32,
     n_media: u32,
     n_chart: u32,
@@ -143,6 +145,21 @@ impl Exp<'_> {
         }
         let part = self.media_part(id)?;
         Some(o.rels.add(kind, &opc::relative(&o.name, &part), false))
+    }
+    /// A PNG raster of an SVG picture, so a reader that ignores `svgBlip` still has an image.
+    pub fn svg_png_rel(&mut self, o: &mut Out, id: MediaId) -> Option<String> {
+        let part = if let Some(p) = self.svg_png.get(&id) {
+            p.clone()
+        } else {
+            let m = self.p.media(id)?;
+            let png = deckcraft_svg::rasterize_png(&m.data, 512)?;
+            self.n_image += 1;
+            let name = format!("ppt/media/image{}.png", self.n_image);
+            self.pkg.binary(&name, "image/png", png);
+            self.svg_png.insert(id, name.clone());
+            name
+        };
+        Some(o.rels.add("image", &opc::relative(&o.name, &part), false))
     }
     /// A tiny transparent PNG for pictures whose image is missing.
     pub fn placeholder_rel(&mut self, o: &mut Out) -> String {
@@ -382,6 +399,7 @@ pub fn export(p: &Presentation) -> Result<Vec<u8>, PptxError> {
         p,
         pkg: PackageOut::default(),
         media_parts: HashMap::new(),
+        svg_png: HashMap::new(),
         n_image: 0,
         n_media: 0,
         n_chart: 0,

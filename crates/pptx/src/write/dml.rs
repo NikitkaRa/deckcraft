@@ -93,13 +93,28 @@ pub fn fill(w: &mut W, x: &mut Exp, o: &mut Out, f: &Fill) {
     }
 }
 
+/// PowerPoint's SVG icon extension (`asvg:svgBlip`).
+const SVG_EXT_URI: &str = "{96DAC541-7B7A-43D3-8B79-37D633B846F1}";
+const NS_ASVG: &str = "http://schemas.microsoft.com/office/drawing/2016/SVG/main";
+
 /// `a:blipFill` / `p:blipFill`.
 pub fn blip_fill(w: &mut W, x: &mut Exp, o: &mut Out, tag: &str, pf: &PictureFill) {
-    let rid = x.media_rel(o, pf.media, "image").unwrap_or_else(|| x.placeholder_rel(o));
+    let svg = x.p.media(pf.media).is_some_and(|m| deckcraft_svg::is_svg(&m.data) || deckcraft_svg::is_svgz(&m.data));
+    let rid = if svg {
+        x.svg_png_rel(o, pf.media).unwrap_or_else(|| x.placeholder_rel(o))
+    } else {
+        x.media_rel(o, pf.media, "image").unwrap_or_else(|| x.placeholder_rel(o))
+    };
+    let svg_rid = svg.then(|| x.media_rel(o, pf.media, "image")).flatten();
     w.open(tag, A::new().a("rotWithShape", "1"));
     let adj = &pf.adjust;
-    let has_kids =
-        pf.alpha.is_some() || adj.brightness != 0.0 || adj.contrast != 0.0 || adj.grayscale || adj.duotone.is_some() || adj.clear_color.is_some();
+    let has_kids = svg_rid.is_some()
+        || pf.alpha.is_some()
+        || adj.brightness != 0.0
+        || adj.contrast != 0.0
+        || adj.grayscale
+        || adj.duotone.is_some()
+        || adj.clear_color.is_some();
     let a = A::new().a("r:embed", &rid);
     if has_kids {
         w.open("a:blip", a);
@@ -127,6 +142,13 @@ pub fn blip_fill(w: &mut W, x: &mut Exp, o: &mut Out, tag: &str, pf: &PictureFil
         }
         if adj.brightness != 0.0 || adj.contrast != 0.0 {
             w.empty("a:lum", A::new().a("bright", pct(adj.brightness.clamp(-1.0, 1.0))).a("contrast", pct(adj.contrast.clamp(-1.0, 1.0))));
+        }
+        if let Some(sid) = &svg_rid {
+            w.open0("a:extLst");
+            w.open("a:ext", A::new().a("uri", SVG_EXT_URI));
+            w.empty("asvg:svgBlip", A::new().a("xmlns:asvg", NS_ASVG).a("r:embed", sid));
+            w.close("a:ext");
+            w.close("a:extLst");
         }
         w.close("a:blip");
     } else {

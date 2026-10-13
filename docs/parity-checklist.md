@@ -8,7 +8,7 @@ The summary between `<!-- SUMMARY -->
 | Priority | Features | Done | Partial | Missing | Parity |
 |---|---|---|---|---|---|
 | P0 | 72 | 61 | 11 | 0 | 92% |
-| P1 | 65 | 38 | 21 | 6 | 75% |
+| P1 | 65 | 38 | 22 | 5 | 75% |
 | P2 | 54 | 13 | 14 | 27 | 37% |
 
 | Area | Parity |
@@ -25,7 +25,7 @@ The summary between `<!-- SUMMARY -->
 | Tables | 89% |
 | Charts | 65% |
 | SmartArt | 33% |
-| Pictures | 48% |
+| Pictures | 52% |
 | Media | 67% |
 | Transitions | 92% |
 | Animations | 79% |
@@ -179,7 +179,7 @@ Open P0 items: Contextual tabs (Shape Format, Picture Format, Table Design/Layou
 | SmartArt | Insert SmartArt (lists, processes, cycles, hierarchy) | P1 | P |
 | SmartArt | Text pane and layout switching | P2 | M |
 | Pictures | Insert picture (PNG, JPEG, GIF, WebP, BMP, TIFF) | P0 | D |
-| Pictures | SVG pictures | P1 | M |
+| Pictures | SVG pictures (rasterized; text only from fonts in the file) | P1 | P |
 | Pictures | Crop (and crop to shape, aspect ratio) | P0 | P |
 | Pictures | Corrections, colour, transparency | P1 | P |
 | Pictures | Artistic effects | P2 | M |

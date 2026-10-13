@@ -133,3 +133,64 @@ fn a_fill_overlay_round_trips() {
     let s = q.slides[0].shapes.iter().find(|s| s.name == "Overlaid").expect("shape");
     assert_eq!(s.effects.as_ref().and_then(|e| e.fill_overlay.clone()), Some(overlay));
 }
+
+/// An SVG icon is the picture that comes back, and the package also carries a PNG fallback.
+#[test]
+fn an_svg_icon_round_trips_ahead_of_its_png_fallback() {
+    let svg = br#"<svg xmlns="http://www.w3.org/2000/svg" width="8" height="8"><rect width="8" height="8" fill="red"/></svg>"#.to_vec();
+    let mut p = defaults::new_presentation(None);
+    let media = p.add_media("icon.svg", "image/svg+xml", svg.clone());
+    let id = ShapeId(p.alloc_id());
+    let first = p.slides[0].id;
+    p.slide_mut(first).expect("slide").shapes.push(Shape {
+        id,
+        name: "Icon".into(),
+        xfrm: Some(Xfrm::new(10.0, 10.0, 80.0, 80.0)),
+        fill: Some(Fill::Picture(PictureFill { media, ..Default::default() })),
+        ..Default::default()
+    });
+    let bytes = deckcraft_pptx::export(&p).expect("export");
+    let mut z = zip::ZipArchive::new(Cursor::new(bytes.as_slice())).expect("zip");
+    let mut names = vec![];
+    let mut slide = String::new();
+    let mut png_name = None;
+    for i in 0..z.len() {
+        let mut f = z.by_index(i).expect("entry");
+        let name = f.name().to_string();
+        names.push(name.clone());
+        let mut d = vec![];
+        f.read_to_end(&mut d).expect("read");
+        if name.starts_with("ppt/slides/slide") && name.ends_with(".xml") {
+            slide = String::from_utf8(d).expect("utf8");
+        } else if name.ends_with(".png") {
+            png_name = Some(name);
+        }
+    }
+    assert!(names.iter().any(|n| n.ends_with(".svg")), "{names:?}");
+    assert!(png_name.is_some(), "{names:?}");
+    assert!(slide.contains("svgBlip"), "{slide}");
+    // Replace the fallback with a different picture. Reopen must still keep the SVG.
+    let png_name = png_name.expect("png");
+    let green = png();
+    let mut out = zip::ZipWriter::new(Cursor::new(Vec::new()));
+    let o = zip::write::SimpleFileOptions::default();
+    let mut z = zip::ZipArchive::new(Cursor::new(bytes.as_slice())).expect("zip");
+    for i in 0..z.len() {
+        let mut f = z.by_index(i).expect("entry");
+        let name = f.name().to_string();
+        let mut d = vec![];
+        f.read_to_end(&mut d).expect("read");
+        if name == png_name {
+            d = green.clone();
+        }
+        out.start_file(name, o).expect("start");
+        out.write_all(&d).expect("write");
+    }
+    let swapped = out.finish().expect("finish").into_inner();
+    let q = deckcraft_pptx::import(&swapped).expect("import");
+    let shape = q.slides[0].shapes.iter().find(|s| s.name == "Icon").expect("shape");
+    let Fill::Picture(pf) = shape.fill.as_ref().expect("fill") else { panic!("not a picture") };
+    let item = q.media(pf.media).expect("media");
+    assert!(item.data.starts_with(b"<svg"), "the PNG fallback replaced the icon");
+    assert_eq!(item.data.as_ref(), svg.as_slice());
+}

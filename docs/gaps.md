@@ -20,7 +20,7 @@ revision history.
 | 1 | PPTX never tested against a corpus of real decks | File format | B | 20–35 | [file-format-parity.md](file-format-parity.md) |
 | 2 | Data loss and crashes on common paths (#60, #40, #59) | Stability | B | 6–12 | this file |
 | 3 | PPTX round trip drops comment threads, media options, rewind (#70, #74, #77) | File format | B | 3–6 | [file-format-parity.md](file-format-parity.md) |
-| 4 | SVG pictures don't render (EMF/WMF do) | File format | B | 6–12 | [file-format-parity.md](file-format-parity.md) |
+| 4 | EMF/WMF pictures ignore clip regions | File format | | 2–4 | [file-format-parity.md](file-format-parity.md) |
 | 5 | No localization: English only | Localization | B (infra + 5 languages) | 55–90 | [localization-parity.md](localization-parity.md) |
 | 6 | No printing | Feature | B | 5–8 | [file-format-parity.md](file-format-parity.md) |
 | 7 | Fonts: only Regular, Bold and Italic faces (#69) | Feature | B | 3–5 | [ui-parity.md](ui-parity.md) |
@@ -75,14 +75,14 @@ Detail in [file-format-parity.md](file-format-parity.md).
 - **Impact:** a deck opened and saved silently loses review state and show behaviour.
 - **Estimate:** 3–6 h. **Beta blocker.**
 
-### SVG pictures don't render
-- **Evidence:** `crates/render/src/images.rs` decodes through `image` 0.25 (PNG, JPEG, WebP, GIF,
-  TIFF, BMP), and EMF/WMF through `deckcraft-metafile` (ported from WordCraft: paths, fills, pens,
-  pattern and hatch brushes, bitmaps and text; clip regions and EMF+ records are not drawn).
-  Nothing reads SVG; PowerPoint's Insert Icons stores SVG with a PNG fallback.
-- **Impact:** SVG icons show only their raster fallback, and SVG files can't be inserted. An
-  EMF/WMF that clips its drawing (EXTSELECTCLIPRGN, INTERSECTCLIPRECT) draws past its clip.
-- **Estimate:** 4–8 h (an SVG renderer through `resvg`-style crates); EMF/WMF clip regions 2–4 h.
+### EMF/WMF clip regions aren't applied
+- **Evidence:** EMF/WMF draw through `deckcraft-metafile` (paths, fills, pens, pattern and hatch
+  brushes, bitmaps and text). Clip regions (`EXTSELECTCLIPRGN`, `INTERSECTCLIPRECT`) and EMF+
+  records are not drawn. SVG pictures rasterize (`crates/svg`): an inserted `.svg` draws, and a
+  PowerPoint icon's `asvg:svgBlip` is the picture that round-trips, with a PNG fallback written
+  beside it. Text in an SVG is drawn only from fonts embedded in the file.
+- **Impact:** an EMF/WMF that clips its drawing draws past its clip.
+- **Estimate:** 2–4 h.
 
 ### Template, slide-show and macro variants are saved as plain `.pptx`
 - **Evidence:** `crates/pptx/src/write/mod.rs` always writes the
@@ -255,6 +255,7 @@ Detail in [localization-parity.md](localization-parity.md).
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-10-13 | minor | SVG pictures rasterize and round-trip (`#297`); the picture gap left here is EMF/WMF clip regions |
 | 2026-10-12 | minor | IME composition in slide text and notes, and CJK interface text with real glyphs (#101): the IME gap is now Korean on the web and table-cell underlines |
 | 2026-10-12 | minor | EMF/WMF text, pattern and hatch brushes drawn; legacy OLE and ActiveX previews shown; the SVG gap keeps only EMF clip regions |
 | 2026-10-12 | minor | Text warps render (all 40 presets, adjusts round-trip); the warp gap is now the gallery, command and handles |

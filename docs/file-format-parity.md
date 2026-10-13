@@ -37,7 +37,7 @@ PowerPoint opens and saves; Viewer = opens only).
 | Kind | PowerPoint | DeckCraft | Notes |
 |---|---|---|---|
 | PNG, JPEG, GIF (animated), BMP, TIFF, WebP | yes | yes | `image` 0.25; animated GIFs play since #39 |
-| SVG | yes (with PNG fallback) | **no** | The PNG fallback shows; SVG files can't be inserted |
+| SVG | yes (with PNG fallback) | yes | Rasterized (`resvg`). An icon's `asvg:svgBlip` is kept, and a PNG fallback is written beside it. Text draws only from fonts in the file |
 | EMF / WMF | yes | partial | Drawn as vectors (paths, pens, pattern and hatch brushes, bitmaps, text in the document's fonts with the file's character advances); clip regions and EMF+ records are not drawn. Legacy OLE objects (VML preview) and ActiveX controls show their pictures |
 | HEIC | yes (macOS) | no | |
 | Audio: MP3, AAC/M4A, ALAC, WAV, AIFF, CAF, FLAC, Ogg Vorbis, Opus | yes (Ogg/Opus partly) | yes | Pure-Rust decoders in `crates/media`, `crates/opus` |
@@ -93,12 +93,13 @@ the round trip even though DeckCraft doesn't model it.
    embedded fonts, every transition and animation) in a corpus repo, with import → render → export
    → re-import checks in CI and a PowerPoint reference render for each (owner runs PowerPoint).
 2. The round-trip losses above (#70, #74, #77).
-3. SVG rendering, and clip regions inside EMF/WMF.
+3. Clip regions inside EMF/WMF.
 
 ## Revision history
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-10-13 | minor | SVG pictures rasterize; an icon's svgBlip round-trips with a PNG fallback (#297) |
 | 2026-10-12 | minor | EMF/WMF text and pattern brushes drawn; OLE (VML) and ActiveX previews read |
 | 2026-10-12 | minor | Text warps rendered; their adjust values read and written |
 | 2026-10-12 | trivial | Groups with a small legacy child coordinate space draw outlines, dashes, arrowheads and ink at their own width (#233) |
