@@ -179,7 +179,7 @@ Open P0 items: Contextual tabs (Shape Format, Picture Format, Table Design/Layou
 | SmartArt | Insert SmartArt (lists, processes, cycles, hierarchy) | P1 | P |
 | SmartArt | Text pane and layout switching | P2 | M |
 | Pictures | Insert picture (PNG, JPEG, GIF, WebP, BMP, TIFF) | P0 | D |
-| Pictures | SVG pictures (rasterized; text only from fonts in the file) | P1 | P |
+| Pictures | SVG pictures (rasterized; text is not drawn) | P1 | P |
 | Pictures | Crop (and crop to shape, aspect ratio) | P0 | P |
 | Pictures | Corrections, colour, transparency | P1 | P |
 | Pictures | Artistic effects | P2 | M |

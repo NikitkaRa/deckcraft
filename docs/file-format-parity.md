@@ -37,7 +37,7 @@ PowerPoint opens and saves; Viewer = opens only).
 | Kind | PowerPoint | DeckCraft | Notes |
 |---|---|---|---|
 | PNG, JPEG, GIF (animated), BMP, TIFF, WebP | yes | yes | `image` 0.25; animated GIFs play since #39 |
-| SVG | yes (with PNG fallback) | yes | Rasterized (`resvg`). An icon's `asvg:svgBlip` is kept, and a PNG fallback is written beside it. Text draws only from fonts in the file |
+| SVG | yes (with PNG fallback) | yes | Rasterized (`resvg`). An icon's `asvg:svgBlip` is kept, and a PNG fallback is written beside it. Text is not drawn (no fonts are loaded). A `.svgz` is stored inflated |
 | EMF / WMF | yes | partial | Drawn as vectors (paths, pens, pattern and hatch brushes, bitmaps, text in the document's fonts with the file's character advances); clip regions and EMF+ records are not drawn. Legacy OLE objects (VML preview) and ActiveX controls show their pictures |
 | HEIC | yes (macOS) | no | |
 | Audio: MP3, AAC/M4A, ALAC, WAV, AIFF, CAF, FLAC, Ogg Vorbis, Opus | yes (Ogg/Opus partly) | yes | Pure-Rust decoders in `crates/media`, `crates/opus` |

@@ -9,6 +9,7 @@ description = "Rasterize SVG pictures for slides and for the PNG PowerPoint keep
 workspace = true
 
 [dependencies]
+flate2 = "1.1.10"
 image = { workspace = true }
 # No system-font or memmap features: those need fontconfig and do not build for wasm.
 resvg = { version = "0.48.1", default-features = false, features = ["text", "raster-images", "svgz"] }

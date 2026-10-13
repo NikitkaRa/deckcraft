@@ -117,6 +117,15 @@ impl Exp<'_> {
         } else {
             m.content_type.clone()
         };
+        // `.svgz` is gzip. PowerPoint's svgBlip part is SVG markup, so store the inflated document.
+        let bytes = if ct == "image/svg+xml" || deckcraft_svg::is_svg(&m.data) || deckcraft_svg::is_svgz(&m.data) {
+            match deckcraft_svg::svg_xml(&m.data) {
+                Some(xml) => xml.into_owned(),
+                None => m.data.as_ref().clone(),
+            }
+        } else {
+            m.data.as_ref().clone()
+        };
         let name = if ct.starts_with("image/") {
             self.n_image += 1;
             format!("ppt/media/image{}.{ext}", self.n_image)
@@ -124,7 +133,7 @@ impl Exp<'_> {
             self.n_media += 1;
             format!("ppt/media/media{}.{ext}", self.n_media)
         };
-        self.pkg.binary(&name, &ct, m.data.as_ref().clone());
+        self.pkg.binary(&name, &ct, bytes);
         self.media_parts.insert(id, name.clone());
         Some(name)
     }

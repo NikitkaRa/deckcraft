@@ -1142,6 +1142,7 @@ dependencies = [
 name = "deckcraft-svg"
 version = "0.6.1"
 dependencies = [
+ "flate2",
  "image",
  "resvg",
 ]

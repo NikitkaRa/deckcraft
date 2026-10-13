@@ -194,3 +194,45 @@ fn an_svg_icon_round_trips_ahead_of_its_png_fallback() {
     assert!(item.data.starts_with(b"<svg"), "the PNG fallback replaced the icon");
     assert_eq!(item.data.as_ref(), svg.as_slice());
 }
+
+/// A gzip SVG is written as markup. PowerPoint does not treat gzip bytes in an `.svg` part as an icon.
+#[test]
+fn an_svgz_icon_is_stored_as_svg_markup() {
+    let gz = hex(
+        "1f8b0800a615ce6a02ff6d8c5b0a80201000afb2ec015aa99f08f53269ae600f74693b7ef9dfdfc00c63db9de0d9cbd11cb2c8b510a9eaa0d370d644a33186be0241731076382370cc89a5a3b735aef2ab60cba538ac312079db17fe05d934926e6a000000",
+    );
+    assert!(gz.starts_with(&[0x1f, 0x8b]));
+    let mut p = defaults::new_presentation(None);
+    let media = p.add_media("icon.svgz", "image/svg+xml", gz);
+    let id = ShapeId(p.alloc_id());
+    let first = p.slides[0].id;
+    p.slide_mut(first).expect("slide").shapes.push(Shape {
+        id,
+        name: "Icon".into(),
+        xfrm: Some(Xfrm::new(10.0, 10.0, 80.0, 80.0)),
+        fill: Some(Fill::Picture(PictureFill { media, ..Default::default() })),
+        ..Default::default()
+    });
+    let bytes = deckcraft_pptx::export(&p).expect("export");
+    let mut z = zip::ZipArchive::new(Cursor::new(bytes.as_slice())).expect("zip");
+    let mut svg_part = None;
+    for i in 0..z.len() {
+        let mut f = z.by_index(i).expect("entry");
+        if f.name().ends_with(".svg") {
+            let mut d = vec![];
+            f.read_to_end(&mut d).expect("read");
+            svg_part = Some(d);
+        }
+    }
+    let part = svg_part.expect("svg part");
+    assert!(part.starts_with(b"<svg"), "stored gzip instead of markup: {:02x?}", &part[..part.len().min(4)]);
+    let q = deckcraft_pptx::import(&bytes).expect("import");
+    let shape = q.slides[0].shapes.iter().find(|s| s.name == "Icon").expect("shape");
+    let Fill::Picture(pf) = shape.fill.as_ref().expect("fill") else { panic!("not a picture") };
+    let item = q.media(pf.media).expect("media");
+    assert!(item.data.starts_with(b"<svg"));
+}
+
+fn hex(s: &str) -> Vec<u8> {
+    (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).expect("hex")).collect()
+}

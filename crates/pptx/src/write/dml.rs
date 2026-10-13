@@ -99,7 +99,7 @@ const NS_ASVG: &str = "http://schemas.microsoft.com/office/drawing/2016/SVG/main
 
 /// `a:blipFill` / `p:blipFill`.
 pub fn blip_fill(w: &mut W, x: &mut Exp, o: &mut Out, tag: &str, pf: &PictureFill) {
-    let svg = x.p.media(pf.media).is_some_and(|m| deckcraft_svg::is_svg(&m.data) || deckcraft_svg::is_svgz(&m.data));
+    let svg = x.p.media(pf.media).is_some_and(|m| deckcraft_svg::svg_xml(&m.data).is_some());
     let rid = if svg {
         x.svg_png_rel(o, pf.media).unwrap_or_else(|| x.placeholder_rel(o))
     } else {

@@ -80,7 +80,7 @@ Detail in [file-format-parity.md](file-format-parity.md).
   brushes, bitmaps and text). Clip regions (`EXTSELECTCLIPRGN`, `INTERSECTCLIPRECT`) and EMF+
   records are not drawn. SVG pictures rasterize (`crates/svg`): an inserted `.svg` draws, and a
   PowerPoint icon's `asvg:svgBlip` is the picture that round-trips, with a PNG fallback written
-  beside it. Text in an SVG is drawn only from fonts embedded in the file.
+  beside it. Text in an SVG is not drawn: no fonts are loaded. A `.svgz` is stored as SVG markup.
 - **Impact:** an EMF/WMF that clips its drawing draws past its clip.
 - **Estimate:** 2–4 h.
 

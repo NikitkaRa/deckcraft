@@ -174,7 +174,7 @@ pub fn blip_fill(imp: &mut Imp, part: &Part, bf: &El) -> Option<PictureFill> {
 fn picture_media(imp: &mut Imp, part: &Part, blip: &El) -> Option<deckcraft_model::MediaId> {
     if let Some(svg) = blip.find("svgBlip")
         && let Some(id) = media_ref(imp, part, svg)
-        && imp.media.iter().any(|m| m.id == id && (deckcraft_svg::is_svg(&m.data) || deckcraft_svg::is_svgz(&m.data)))
+        && imp.media.iter().any(|m| m.id == id && deckcraft_svg::svg_xml(&m.data).is_some())
     {
         return Some(id);
     }
