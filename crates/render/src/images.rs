@@ -75,6 +75,9 @@ fn adjust_key(a: &PictureAdjust) -> u64 {
     mix(a.contrast.to_bits());
     mix(a.saturation.unwrap_or(1.0).to_bits());
     mix(a.grayscale as u64);
+    if let Some(t) = a.bi_level {
+        mix(t.to_bits() ^ (1 << 42));
+    }
     mix(a.sharpen.to_bits());
     if let Some(c) = a.clear_color {
         mix(((c.r as u64) << 16) | ((c.g as u64) << 8) | c.b as u64 | 1 << 40);
@@ -256,7 +259,14 @@ pub(crate) fn gif_pixmap(bytes: &Arc<Vec<u8>>, adj: &PictureAdjust, t: f64) -> O
 
 fn apply_adjust(img: &mut image::RgbaImage, a: &PictureAdjust) {
     let sat = a.saturation.unwrap_or(1.0);
-    if a.brightness == 0.0 && a.contrast == 0.0 && sat == 1.0 && !a.grayscale && a.clear_color.is_none() && a.duotone.is_none() {
+    if a.brightness == 0.0
+        && a.contrast == 0.0
+        && sat == 1.0
+        && !a.grayscale
+        && a.bi_level.is_none()
+        && a.clear_color.is_none()
+        && a.duotone.is_none()
+    {
         return;
     }
     let duo = duotone_rgb(a);
@@ -274,6 +284,17 @@ fn apply_adjust(img: &mut image::RgbaImage, a: &PictureAdjust) {
         }
         let mut rgb = [p[0] as f64, p[1] as f64, p[2] as f64];
         let y = 0.299 * rgb[0] + 0.587 * rgb[1] + 0.114 * rgb[2];
+        // Black and white: darker than the threshold becomes black, the rest white. Alpha stays.
+        if let Some(thresh) = a.bi_level.filter(|t| t.is_finite()) {
+            let v = if y >= thresh.clamp(0.0, 1.0) * 255.0 { 255.0 } else { 0.0 };
+            rgb = [v, v, v];
+            for (i, v) in rgb.iter().enumerate() {
+                if let Some(ch) = p.0.get_mut(i) {
+                    *ch = *v as u8;
+                }
+            }
+            continue;
+        }
         let s = if a.grayscale { 0.0 } else { sat };
         for v in &mut rgb {
             *v = y + (*v - y) * s;
@@ -316,6 +337,26 @@ mod tests {
         let other = PictureAdjust { duotone: Some((ColorRef::rgb(Rgba::rgb(0, 0, 0)), ColorRef::rgb(Rgba::rgb(255, 0, 0)))), ..Default::default() };
         assert_ne!(adjust_key(&adj), adjust_key(&other));
         assert_ne!(adjust_key(&adj), adjust_key(&PictureAdjust::default()));
+    }
+
+    #[test]
+    fn bi_level_turns_pixels_black_or_white_and_keeps_alpha() {
+        // Gray 127 is just under a 50% threshold; 128 is at or above it. Cyan is the logo case.
+        let sample =
+            || image::RgbaImage::from_fn(3, 1, |x, _| image::Rgba([[127, 127, 127, 200], [128, 128, 128, 255], [0x2D, 0xC6, 0xD6, 180]][x as usize]));
+        let mut half = sample();
+        apply_adjust(&mut half, &PictureAdjust { bi_level: Some(0.5), ..Default::default() });
+        assert_eq!(half.get_pixel(0, 0).0, [0, 0, 0, 200]);
+        assert_eq!(half.get_pixel(1, 0).0, [255, 255, 255, 255]);
+        assert_eq!(half.get_pixel(2, 0).0, [255, 255, 255, 180], "cyan is lighter than 50%");
+        let mut quarter = sample();
+        apply_adjust(&mut quarter, &PictureAdjust { bi_level: Some(0.25), ..Default::default() });
+        assert_eq!(quarter.get_pixel(0, 0).0, [255, 255, 255, 200], "gray 127 is lighter than 25%");
+        assert_eq!(quarter.get_pixel(2, 0).0, [255, 255, 255, 180]);
+        let quarter_adj = PictureAdjust { bi_level: Some(0.25), ..Default::default() };
+        let half_adj = PictureAdjust { bi_level: Some(0.5), ..Default::default() };
+        assert_ne!(adjust_key(&quarter_adj), adjust_key(&half_adj));
+        assert_ne!(adjust_key(&half_adj), adjust_key(&PictureAdjust::default()));
     }
 
     #[test]

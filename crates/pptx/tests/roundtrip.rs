@@ -768,6 +768,23 @@ fn a_picture_duotone_round_trips() {
 }
 
 #[test]
+fn a_picture_bi_level_round_trips() {
+    let mut p = defaults::new_presentation(None);
+    let img = p.add_media("image1.png", "image/png", png(4, 4, [45, 198, 214]));
+    let mut pic = shape(&mut p, "Logo", 10.0, 10.0, 100.0, 100.0);
+    let mut pf = PictureFill { media: img, ..Default::default() };
+    pf.adjust.bi_level = Some(0.25);
+    pic.kind = deckcraft_model::ShapeKind::Picture { fill: pf };
+    let first = p.slides[0].id;
+    p.slide_mut(first).expect("slide").shapes.push(pic);
+    let q = round(&p);
+    let sh = by_name(&q.slides[0], "Logo");
+    let deckcraft_model::ShapeKind::Picture { fill } = &sh.kind else { panic!("picture") };
+    let thresh = fill.adjust.bi_level.expect("biLevel kept");
+    assert!((thresh - 0.25).abs() < 1e-9, "{thresh}");
+}
+
+#[test]
 fn line_break_options_round_trip() {
     let mut p = defaults::new_presentation(None);
     let first = p.slides[0].id;

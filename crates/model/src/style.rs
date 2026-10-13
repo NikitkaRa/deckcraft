@@ -143,6 +143,9 @@ pub struct PictureAdjust {
     /// 0..4 (1 = unchanged)
     pub saturation: Option<f64>,
     pub grayscale: bool,
+    /// Black-and-white threshold, 0..1 (`a:biLevel`). Luminance below it becomes black; the rest white.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bi_level: Option<f64>,
     /// Recolour duotone (dark, light).
     pub duotone: Option<(ColorRef, ColorRef)>,
     /// Make a colour transparent (Set Transparent Color).

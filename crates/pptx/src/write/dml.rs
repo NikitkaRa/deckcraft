@@ -98,8 +98,13 @@ pub fn blip_fill(w: &mut W, x: &mut Exp, o: &mut Out, tag: &str, pf: &PictureFil
     let rid = x.media_rel(o, pf.media, "image").unwrap_or_else(|| x.placeholder_rel(o));
     w.open(tag, A::new().a("rotWithShape", "1"));
     let adj = &pf.adjust;
-    let has_kids =
-        pf.alpha.is_some() || adj.brightness != 0.0 || adj.contrast != 0.0 || adj.grayscale || adj.duotone.is_some() || adj.clear_color.is_some();
+    let has_kids = pf.alpha.is_some()
+        || adj.brightness != 0.0
+        || adj.contrast != 0.0
+        || adj.grayscale
+        || adj.bi_level.is_some()
+        || adj.duotone.is_some()
+        || adj.clear_color.is_some();
     let a = A::new().a("r:embed", &rid);
     if has_kids {
         w.open("a:blip", a);
@@ -124,6 +129,9 @@ pub fn blip_fill(w: &mut W, x: &mut Exp, o: &mut Out, tag: &str, pf: &PictureFil
         }
         if adj.grayscale {
             w.empty0("a:grayscl");
+        }
+        if let Some(t) = adj.bi_level.filter(|t| t.is_finite()) {
+            w.empty("a:biLevel", A::new().a("thresh", pct(t.clamp(0.0, 1.0))));
         }
         if adj.brightness != 0.0 || adj.contrast != 0.0 {
             w.empty("a:lum", A::new().a("bright", pct(adj.brightness.clamp(-1.0, 1.0))).a("contrast", pct(adj.contrast.clamp(-1.0, 1.0))));
