@@ -177,6 +177,29 @@ pub struct Perf {
     pub fps: f64,
 }
 
+/// File-type filters for a save dialog suggesting `suggested`: the suggested type first (so it is
+/// preselected), then the other presentation formats. Desktop dialogs without filters only offer
+/// "All files", so a deck couldn't be saved as PowerPoint from them (#208).
+pub fn save_filters(suggested: &str) -> Vec<(&'static str, &'static [&'static str])> {
+    const PPTX: (&str, &[&str]) = ("PowerPoint Presentation (.pptx)", &["pptx"]);
+    const DECK: (&str, &[&str]) = ("DeckCraft Presentation (.deckcraft)", &["deckcraft"]);
+    const POTX: (&str, &[&str]) = ("PowerPoint Template (.potx)", &["potx"]);
+    const PPSX: (&str, &[&str]) = ("PowerPoint Show (.ppsx)", &["ppsx"]);
+    let l = suggested.to_ascii_lowercase();
+    let first = [PPTX, DECK, POTX, PPSX].into_iter().find(|f| f.1.iter().any(|e| l.ends_with(&format!(".{e}")))).unwrap_or(DECK);
+    let mut v = vec![first];
+    v.extend([DECK, PPTX, POTX, PPSX].into_iter().filter(|f| f.0 != first.0));
+    v
+}
+
+/// `path` with `.ext` added when it has no presentation extension (`Talk` → `Talk.pptx`); paths
+/// that already name a format keep it, so typing `Talk.deckcraft` still saves natively.
+pub fn with_save_extension(path: &str, ext: &str) -> String {
+    let l = path.to_ascii_lowercase();
+    let known = ["deckcraft", "pptx", "potx", "ppsx"].iter().any(|e| l.ends_with(&format!(".{e}")));
+    if known || ext.is_empty() { path.to_string() } else { format!("{path}.{ext}") }
+}
+
 pub struct SlideApp {
     pub session: Session,
     pub services: Services,
@@ -539,7 +562,10 @@ impl SlideApp {
             "app.insertPictureDialog" => self.pick_and_insert("picture", "insert.picture"),
             "app.insertAudioDialog" => self.pick_and_insert("audio", "insert.audio"),
             "app.insertVideoDialog" => self.pick_and_insert("video", "insert.video"),
-            "app.saveAsDialog" => self.save_as_dialog("deckcraft"),
+            "app.saveAsDialog" => {
+                let fmt = self.current_save_format();
+                self.save_as_dialog(fmt)
+            }
             "app.exportDialog" => self.dialog = Some(dialogs::Dialog::new("export")),
             "app.dialog" => {
                 let d = p.get("id").and_then(Value::as_str).ok_or("missing `id`")?;
@@ -599,12 +625,21 @@ impl SlideApp {
         }
     }
 
+    /// The format Save As suggests: the open file's own (a deck opened from `.pptx` stays one),
+    /// native otherwise.
+    pub fn current_save_format(&self) -> &'static str {
+        let path = self.session.active().and_then(|d| d.path.clone()).unwrap_or_default();
+        if deckcraft_engine::cmd::file::format_for_path(&path) == "pptx" { "pptx" } else { "deckcraft" }
+    }
+
     pub fn save_as_dialog(&mut self, format: &str) {
         let name = self.session.active().map(|d| d.title()).unwrap_or_else(|| "Presentation".into());
         let ext = if format == "pptx" { "pptx" } else { "deckcraft" };
         let suggested = format!("{name}.{ext}");
         if let Some(pick) = self.services.pick_save.as_mut() {
             if let Some(path) = pick(&suggested) {
+                // A dialog that returns a bare name (no type chosen) gets the format asked for (#208).
+                let path = with_save_extension(&path, ext);
                 match self.session.execute("file.saveAs", &json!({"path": path})) {
                     Ok(_) => {
                         self.set_status(format!("Saved {path}"));
@@ -1129,9 +1164,12 @@ fn js_now() -> f64 {
 
 #[cfg(test)]
 mod ime_tests;
+#[cfg(test)]
+mod save_tests;
 
 #[cfg(test)]
 mod tests {
+
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
