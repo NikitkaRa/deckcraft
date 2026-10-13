@@ -354,6 +354,12 @@ fn parse_block<S: ByteSource + ?Sized>(
     Ok(Some((track, rel, flags, frames)))
 }
 
+/// A block's absolute timestamp: the cluster timestamp plus the block's signed relative time.
+/// Both come from the file, so an overflowing sum is an error rather than a wrapped timestamp.
+fn block_ts(cluster_ts: i64, rel: i16) -> Result<i64> {
+    cluster_ts.checked_add(i64::from(rel)).ok_or_else(|| Error::Invalid(format!("block timestamp overflows: cluster {cluster_ts} + {rel}")))
+}
+
 /// Parse one SimpleBlock or BlockGroup element.
 fn parse_block_elem<S: ByteSource + ?Sized>(
     io: &mut Io<'_, S>,
@@ -369,7 +375,7 @@ fn parse_block_elem<S: ByteSource + ?Sized>(
             Ok(Some(BlockRef {
                 track,
                 block_offset: h.pos,
-                ts: cluster_ts + rel as i64,
+                ts: block_ts(cluster_ts, rel)?,
                 frames,
                 block_duration: None,
                 keyframe: flags & 0x80 != 0,
@@ -398,7 +404,7 @@ fn parse_block_elem<S: ByteSource + ?Sized>(
             Ok(Some(BlockRef {
                 track,
                 block_offset: h.pos,
-                ts: cluster_ts + rel as i64,
+                ts: block_ts(cluster_ts, rel)?,
                 frames,
                 block_duration: dur,
                 keyframe: !has_ref,
@@ -1163,5 +1169,18 @@ impl<S: ByteSource> Iterator for Demuxer<S> {
                 Some(Err(e))
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod arith_tests {
+    use super::block_ts;
+
+    #[test]
+    fn block_timestamp_overflow_is_an_error() {
+        assert_eq!(block_ts(1000, -5).unwrap(), 995);
+        assert_eq!(block_ts(i64::MAX - 1, 1).unwrap(), i64::MAX);
+        assert!(block_ts(i64::MAX, 1).is_err());
+        assert!(block_ts(i64::MIN, -1).is_err());
     }
 }

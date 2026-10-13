@@ -315,8 +315,8 @@ impl SliceHeader {
             ensure!(cabac_init_idc <= 2, "cabac_init_idc out of range");
         }
         let slice_qp_delta = r.read_se()?;
-        let qp = pps.pic_init_qp + slice_qp_delta;
-        ensure!((0..=51).contains(&qp), "slice QP {qp} out of range");
+        let qp = pps.pic_init_qp.checked_add(slice_qp_delta);
+        ensure!(qp.is_some_and(|qp| (0..=51).contains(&qp)), "slice QP out of range");
         let mut sp_for_switch = false;
         let mut slice_qs_delta = 0;
         if matches!(slice_type, SliceType::Sp | SliceType::Si) {

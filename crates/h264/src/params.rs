@@ -610,8 +610,14 @@ impl Pps {
         ensure!(num_ref_idx_l0_default_active <= 32 && num_ref_idx_l1_default_active <= 32, "num_ref_idx_default_active out of range");
         let weighted_pred = r.read_flag()?;
         let weighted_bipred_idc = r.read_bits(2)?;
-        let pic_init_qp = 26 + r.read_se()?;
-        let pic_init_qs = 26 + r.read_se()?;
+        // pic_init_qp_minus26 lies in -(26 + QpBdOffsetY)..=25 (QpBdOffsetY <= 36) and pic_init_qs_minus26
+        // in -26..=25 (7.4.2.2); check before adding so hostile values cannot overflow.
+        let pic_init_qp_minus26 = r.read_se()?;
+        ensure!((-(26 + 36)..=25).contains(&pic_init_qp_minus26), "pic_init_qp_minus26 out of range");
+        let pic_init_qs_minus26 = r.read_se()?;
+        ensure!((-26..=25).contains(&pic_init_qs_minus26), "pic_init_qs_minus26 out of range");
+        let pic_init_qp = 26 + pic_init_qp_minus26;
+        let pic_init_qs = 26 + pic_init_qs_minus26;
         let chroma_qp_index_offset = r.read_se()?;
         ensure!((-12..=12).contains(&chroma_qp_index_offset), "chroma_qp_index_offset out of range");
         let deblocking_filter_control_present = r.read_flag()?;
@@ -750,5 +756,36 @@ mod tests {
         assert!(Sps::parse(&sps_with(10, Some([u32::MAX - 1, u32::MAX - 1, 0, 0]))).is_err());
         assert!(Sps::parse(&sps_with(10, Some([0x8000_0000, 0, 0, 0]))).is_err());
         assert!(Sps::parse(&sps_with(10, Some([1, 1, 1, 1]))).is_ok());
+    }
+
+    fn pps_with(qp_minus26: i32, qs_minus26: i32) -> Vec<u8> {
+        let mut w = BitWriter::new();
+        w.write_ue(0); // pps id
+        w.write_ue(0); // sps id
+        w.write_bit(false); // CAVLC
+        w.write_bit(false); // bottom_field_pic_order
+        w.write_ue(0); // one slice group
+        w.write_ue(0);
+        w.write_ue(0);
+        w.write_bit(false); // weighted_pred
+        w.write_bits(0, 2);
+        w.write_se(qp_minus26);
+        w.write_se(qs_minus26);
+        w.write_se(0); // chroma_qp_index_offset
+        w.write_bit(true);
+        w.write_bit(false);
+        w.write_bit(false);
+        w.rbsp_trailing();
+        w.finish()
+    }
+
+    #[test]
+    fn hostile_pic_init_qp_is_an_error_not_an_overflow() {
+        let spss = vec![Some(Sps::parse(&sps_with(10, None)).unwrap())];
+        assert_eq!(Pps::parse(&pps_with(25, -26), &spss).unwrap().pic_init_qp, 51);
+        assert_eq!(Pps::parse(&pps_with(-62, 0), &spss).unwrap().pic_init_qp, -36);
+        for (qp, qs) in [(26, 0), (-63, 0), (i32::MAX, 0), (i32::MIN + 1, 0), (0, 26), (0, -27), (0, i32::MAX)] {
+            assert!(Pps::parse(&pps_with(qp, qs), &spss).is_err(), "qp {qp} qs {qs}");
+        }
     }
 }

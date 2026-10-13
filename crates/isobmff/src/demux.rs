@@ -701,11 +701,11 @@ fn parse_stbl(stbl: &[u8], t: &mut Track, is_qt: bool, file_len: u64) -> Result<
         let a = t.audio().cloned().unwrap_or_default();
         let frame_bytes = |frames: u64| -> u64 {
             if a.qt_version == 1 && a.bytes_per_frame > 0 && a.samples_per_packet > 0 {
-                frames / a.samples_per_packet as u64 * a.bytes_per_frame as u64
+                (frames / a.samples_per_packet as u64).saturating_mul(a.bytes_per_frame as u64)
             } else if const_size > 1 {
                 frames * const_size as u64
             } else {
-                frames * p.bytes_per_frame() as u64
+                frames.saturating_mul(p.bytes_per_frame() as u64)
             }
         };
         if chunks.len() > MAX_SAMPLES {

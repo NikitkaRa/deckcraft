@@ -726,7 +726,10 @@ impl Pps {
         let num_ref_idx_l0_default = r.read_ue_plus(1)?;
         let num_ref_idx_l1_default = r.read_ue_plus(1)?;
         ensure!(num_ref_idx_l0_default <= 15 && num_ref_idx_l1_default <= 15, "num_ref_idx_default_active out of range");
-        let init_qp = 26 + r.read_se()?;
+        // init_qp_minus26 lies in -(26 + QpBdOffsetY)..=25 (QpBdOffsetY <= 48); check before adding.
+        let init_qp_minus26 = r.read_se()?;
+        ensure!((-(26 + 48)..=25).contains(&init_qp_minus26), "init_qp_minus26 out of range");
+        let init_qp = 26 + init_qp_minus26;
         let constrained_intra_pred = r.read_flag()?;
         let transform_skip = r.read_flag()?;
         let cu_qp_delta_enabled = r.read_flag()?;
@@ -997,6 +1000,40 @@ mod tests {
             w.rbsp_trailing();
             let b = w.finish();
             assert!(StRps::parse(&mut BitReader::new(&b), 0, &[], 1).is_err(), "ue {ue:#x}");
+        }
+    }
+
+    fn pps_with(init_qp_minus26: i32) -> Vec<u8> {
+        let mut w = BitWriter::new();
+        w.write_ue(0); // pps id
+        w.write_ue(0); // sps id
+        [false, false].iter().for_each(|&b| w.write_bit(b)); // dependent slices, output_flag
+        w.write_bits(0, 3);
+        [false, false].iter().for_each(|&b| w.write_bit(b)); // sign hiding, cabac_init_present
+        w.write_ue(0);
+        w.write_ue(0);
+        w.write_se(init_qp_minus26);
+        [false; 3].iter().for_each(|&b| w.write_bit(b)); // constrained intra, transform skip, cu_qp_delta
+        w.write_se(0);
+        w.write_se(0);
+        [false; 6].iter().for_each(|&b| w.write_bit(b)); // ... tiles, entropy sync
+        w.write_bit(false); // loop filter across slices
+        w.write_bit(false); // deblocking control
+        w.write_bit(false); // scaling list
+        w.write_bit(false); // lists_modification
+        w.write_ue(0); // log2_parallel_merge_level_minus2
+        w.write_bit(false); // slice header extension
+        w.write_bit(false); // pps extension
+        w.rbsp_trailing();
+        w.finish()
+    }
+
+    #[test]
+    fn hostile_init_qp_is_an_error_not_an_overflow() {
+        assert_eq!(Pps::parse(&pps_with(25)).unwrap().init_qp, 51);
+        assert_eq!(Pps::parse(&pps_with(-74)).unwrap().init_qp, -48);
+        for v in [26, -75, i32::MAX, i32::MIN + 1] {
+            assert!(Pps::parse(&pps_with(v)).is_err(), "init_qp_minus26 {v}");
         }
     }
 }

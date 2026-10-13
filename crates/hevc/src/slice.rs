@@ -339,9 +339,9 @@ impl SliceHeader {
                 sh.max_num_merge_cand = 5 - five_minus;
             }
             sh.qp_delta = r.read_se()?;
-            let qp = pps.init_qp + sh.qp_delta;
+            let qp = pps.init_qp.checked_add(sh.qp_delta);
             let qp_bd = 6 * (sps.bit_depth_luma as i32 - 8);
-            ensure!((-qp_bd..=51).contains(&qp), "SliceQpY {qp} out of range");
+            ensure!(qp.is_some_and(|qp| (-qp_bd..=51).contains(&qp)), "SliceQpY out of range");
             if pps.slice_chroma_qp_offsets_present {
                 sh.cb_qp_offset = r.read_se()?;
                 sh.cr_qp_offset = r.read_se()?;
@@ -391,8 +391,8 @@ fn parse_pwt(r: &mut BitReader, sh: &SliceHeader, sps: &Sps) -> Result<PredWeigh
     ensure!(t.luma_log2_denom <= 7, "luma_log2_weight_denom out of range");
     let chroma = sps.chroma_array_type() != 0;
     if chroma {
-        let d = t.luma_log2_denom as i32 + r.read_se()?;
-        ensure!((0..=7).contains(&d), "ChromaLog2WeightDenom out of range");
+        let d = (t.luma_log2_denom as i32).checked_add(r.read_se()?);
+        let Some(d) = d.filter(|d| (0..=7).contains(d)) else { return invalid("ChromaLog2WeightDenom out of range") };
         t.chroma_log2_denom = d as u32;
     }
     let lists = if sh.is_b() { 2 } else { 1 };

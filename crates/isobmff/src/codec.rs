@@ -607,7 +607,7 @@ pub struct PcmConfig {
 impl PcmConfig {
     /// Bytes per interleaved audio frame (all channels).
     pub fn bytes_per_frame(&self) -> u32 {
-        (self.bits as u32).div_ceil(8) * self.channels.max(1)
+        (self.bits as u32).div_ceil(8).saturating_mul(self.channels.max(1))
     }
 }
 
@@ -888,6 +888,11 @@ pub(crate) fn parse_sample_entry(format: FourCc, payload: &[u8], handler: FourCc
             let _size_of_struct = c.u32()?;
             a.sample_rate = c.f64()?;
             a.channels = c.u32()?;
+            // Version 0/1 store the channel count in 16 bits; a larger v2 count is not a real stream and
+            // would overflow the byte counts derived from it.
+            if a.channels > u32::from(u16::MAX) {
+                return Err(Error::Invalid(format!("QuickTime v2 audio with {} channels", a.channels)));
+            }
             let _always = c.u32()?;
             a.const_bits_per_channel = c.u32()?;
             a.lpcm_flags = c.u32()?;
@@ -1577,5 +1582,13 @@ mod tests {
     fn asc_parse() {
         assert_eq!(parse_asc(&[0x11, 0x90]), Some((2, 48000, 2)));
         assert_eq!(parse_asc(&[]), None);
+    }
+
+    #[test]
+    fn pcm_bytes_per_frame_saturates_instead_of_overflowing() {
+        let p = PcmConfig { bits: 32, channels: u32::MAX, ..Default::default() };
+        assert_eq!(p.bytes_per_frame(), u32::MAX);
+        let p = PcmConfig { bits: 24, channels: 6, ..Default::default() };
+        assert_eq!(p.bytes_per_frame(), 18);
     }
 }

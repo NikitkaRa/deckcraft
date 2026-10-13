@@ -179,3 +179,24 @@ fn opus_toc_durations() {
     assert_eq!(opus_packet_samples([0xF8 | 3, 7], 10), None); // 140 ms: invalid
     assert_eq!(opus_packet_samples([0xF8, 0], 0), None);
 }
+
+#[test]
+fn hostile_granules_saturate_instead_of_overflowing() {
+    for (g1, g2) in [(i64::MAX - 10, i64::MAX), (i64::MIN + 1, i64::MAX), (i64::MAX, i64::MIN + 1)] {
+        let mut f = Vec::new();
+        let head = opus_head(u16::MAX);
+        let (l, b) = lace(&[&head], false);
+        page(&mut f, 0x02, 0, 1, 0, &l, &b);
+        let (l, b) = lace(&[b"OpusTags"], false);
+        page(&mut f, 0, 0, 1, 1, &l, &b);
+        let (a, c) = (pkt(0, 40), pkt(1, 40));
+        let (l, b) = lace(&[&a], false);
+        page(&mut f, 0, g1, 1, 2, &l, &b);
+        let (l, b) = lace(&[&c], false);
+        page(&mut f, 0x04, g2, 1, 3, &l, &b);
+        let o = open(&f).unwrap();
+        let t = OpusTiming::of(&o.streams[0], u32::from(u16::MAX));
+        assert_eq!(t.starts.len(), 2);
+        assert!(t.total >= 0);
+    }
+}
