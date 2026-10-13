@@ -9,7 +9,7 @@
 //! deckcraft-cli commands [FILTER]               # list commands (JSON)
 //! deckcraft-cli describe ID                     # one command
 //! deckcraft-cli app [--port PORT] COMMAND [JSON] | --method METHOD [JSON]   # drive the running app
-//! deckcraft-cli mcp [--connect PORT] [--sample] # MCP server over stdio
+//! deckcraft-cli mcp [--connect PORT] [--sample] [--automation-read-root DIR] [--automation-write-root DIR]
 //! deckcraft-cli links | --version
 //! ```
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
@@ -41,7 +41,7 @@ const USAGE: &str = "usage: deckcraft-cli info FILE
        deckcraft-cli commands [FILTER]
        deckcraft-cli describe COMMAND
        deckcraft-cli app [--port PORT] COMMAND [JSON] | --method METHOD [JSON]
-       deckcraft-cli mcp [--connect PORT] [--sample]
+       deckcraft-cli mcp [--connect PORT] [--sample] [--automation-read-root DIR] [--automation-write-root DIR]
        deckcraft-cli links | --version";
 
 fn main() -> ExitCode {
@@ -329,19 +329,68 @@ fn app(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-fn mcp(args: &[String]) -> Result<(), String> {
-    use deckcraft_mcp::{Backend, Headless, Remote, Server, control_addr};
-    let mut connect: Option<String> = None;
+#[derive(Debug)]
+struct McpOptions {
+    connect: Option<String>,
+    sample: bool,
+    read_root: Option<std::path::PathBuf>,
+    write_root: Option<std::path::PathBuf>,
+}
+
+fn mcp_options(args: &[String]) -> Result<McpOptions, String> {
+    let mut connect = None;
     let mut sample = false;
+    let mut read_root = None;
+    let mut write_root = None;
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
-            "--connect" => connect = Some(it.next().cloned().ok_or("--connect needs a port or host:port")?),
+            "--connect" => {
+                if connect.is_some() {
+                    return Err("--connect given twice".into());
+                }
+                connect = Some(it.next().cloned().ok_or("--connect needs a port or host:port")?);
+            }
             "--sample" => sample = true,
+            "--automation-read-root" => {
+                if read_root.is_some() {
+                    return Err("--automation-read-root given twice".into());
+                }
+                read_root = Some(std::path::PathBuf::from(it.next().ok_or("--automation-read-root needs a folder")?));
+            }
+            "--automation-write-root" => {
+                if write_root.is_some() {
+                    return Err("--automation-write-root given twice".into());
+                }
+                write_root = Some(std::path::PathBuf::from(it.next().ok_or("--automation-write-root needs a folder")?));
+            }
             other => return Err(format!("unknown mcp option `{other}`")),
         }
     }
-    let backend: Box<dyn Backend> = match connect {
+    if connect.is_some() && (read_root.is_some() || write_root.is_some()) {
+        return Err("automation roots confine the headless server; they do not apply through --connect".into());
+    }
+    Ok(McpOptions { connect, sample, read_root, write_root })
+}
+
+/// Install process-wide roots for the headless server. Nothing is checked when both are absent.
+fn prepare_automation(opts: &McpOptions) -> Result<(), String> {
+    use deckcraft_engine::file_access::AutomationRoots;
+    let Some(roots) = AutomationRoots::new(opts.read_root.as_deref(), opts.write_root.as_deref())? else {
+        return Ok(());
+    };
+    if !deckcraft_engine::file_access::confine_process(&roots) {
+        return Err("automation roots are already set for this process".into());
+    }
+    Ok(())
+}
+
+fn mcp(args: &[String]) -> Result<(), String> {
+    use deckcraft_mcp::{Backend, Headless, Remote, Server, control_addr};
+    let opts = mcp_options(args)?;
+    prepare_automation(&opts)?;
+    let sample = opts.sample;
+    let backend: Box<dyn Backend> = match opts.connect {
         Some(c) => Box::new(Remote::connect(&control_addr(&c)).map_err(|e| format!("can't reach the app at {c}: {e}"))?),
         None => {
             let mut h = Headless::new();
@@ -354,4 +403,29 @@ fn mcp(args: &[String]) -> Result<(), String> {
     let mut server = Server::new(backend);
     let stdin = std::io::stdin();
     server.serve(stdin.lock(), std::io::stdout()).map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    #[test]
+    fn mcp_roots_are_parsed_and_connect_rejects_them() {
+        let opts = mcp_options(&args(&["--sample", "--automation-read-root", "/in", "--automation-write-root", "/out"])).unwrap();
+        assert!(opts.sample);
+        assert!(opts.connect.is_none());
+        assert_eq!(opts.read_root.unwrap(), std::path::PathBuf::from("/in"));
+        assert_eq!(opts.write_root.unwrap(), std::path::PathBuf::from("/out"));
+        let err = mcp_options(&args(&["--connect", "7990", "--automation-read-root", "/in"])).unwrap_err();
+        assert!(err.contains("--connect"), "{err}");
+        assert!(mcp_options(&args(&["--automation-write-root"])).is_err());
+        assert!(mcp_options(&args(&["--nope"])).unwrap_err().contains("unknown"));
+        let missing = mcp_options(&args(&["--automation-read-root", "/no/such/deckcraft-automation-root"])).unwrap();
+        let err = prepare_automation(&missing).unwrap_err();
+        assert!(err.contains("cannot open the automation read root"), "{err}");
+    }
 }

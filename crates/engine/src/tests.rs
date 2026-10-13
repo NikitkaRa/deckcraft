@@ -835,3 +835,55 @@ fn slide_ranges_parse_like_powerpoints_print_box() {
     let opts = cmd::file::pdf_options(&json!({"slides": [0, 7, 1]}), 2).unwrap();
     assert_eq!(opts.slides, Some(vec![0, 1]), "indices past the end are dropped");
 }
+
+/// Open, save, export and inserted media stay inside the automation roots (#373).
+#[test]
+fn automation_roots_confine_open_save_export_and_media() {
+    let base = std::env::temp_dir().join(format!("deckcraft-confine-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    let read = base.join("read");
+    let write = base.join("write");
+    let outside = base.join("outside");
+    std::fs::create_dir_all(&read).unwrap();
+    std::fs::create_dir_all(&write).unwrap();
+    std::fs::create_dir_all(&outside).unwrap();
+    let deck = read.join("deck.deckcraft");
+    let mut s = session();
+    s.execute("file.saveAs", &json!({"path": deck.to_string_lossy()})).unwrap();
+    let roots = file_access::AutomationRoots::new(Some(&read), Some(&write)).unwrap().unwrap();
+    file_access::confine(Some(&roots), || {
+        let mut s = session();
+        let missing = outside.join("nope.deckcraft");
+        let err = s.execute("file.open", &json!({"path": missing.to_string_lossy()})).unwrap_err();
+        assert!(err.to_string().contains("outside the read root"), "{err}");
+        assert!(!missing.exists());
+        s.execute("file.open", &json!({"path": deck.to_string_lossy()})).unwrap();
+        let blocked = outside.join("x.deckcraft");
+        let err = s.execute("file.saveAs", &json!({"path": blocked.to_string_lossy()})).unwrap_err();
+        assert!(err.to_string().contains("outside the write root"), "{err}");
+        assert!(!blocked.exists());
+        assert!(!outside.join("x.deckcraft.saving").exists());
+        let err = s.execute("file.saveAs", &json!({"path": read.join("other.deckcraft").to_string_lossy()})).unwrap_err();
+        assert!(err.to_string().contains("outside the write root"), "{err}");
+        assert!(!read.join("other.deckcraft").exists());
+        let saved = write.join("ok.deckcraft");
+        s.execute("file.saveAs", &json!({"path": saved.to_string_lossy()})).unwrap();
+        assert!(saved.is_file());
+        let err = s.execute("file.open", &json!({"path": saved.to_string_lossy()})).unwrap_err();
+        assert!(err.to_string().contains("outside the read root"), "{err}");
+        let shot = outside.join("slide.png");
+        let err = s.execute("file.export", &json!({"path": shot.to_string_lossy(), "format": "png", "scale": 0.05})).unwrap_err();
+        assert!(err.to_string().contains("outside the write root"), "{err}");
+        assert!(!shot.exists());
+        s.execute("slide.new", &json!({})).unwrap();
+        s.execute("file.export", &json!({"path": write.join("slide.png").to_string_lossy(), "format": "png", "all": true, "scale": 0.05})).unwrap();
+        assert!(write.join("slide1.png").is_file());
+        assert!(write.join("slide2.png").is_file());
+        std::fs::write(read.join("pic.bin"), b"not a picture").unwrap();
+        let err = s.execute("insert.picture", &json!({"path": outside.join("pic.bin").to_string_lossy()})).unwrap_err();
+        assert!(err.to_string().contains("outside the read root"), "{err}");
+        let err = s.execute("insert.picture", &json!({"path": read.join("pic.bin").to_string_lossy()})).unwrap_err();
+        assert!(err.to_string().contains("not a picture"), "{err}");
+    });
+    let _ = std::fs::remove_dir_all(&base);
+}

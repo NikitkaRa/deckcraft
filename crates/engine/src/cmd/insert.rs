@@ -224,6 +224,7 @@ pub(crate) fn media_bytes(p: &Value, cmd: &str) -> Result<(String, Vec<u8>)> {
     }
     #[cfg(not(target_arch = "wasm32"))]
     if let Some(path) = str_param(p, "path") {
+        crate::file_access::check_read(path).map_err(EngineError::Other)?;
         let bytes = std::fs::read(path).map_err(|e| EngineError::Other(format!("{path}: {e}")))?;
         let name = std::path::Path::new(path).file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| "media".into());
         return Ok((name, bytes));

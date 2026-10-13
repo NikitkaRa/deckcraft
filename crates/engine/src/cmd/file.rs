@@ -97,6 +97,7 @@ pub fn add_opened(s: &mut Session, name: &str, path: Option<String>, p: Presenta
 #[cfg(not(target_arch = "wasm32"))]
 fn open(s: &mut Session, p: &Value) -> Result<Value> {
     let path = str_param(p, "path").ok_or_else(|| bad("file.open", "missing `path`"))?;
+    crate::file_access::check_read(path).map_err(EngineError::Other)?;
     let bytes = std::fs::read(path).map_err(|e| EngineError::Other(format!("{path}: {e}")))?;
     let doc = open_presentation(path, &bytes)?;
     let native = deckcraft_format::sniff(&bytes) || deckcraft_pptx::sniff(&bytes);
@@ -217,6 +218,8 @@ fn mark_saved(s: &mut Session, path: Option<String>) -> Result<()> {
 fn write_file(path: &str, bytes: &[u8]) -> Result<()> {
     // Write to a temporary sibling then rename, so a failed save never truncates the old file.
     let tmp = format!("{path}.saving");
+    crate::file_access::check_write(path).map_err(EngineError::Other)?;
+    crate::file_access::check_write(&tmp).map_err(EngineError::Other)?;
     std::fs::write(&tmp, bytes).map_err(|e| EngineError::Other(format!("{path}: {e}")))?;
     std::fs::rename(&tmp, path).map_err(|e| EngineError::Other(format!("{path}: {e}")))
 }
@@ -323,7 +326,7 @@ fn info(s: &mut Session, _p: &Value) -> Result<Value> {
     let st = s.doc()?;
     let doc = &st.doc;
     #[cfg(not(target_arch = "wasm32"))]
-    let bytes = st.path.as_ref().and_then(|p| std::fs::metadata(p).ok()).map(|m| m.len());
+    let bytes = st.path.as_ref().filter(|p| crate::file_access::check_read(p).is_ok()).and_then(|p| std::fs::metadata(p).ok()).map(|m| m.len());
     #[cfg(target_arch = "wasm32")]
     let bytes: Option<u64> = None;
     Ok(json!({

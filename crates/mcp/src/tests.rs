@@ -117,3 +117,29 @@ fn export_tool_lists_pdf_and_its_options() {
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// `ui.render` to a path is the same write root as save and export.
+#[test]
+fn render_to_a_path_stays_inside_the_write_root() {
+    use crate::Backend;
+    use deckcraft_engine::file_access::{AutomationRoots, confine};
+
+    let base = std::env::temp_dir().join(format!("deckcraft-mcp-render-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    let write = base.join("write");
+    let outside = base.join("outside");
+    std::fs::create_dir_all(&write).unwrap();
+    std::fs::create_dir_all(&outside).unwrap();
+    let roots = AutomationRoots::new(None, Some(&write)).unwrap().unwrap();
+    let mut h = Headless::with_document();
+    confine(Some(&roots), || {
+        let blocked = outside.join("slide.png");
+        let err = h.call("ui.render", json!({"path": blocked.to_string_lossy(), "scale": 0.05})).unwrap_err();
+        assert!(err.contains("outside the write root"), "{err}");
+        assert!(!blocked.exists());
+        let inside = write.join("slide.png");
+        h.call("ui.render", json!({"path": inside.to_string_lossy(), "scale": 0.05})).unwrap();
+        assert!(std::fs::read(&inside).unwrap().starts_with(b"\x89PNG"));
+    });
+    let _ = std::fs::remove_dir_all(&base);
+}

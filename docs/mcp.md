@@ -5,6 +5,12 @@ headless engine (no window); with `--connect PORT` it drives a running DeckCraft
 `--control PORT`, so an agent and a person can work on the same deck. `--sample` opens the sample
 deck.
 
+`--automation-read-root DIR` and `--automation-write-root DIR` confine that headless server. A
+presentation, picture, export or rendered file is read or written only when its path is inside
+that folder: the path is made absolute and links are followed, and `/work2` is not inside `/work`.
+One root grants only that kind of access. With neither flag the server is not confined. The flags
+do not apply through `--connect`, because that drives another process.
+
 ```json
 {
   "mcpServers": {

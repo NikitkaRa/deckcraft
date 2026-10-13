@@ -9,6 +9,7 @@
 
 pub mod cmd;
 pub mod connect;
+pub mod file_access;
 pub mod fonts;
 pub mod guard;
 pub mod keys;
