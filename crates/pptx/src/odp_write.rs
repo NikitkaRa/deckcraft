@@ -1,10 +1,11 @@
-//! OpenDocument Presentation (.odp) export, first slice: slides (size, background, hidden),
-//! autoshapes and text boxes with their text, connectors, groups, pictures, and speaker notes.
+//! OpenDocument Presentation (.odp) export: slides (size, background, hidden, transitions),
+//! autoshapes and text boxes with their text, connectors, groups, pictures (with crops), tables,
+//! the layout's and master's graphics, and speaker notes.
 //!
 //! Everything is written with explicit formatting (automatic styles resolved through the
-//! placeholder and theme chain), so the file looks the same without our masters. Not written
-//! yet: tables, charts, media, ink, master/layout graphics, gradients/patterns (first colour),
-//! dashes (solid), shadows and other effects, picture crops, transitions and animations.
+//! placeholder and theme chain), so the file looks the same without our masters. Gradients keep
+//! their first and last colours; dashes map to ODF stroke dashes. Not written yet: charts,
+//! media, ink, patterns and picture fills of shapes, shadows and other effects, animations.
 
 use std::collections::HashMap;
 use std::fmt::Write as _;
@@ -14,8 +15,10 @@ use deckcraft_color::Rgba;
 use deckcraft_geom::{Rect, Xfrm};
 use deckcraft_model::resolve::{self, Ctx};
 use deckcraft_model::style::Fill;
+use deckcraft_model::style::{Dash, GradientShape};
+use deckcraft_model::table::Table;
 use deckcraft_model::text::{Align, Anchor, Bullet, Caps, Paragraph, RunKind, Spacing, Strike, TextBody};
-use deckcraft_model::{Geom, MediaId, Presentation, Shape, ShapeKind};
+use deckcraft_model::{Geom, MediaId, Presentation, Shape, ShapeKind, Slide};
 
 use crate::PptxError;
 use crate::xml::{A, W};
@@ -89,14 +92,41 @@ fn attrs(a: &[(&str, String)]) -> String {
     s
 }
 
+/// How a table cell looks under its table style (the renderer knows the built-in styles).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct CellLook {
+    pub fill: Option<Rgba>,
+    pub text: Option<Rgba>,
+    pub bold: bool,
+    /// Left, right, top, bottom: colour and width in points.
+    pub borders: [Option<(Rgba, f64)>; 4],
+}
+
+/// Supplies [`CellLook`]s: `(presentation, slide, table, row, column)`.
+pub type CellLookFn<'a> = &'a dyn Fn(&Presentation, &Slide, &Table, usize, usize) -> Option<CellLook>;
+
 struct Out<'a> {
     pres: &'a Presentation,
     styles: Styles,
+    /// Named styles for `office:styles` in styles.xml (gradients, stroke dashes).
+    named: String,
+    named_seen: HashMap<String, String>,
+    cell_look: Option<CellLookFn<'a>>,
     media: Vec<(MediaId, String)>,
     skipped: usize,
 }
 
 impl Out<'_> {
+    /// A named `office:styles` element built by `f(name)`, de-duplicated by `key`.
+    fn named(&mut self, prefix: &str, key: String, f: impl FnOnce(&str) -> String) -> String {
+        if let Some(n) = self.named_seen.get(&key) {
+            return n.clone();
+        }
+        let name = format!("{prefix}{}", self.named_seen.len() + 1);
+        self.named.push_str(&f(&name));
+        self.named_seen.insert(key, name.clone());
+        name
+    }
     fn picture(&mut self, id: MediaId) -> Option<String> {
         if let Some((_, n)) = self.media.iter().find(|m| m.0 == id) {
             return Some(n.clone());
@@ -237,7 +267,7 @@ fn geometry(g: &Geom) -> String {
     }
 }
 
-fn fill_props(ctx: &Ctx, f: Option<&Fill>, ph: Option<Rgba>) -> Vec<(&'static str, String)> {
+fn fill_props(o: &mut Out, ctx: &Ctx, f: Option<&Fill>, ph: Option<Rgba>) -> Vec<(&'static str, String)> {
     let solid = |c: Rgba| {
         let mut v = vec![("draw:fill", "solid".to_string()), ("draw:fill-color", hex(c))];
         if c.a < 255 {
@@ -247,30 +277,96 @@ fn fill_props(ctx: &Ctx, f: Option<&Fill>, ph: Option<Rgba>) -> Vec<(&'static st
     };
     match f {
         Some(Fill::Solid { color }) => solid(ctx.color(color, ph)),
+        Some(Fill::Gradient(g)) if g.stops.len() >= 2 => {
+            let mut stops = g.stops.clone();
+            stops.sort_by(|a, b| a.pos.total_cmp(&b.pos));
+            let (c0, c1) = (ctx.color(&stops[0].color, ph), ctx.color(&stops[stops.len() - 1].color, ph));
+            let (style, extra) = match &g.shape {
+                // DrawingML: degrees clockwise from left→right; ODF: tenths counter-clockwise from top→bottom.
+                GradientShape::Linear { angle, .. } => {
+                    ("linear", format!(" draw:angle=\"{}\"", (((90.0 - angle) % 360.0 + 360.0) % 360.0 * 10.0).round() as i64))
+                }
+                GradientShape::Path { path, focus } => {
+                    let cx = (focus[0] + (1.0 - focus[2])) / 2.0 * 100.0;
+                    let cy = (focus[1] + (1.0 - focus[3])) / 2.0 * 100.0;
+                    (if path == "circle" { "radial" } else { "rectangular" }, format!(" draw:cx=\"{cx:.0}%\" draw:cy=\"{cy:.0}%\""))
+                }
+            };
+            // A path gradient runs from its centre (DrawingML's first stop) outwards; ODF's radial
+            // runs from the border (start) to the centre (end).
+            let (start, end) = if style == "linear" { (c0, c1) } else { (c1, c0) };
+            let key = format!("{style}{extra}{}{}", hex(start), hex(end));
+            let name = o.named("Gradient_", key, |n| {
+                format!(
+                    "<draw:gradient draw:name=\"{n}\" draw:style=\"{style}\"{extra} draw:start-color=\"{}\" draw:end-color=\"{}\" draw:start-intensity=\"100%\" draw:end-intensity=\"100%\" draw:border=\"0%\"/>",
+                    hex(start),
+                    hex(end)
+                )
+            });
+            vec![("draw:fill", "gradient".into()), ("draw:fill-gradient-name", name)]
+        }
         Some(Fill::Gradient(g)) => g.stops.first().map(|s| solid(ctx.color(&s.color, ph))).unwrap_or_else(|| vec![("draw:fill", "none".into())]),
+        Some(Fill::Pattern(pf)) => solid(ctx.color(&pf.bg, ph)),
         _ => vec![("draw:fill", "none".into())],
     }
 }
 
-fn line_props(ctx: &Ctx, shape: &Shape) -> Vec<(&'static str, String)> {
-    let (l, ph) = resolve::line(ctx, shape);
-    match &l.fill {
-        Some(Fill::Solid { color }) => {
-            vec![("draw:stroke", "solid".into()), ("svg:stroke-color", hex(ctx.color(color, ph))), ("svg:stroke-width", cm(l.width.unwrap_or(0.75)))]
+/// A DrawingML dash as ODF `(dots1, dots1-length, dots2, dots2-length, distance)`, lengths as
+/// multiples of the line width.
+fn dash_parts(d: &Dash) -> Option<(u32, f64, u32, f64, f64)> {
+    Some(match d {
+        Dash::Preset { name } => match name.as_str() {
+            "solid" => return None,
+            "sysDot" => (1, 1.0, 0, 0.0, 1.0),
+            "dot" => (1, 1.0, 0, 0.0, 3.0),
+            "sysDash" => (1, 3.0, 0, 0.0, 1.0),
+            "dash" => (1, 4.0, 0, 0.0, 3.0),
+            "lgDash" => (1, 8.0, 0, 0.0, 3.0),
+            "sysDashDot" => (1, 3.0, 1, 1.0, 1.0),
+            "dashDot" => (1, 4.0, 1, 1.0, 3.0),
+            "lgDashDot" => (1, 8.0, 1, 1.0, 3.0),
+            "sysDashDotDot" => (1, 3.0, 2, 1.0, 1.0),
+            "lgDashDotDot" => (1, 8.0, 2, 1.0, 3.0),
+            _ => (1, 4.0, 0, 0.0, 3.0),
+        },
+        Dash::Custom { pattern } => {
+            let (d, sp) = pattern.first().copied()?;
+            (1, d.max(0.01), 0, 0.0, sp.max(0.01))
         }
-        Some(Fill::Gradient(g)) if !g.stops.is_empty() => vec![
-            ("draw:stroke", "solid".into()),
-            ("svg:stroke-color", hex(ctx.color(&g.stops[0].color, ph))),
-            ("svg:stroke-width", cm(l.width.unwrap_or(0.75))),
-        ],
-        _ => vec![("draw:stroke", "none".into())],
+    })
+}
+
+fn line_props(o: &mut Out, ctx: &Ctx, shape: &Shape) -> Vec<(&'static str, String)> {
+    let (l, ph) = resolve::line(ctx, shape);
+    let color = match &l.fill {
+        Some(Fill::Solid { color }) => ctx.color(color, ph),
+        Some(Fill::Gradient(g)) if !g.stops.is_empty() => ctx.color(&g.stops[0].color, ph),
+        _ => return vec![("draw:stroke", "none".into())],
+    };
+    let mut v = vec![("svg:stroke-color", hex(color)), ("svg:stroke-width", cm(l.width.unwrap_or(0.75)))];
+    if color.a < 255 {
+        v.push(("svg:stroke-opacity", format!("{:.0}%", color.a as f64 / 2.55)));
     }
+    match l.dash.as_ref().and_then(dash_parts) {
+        Some((d1, l1, d2, l2, dist)) => {
+            let pct = |x: f64| format!("{:.0}%", x * 100.0);
+            let key = format!("{d1}/{l1}/{d2}/{l2}/{dist}");
+            let name = o.named("Dash_", key, |n| {
+                let two = if d2 > 0 { format!(" draw:dots2=\"{d2}\" draw:dots2-length=\"{}\"", pct(l2)) } else { String::new() };
+                format!("<draw:stroke-dash draw:name=\"{n}\" draw:style=\"rect\" draw:dots1=\"{d1}\" draw:dots1-length=\"{}\"{two} draw:distance=\"{}\"/>", pct(l1), pct(dist))
+            });
+            v.insert(0, ("draw:stroke-dash", name));
+            v.insert(0, ("draw:stroke", "dash".into()));
+        }
+        None => v.insert(0, ("draw:stroke", "solid".into())),
+    }
+    v
 }
 
 fn graphic_style(o: &mut Out, ctx: &Ctx, shape: &Shape, with_text: bool) -> String {
     let (f, ph) = resolve::fill(ctx, shape);
-    let mut a = fill_props(ctx, f.as_ref(), ph);
-    a.extend(line_props(ctx, shape));
+    let mut a = fill_props(o, ctx, f.as_ref(), ph);
+    a.extend(line_props(o, ctx, shape));
     if with_text {
         let b = resolve::body(ctx, shape);
         let va = match b.anchor {
@@ -539,7 +635,10 @@ fn shape(o: &mut Out, ctx: &Ctx, sh: &Shape, xf: Xfrm, w: &mut String) {
                 return;
             };
             let mut a = vec![("draw:fill", "none".to_string())];
-            a.extend(line_props(ctx, sh));
+            a.extend(line_props(o, ctx, sh));
+            if let Some(clip) = clip(o.pres, fill) {
+                a.push(("fo:clip", clip));
+            }
             let st = o.styles.get("gr", "graphic", format!("<style:graphic-properties{}/>", attrs(&a)));
             let _ = write!(w, "<draw:frame draw:style-name=\"{st}\"{name}{}>", attrs(&place(&xf)));
             let _ = write!(
@@ -578,8 +677,140 @@ fn shape(o: &mut Out, ctx: &Ctx, sh: &Shape, xf: Xfrm, w: &mut String) {
             }
             w.push_str("</draw:g>");
         }
+        ShapeKind::Table(t) => table(o, ctx, sh, t, xf, &name, w),
         _ => o.skipped += 1,
     }
+}
+
+/// `fo:clip` for a cropped picture: insets measured on the picture's own size.
+fn clip(p: &Presentation, f: &deckcraft_model::style::PictureFill) -> Option<String> {
+    if f.crop.iter().all(|c| *c <= 1e-6) {
+        return None;
+    }
+    let (w, h) = pixel_size(&p.media(f.media)?.data)?;
+    let (w, h) = (w as f64 * 0.75, h as f64 * 0.75);
+    let [l, t, r, b] = f.crop.map(|c| c.max(0.0));
+    Some(format!("rect({}, {}, {}, {})", cm(t * h), cm(r * w), cm(b * h), cm(l * w)))
+}
+
+/// A PNG, JPEG or GIF's size in pixels, from its header.
+fn pixel_size(b: &[u8]) -> Option<(u32, u32)> {
+    let be32 = |i: usize| b.get(i..i + 4).map(|x| u32::from_be_bytes([x[0], x[1], x[2], x[3]]));
+    let be16 = |i: usize| b.get(i..i + 2).map(|x| u16::from_be_bytes([x[0], x[1]]) as u32);
+    if b.starts_with(&[0x89, b'P', b'N', b'G']) {
+        return Some((be32(16)?, be32(20)?)).filter(|s| s.0 > 0 && s.1 > 0);
+    }
+    if b.starts_with(b"GIF8") {
+        let le16 = |i: usize| b.get(i..i + 2).map(|x| u16::from_le_bytes([x[0], x[1]]) as u32);
+        return Some((le16(6)?, le16(8)?)).filter(|s| s.0 > 0 && s.1 > 0);
+    }
+    if b.starts_with(&[0xFF, 0xD8]) {
+        let mut i = 2;
+        while i + 9 < b.len() {
+            if b[i] != 0xFF {
+                i += 1;
+                continue;
+            }
+            let m = b[i + 1];
+            if (0xC0..=0xCF).contains(&m) && !matches!(m, 0xC4 | 0xC8 | 0xCC) {
+                return Some((be16(i + 7)?, be16(i + 5)?)).filter(|s| s.0 > 0 && s.1 > 0);
+            }
+            i += 2 + be16(i + 2)? as usize;
+        }
+    }
+    None
+}
+
+fn border(side: Option<(Rgba, f64)>) -> String {
+    match side {
+        Some((c, w)) if c.a > 0 && w > 0.0 => format!("{} solid {}", cm(w), hex(c)),
+        _ => "none".into(),
+    }
+}
+
+fn table(o: &mut Out, ctx: &Ctx, sh: &Shape, t: &Table, xf: Xfrm, name: &str, w: &mut String) {
+    let _ = write!(w, "<draw:frame{name}{}><table:table>", attrs(&place(&xf)));
+    for cw in &t.cols {
+        let st = o.styles.get("co", "table-column", format!("<style:table-column-properties style:column-width=\"{}\"/>", cm(*cw)));
+        let _ = write!(w, "<table:table-column table:style-name=\"{st}\"/>");
+    }
+    let slide = ctx.pres.slides.iter().find(|s| s.shapes.iter().any(|x| x.id == sh.id) || deckcraft_model::find_shape(&s.shapes, sh.id).is_some());
+    for (r, row) in t.rows.iter().enumerate() {
+        let rs = o.styles.get("ro", "table-row", format!("<style:table-row-properties style:row-height=\"{}\"/>", cm(row.height)));
+        let _ = write!(w, "<table:table-row table:style-name=\"{rs}\">");
+        for (c, cell) in row.cells.iter().enumerate() {
+            if cell.h_merge || cell.v_merge {
+                w.push_str("<table:covered-table-cell/>");
+                continue;
+            }
+            let look = match (o.cell_look, slide) {
+                (Some(f), Some(sl)) => f(ctx.pres, sl, t, r, c).unwrap_or_default(),
+                _ => CellLook::default(),
+            };
+            let mut ga = match &cell.fill {
+                Some(f) => fill_props(o, ctx, Some(f), None),
+                None => match look.fill {
+                    Some(c) if c.a > 0 => vec![("draw:fill", "solid".to_string()), ("draw:fill-color", hex(c))],
+                    _ => vec![("draw:fill", "none".to_string())],
+                },
+            };
+            let [ml, mr, mt, mb] = cell.margins.unwrap_or([7.2, 7.2, 3.6, 3.6]);
+            ga.push(("fo:padding-left", cm(ml)));
+            ga.push(("fo:padding-right", cm(mr)));
+            ga.push(("fo:padding-top", cm(mt)));
+            ga.push(("fo:padding-bottom", cm(mb)));
+            let va = match cell.anchor {
+                Some(Anchor::Middle) => "middle",
+                Some(Anchor::Bottom) => "bottom",
+                _ => "top",
+            };
+            ga.push(("draw:textarea-vertical-align", va.into()));
+            let mut sides = look.borders;
+            for (k, b) in cell.borders.iter().enumerate() {
+                if let Some(l) = b {
+                    sides[k] = match &l.fill {
+                        Some(Fill::Solid { color }) => Some((ctx.color(color, None), l.width.unwrap_or(0.75))),
+                        _ => None,
+                    };
+                }
+            }
+            let pa = [
+                ("fo:border-left", border(sides[0])),
+                ("fo:border-right", border(sides[1])),
+                ("fo:border-top", border(sides[2])),
+                ("fo:border-bottom", border(sides[3])),
+            ];
+            let cs =
+                o.styles.get("ce", "table-cell", format!("<style:graphic-properties{}/><style:paragraph-properties{}/>", attrs(&ga), attrs(&pa)));
+            let span = if cell.grid_span > 1 || cell.row_span > 1 {
+                format!(" table:number-columns-spanned=\"{}\" table:number-rows-spanned=\"{}\"", cell.grid_span.max(1), cell.row_span.max(1))
+            } else {
+                String::new()
+            };
+            let _ = write!(w, "<table:table-cell table:style-name=\"{cs}\"{span}>");
+            // The table style's text colour and boldness apply where the runs don't say.
+            let mut body = cell.text.clone();
+            for para in &mut body.paragraphs {
+                for run in &mut para.runs {
+                    if run.props.fill.is_none()
+                        && let Some(c) = look.text
+                    {
+                        run.props.fill = Some(Fill::solid(deckcraft_model::style::ColorRef::rgb(c)));
+                    }
+                    if run.props.bold.is_none() && look.bold {
+                        run.props.bold = Some(true);
+                    }
+                }
+            }
+            if body.paragraphs.is_empty() {
+                w.push_str("<text:p/>");
+            }
+            text_body(o, ctx, sh, &body, w);
+            w.push_str("</table:table-cell>");
+        }
+        w.push_str("</table:table-row>");
+    }
+    w.push_str("</table:table></draw:frame>");
 }
 
 fn package(files: Vec<(String, Vec<u8>, bool)>) -> Result<Vec<u8>, PptxError> {
@@ -599,12 +830,82 @@ fn package(files: Vec<(String, Vec<u8>, bool)>) -> Result<Vec<u8>, PptxError> {
 
 /// Write `p` as an OpenDocument presentation.
 pub fn export_odp(p: &Presentation) -> Result<Vec<u8>, PptxError> {
-    let mut o = Out { pres: p, styles: Styles::default(), media: vec![], skipped: 0 };
+    export_odp_with(p, None)
+}
+
+/// ODF `smil:type`, `smil:subtype` and whether it runs in reverse, for a transition.
+fn smil(t: &deckcraft_model::anim::Transition) -> Option<(&'static str, &'static str, bool)> {
+    let o = t.option.as_str();
+    // DrawingML directions say where the slide moves to; ODF names where it comes from.
+    let from = match o {
+        "l" => "fromRight",
+        "u" => "fromBottom",
+        "d" => "fromTop",
+        "lu" => "fromBottomRight",
+        "ru" => "fromBottomLeft",
+        "ld" => "fromTopRight",
+        "rd" => "fromTopLeft",
+        _ => "fromLeft",
+    };
+    let vert = matches!(o, "vert" | "u" | "d");
+    Some(match t.kind.as_str() {
+        "none" | "" | "cut" => return None,
+        "fade" if o == "black" || o == "thruBlk" => ("fade", "fadeOverColor", false),
+        "push" => ("pushWipe", from, false),
+        "cover" => ("slideWipe", from, false),
+        "uncover" | "pull" => ("slideWipe", from, true),
+        "wipe" => ("barWipe", if vert { "topToBottom" } else { "leftToRight" }, matches!(o, "l" | "u")),
+        "split" => ("barnDoorWipe", if o.starts_with("horz") || o == "horz" { "horizontal" } else { "vertical" }, o.ends_with("in") || o == "in"),
+        "randomBar" => ("randomBarWipe", if vert { "horizontal" } else { "vertical" }, false),
+        "dissolve" => ("dissolve", "defaultSubtype", false),
+        "checker" => ("checkerBoardWipe", if vert { "down" } else { "across" }, false),
+        "blinds" => ("blindsWipe", if vert { "horizontal" } else { "vertical" }, false),
+        "clock" => ("clockWipe", "clockwiseTwelve", false),
+        "wheel" => ("pinWheelWipe", "oneBlade", false),
+        "circle" => ("ellipseWipe", "circle", o == "in"),
+        "diamond" => ("irisWipe", "diamond", o == "in"),
+        "zoom" | "shape" => ("irisWipe", "rectangle", o == "in"),
+        "strips" => ("waterfallWipe", "horizontalLeft", false),
+        _ => ("fade", "crossfade", false),
+    })
+}
+
+/// Write `p` as an OpenDocument presentation; `cell_look` gives table cells their table style's
+/// look (the engine passes the renderer's; without it only explicit cell formatting is written).
+pub fn export_odp_with(p: &Presentation, cell_look: Option<CellLookFn>) -> Result<Vec<u8>, PptxError> {
+    let mut o = Out { pres: p, styles: Styles::default(), named: String::new(), named_seen: HashMap::new(), cell_look, media: vec![], skipped: 0 };
     let mut body = String::new();
     for (i, sl) in p.slides.iter().enumerate() {
         let Some(ctx) = Ctx::for_slide(p, sl) else { continue };
         let (bg, ph) = resolve::background(&ctx, Some(sl));
-        let mut a = fill_props(&ctx, Some(&bg), ph);
+        let mut a = fill_props(&mut o, &ctx, Some(&bg), ph);
+        if let Some(t) = &sl.transition {
+            if let Some((ty, sub, rev)) = smil(t) {
+                a.push(("smil:type", ty.into()));
+                a.push(("smil:subtype", sub.into()));
+                if rev {
+                    a.push(("smil:direction", "reverse".into()));
+                }
+                if sub == "fadeOverColor" {
+                    a.push(("smil:fadeColor", "#000000".into()));
+                }
+                a.push((
+                    "presentation:transition-speed",
+                    if t.duration_ms <= 500 {
+                        "fast"
+                    } else if t.duration_ms <= 1000 {
+                        "medium"
+                    } else {
+                        "slow"
+                    }
+                    .into(),
+                ));
+            }
+            if let Some(ms) = t.advance_after_ms {
+                a.push(("presentation:transition-type", "automatic".into()));
+                a.push(("presentation:duration", format!("PT{}.{:03}S", ms / 1000, ms % 1000)));
+            }
+        }
         if sl.hidden {
             a.push(("presentation:visibility", "hidden".into()));
         }
@@ -612,6 +913,16 @@ pub fn export_odp(p: &Presentation) -> Result<Vec<u8>, PptxError> {
         a.push(("presentation:background-objects-visible", "true".into()));
         let dp = o.styles.get("dp", "drawing-page", format!("<style:drawing-page-properties{}/>", attrs(&a)));
         let _ = write!(body, "<draw:page draw:name=\"page{}\" draw:style-name=\"{dp}\" draw:master-page-name=\"Default\">", i + 1);
+        // The master's and layout's own graphics (not their placeholders), behind the slide's.
+        let (show_layout, show_master) = resolve::show_master_shapes(sl, ctx.layout);
+        let behind =
+            show_master.then_some(ctx.master.shapes.as_slice()).into_iter().chain(ctx.layout.filter(|_| show_layout).map(|l| l.shapes.as_slice()));
+        for list in behind {
+            for sh in list.iter().filter(|x| x.ph.is_none()) {
+                let xf = sh.xfrm.unwrap_or_default();
+                shape(&mut o, &ctx, sh, xf, &mut body);
+            }
+        }
         for sh in &sl.shapes {
             let xf = resolve::xfrm(&ctx, sh);
             shape(&mut o, &ctx, sh, xf, &mut body);
@@ -670,6 +981,11 @@ pub fn export_odp(p: &Presentation) -> Result<Vec<u8>, PptxError> {
         cm(size.height),
         if size.width >= size.height { "landscape" } else { "portrait" }
     ));
+    if !o.named.is_empty() {
+        styles.raw("<office:styles>");
+        styles.raw(&o.named);
+        styles.raw("</office:styles>");
+    }
     styles.raw("<office:master-styles><style:master-page style:name=\"Default\" style:page-layout-name=\"PM1\"/></office:master-styles>");
     styles.close("office:document-styles");
 
@@ -754,5 +1070,49 @@ mod tests {
         assert!(content.contains("<presentation:notes>") && content.contains("Say <text:s text:c=\"1\"/>hi"));
         assert!(read(&bytes, "META-INF/manifest.xml").contains("image/png"));
         assert!(read(&bytes, "styles.xml").contains("fo:page-width=\"33.867cm\""));
+    }
+
+    #[test]
+    fn master_graphics_transitions_and_crops() {
+        let mut p = deckcraft_model::defaults::new_presentation(None);
+        let master = std::sync::Arc::make_mut(&mut p.masters[0]);
+        master.shapes.push(Shape {
+            id: deckcraft_model::ShapeId(900),
+            name: "Logo bar".into(),
+            xfrm: Some(Xfrm::new(0.0, 500.0, 960.0, 40.0)),
+            ..Default::default()
+        });
+        let png = crate::png::transparent_1x1();
+        assert_eq!(pixel_size(&png), Some((1, 1)));
+        let media = p.add_media("dot.png", "image/png", png).unwrap();
+        let sl = std::sync::Arc::make_mut(&mut p.slides[0]);
+        sl.transition = Some(deckcraft_model::anim::Transition {
+            kind: "wipe".into(),
+            option: "d".into(),
+            duration_ms: 2000,
+            advance_after_ms: Some(3500),
+            ..Default::default()
+        });
+        sl.shapes.push(Shape {
+            id: deckcraft_model::ShapeId(501),
+            xfrm: Some(Xfrm::new(10.0, 10.0, 50.0, 50.0)),
+            kind: ShapeKind::Picture { fill: deckcraft_model::style::PictureFill { media, crop: [0.5, 0.0, 0.0, 0.0], ..Default::default() } },
+            ..Default::default()
+        });
+        let bytes = export_odp(&p).unwrap();
+        let content = read(&bytes, "content.xml");
+        assert!(content.contains("draw:name=\"Logo bar\""), "the master's graphic is drawn on the slide");
+        assert!(content.contains("smil:type=\"barWipe\" smil:subtype=\"topToBottom\""), "{content}");
+        assert!(content.contains("presentation:transition-speed=\"slow\"") && content.contains("presentation:duration=\"PT3.500S\""));
+        assert!(content.contains("fo:clip=\"rect(0.000cm, 0.000cm, 0.000cm, 0.013cm)\""), "half of a 0.75 pt picture");
+        let sl = std::sync::Arc::make_mut(&mut p.slides[0]);
+        sl.show_master_shapes = false;
+        assert!(!read(&export_odp(&p).unwrap(), "content.xml").contains("Logo bar"));
+    }
+
+    #[test]
+    fn dashes_map_to_odf_parts() {
+        assert_eq!(dash_parts(&Dash::Preset { name: "solid".into() }), None);
+        assert_eq!(dash_parts(&Dash::Preset { name: "lgDashDotDot".into() }), Some((1, 8.0, 2, 1.0, 3.0)));
     }
 }

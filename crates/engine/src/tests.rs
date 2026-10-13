@@ -3604,7 +3604,13 @@ fn exports_odp_with_text_shapes_pictures_and_notes() {
     s.execute("shape.insert", &json!({"preset": "ellipse", "rect": [100, 380, 120, 80]})).unwrap();
     let png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
     s.execute("insert.picture", &json!({"data": png, "name": "dot.png", "rect": [700, 40, 100, 100]})).unwrap();
+    s.execute("picture.crop", &json!({"left": 0.25, "right": 0.25})).unwrap();
     s.execute("slide.notes", &json!({"text": "Mention the Berlin office"})).unwrap();
+    s.execute("transition.set", &json!({"kind": "push", "option": "l", "duration": 700})).unwrap();
+    s.execute("shape.insert", &json!({"preset": "roundRect", "rect": [250, 380, 200, 90]})).unwrap();
+    s.execute("shape.fill", &json!({"gradient": {"stops": [[0, "#ff0000"], [1, "#0000ff"]], "angle": 90}})).unwrap();
+    s.execute("shape.line", &json!({"width": 3, "color": "#000000", "dash": "dash"})).unwrap();
+    s.execute("insert.table", &json!({"rows": 3, "cols": 3, "rect": [40, 40, 400, 120]})).unwrap();
     let dir = std::env::temp_dir().join(format!("deckcraft-odp-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let path = std::env::var("ODP_OUT").map(std::path::PathBuf::from).unwrap_or_else(|_| dir.join("deck.odp"));
@@ -3613,5 +3619,17 @@ fn exports_odp_with_text_shapes_pictures_and_notes() {
     assert_eq!(&bytes[30..38], b"mimetype");
     let text = String::from_utf8_lossy(&bytes);
     assert!(text.contains("application/vnd.oasis.opendocument.presentation"));
+    let mut z = zip::ZipArchive::new(std::io::Cursor::new(&bytes)).unwrap();
+    let mut read = |name: &str| {
+        let mut out = String::new();
+        std::io::Read::read_to_string(&mut z.by_name(name).unwrap(), &mut out).unwrap();
+        out
+    };
+    let content = read("content.xml");
+    let styles = read("styles.xml");
+    assert!(content.contains("<table:table>") && content.matches("<table:table-cell ").count() == 9, "a 3×3 table");
+    assert!(content.contains("smil:type=\"pushWipe\"") && content.contains("smil:subtype=\"fromRight\""));
+    assert!(content.contains("fo:clip=\"rect(") && content.contains("draw:fill=\"gradient\"") && content.contains("draw:stroke=\"dash\""));
+    assert!(styles.contains("<draw:gradient ") && styles.contains("draw:start-color=\"#ff0000\"") && styles.contains("<draw:stroke-dash "));
     let _ = std::fs::remove_dir_all(&dir);
 }

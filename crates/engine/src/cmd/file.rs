@@ -262,7 +262,16 @@ pub fn save_bytes(doc: &Presentation, format: &str) -> Result<Vec<u8>> {
     match format {
         f @ ("pptx" | "potx" | "ppsx") => deckcraft_pptx::export_as(doc, f).map_err(|e| EngineError::Other(e.to_string())),
         "outline" | "txt" => Ok(deckcraft_format::slides_to_outline(doc).into_bytes()),
-        "odp" => deckcraft_pptx::odp_write::export_odp(doc).map_err(|e| EngineError::Other(e.to_string())),
+        "odp" => {
+            // Table cells get their table style's look from the renderer.
+            let look = |p: &Presentation, sl: &deckcraft_model::Slide, t: &deckcraft_model::Table, r: usize, c: usize| {
+                let ctx = deckcraft_model::resolve::Ctx::for_slide(p, sl)?;
+                let l = deckcraft_render::table_cell_look(&ctx, t, r, c);
+                let side = |k: usize| l.sides[k].or(l.border);
+                Some(deckcraft_pptx::odp_write::CellLook { fill: l.fill, text: l.text, bold: l.bold, borders: [side(0), side(1), side(2), side(3)] })
+            };
+            deckcraft_pptx::odp_write::export_odp_with(doc, Some(&look)).map_err(|e| EngineError::Other(e.to_string()))
+        }
         "pdf" => deckcraft_pdf::export(doc, &Default::default()).map_err(|e| EngineError::Other(e.to_string())),
         "gif" => gif_bytes(doc, &Value::Null),
         _ => deckcraft_format::save(doc).map_err(|e| EngineError::Other(e.to_string())),
