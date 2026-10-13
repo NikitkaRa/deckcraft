@@ -62,7 +62,7 @@ pub fn ui_shortcut(app: &mut SlideApp, key: egui::Key, m: Mods) -> bool {
             return true;
         }
         (F, true, false, false) => {
-            app.palette = Some((String::new(), 0));
+            let _ = app.run("app.find", json!({}));
             return true;
         }
         _ => return false,
@@ -176,7 +176,7 @@ pub fn menu_tree() -> Vec<(&'static str, Vec<(&'static str, &'static str)>)> {
                 ("Duplicate", "edit.duplicate"),
                 ("Delete Slide", "slide.delete"),
                 ("-", ""),
-                ("Find…", "app.palette"),
+                ("Find…", "app.find"),
             ],
         ),
         (

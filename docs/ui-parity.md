@@ -1,6 +1,6 @@
 # UI parity with PowerPoint
 
-> **Last reviewed:** 2026-10-10 · **Last updated:** 2026-10-12 · **Change:** minor (File tab / Backstage, #76; previous: off-slide objects in Normal view, #270) · **Target:** Microsoft PowerPoint for Mac 16.113 (Microsoft 365)
+> **Last reviewed:** 2026-10-13 · **Last updated:** 2026-10-13 · **Change:** minor (Find bar on Cmd+F; previous: File tab / Backstage, #76) · **Target:** Microsoft PowerPoint for Mac 16.113 (Microsoft 365)
 
 > **Last reviewed:** 2026-10-12 · **Last updated:** 2026-10-12 · **Change:** minor (text editing keys observed in PowerPoint for Windows, #268) · **Target:** Microsoft PowerPoint for Mac 16.113 (Microsoft 365)
 
@@ -92,7 +92,8 @@ menu colours taken from the theme tokens (menu `chrome`, page `card`).
 
 Every common PowerPoint for Mac shortcut is bound (checklist row done): new slide, duplicate,
 group/ungroup, bold/italic/underline, alignment, font size, list levels, Format Painter, show from
-start/current, view switching. Not yet: Cmd+F Find opening a find bar on the slide, Option+drag
+start/current, view switching. Cmd+F and Edit ▸ Find… open a find bar (next, previous, replace,
+replace all, match case) over slide text, table cells and notes. Not yet: Option+drag
 precision without snapping, F6 pane cycling, ribbon KeyTips (Windows).
 
 ### Text editing keys
@@ -137,7 +138,7 @@ imitate Microsoft's. No pixel comparison against PowerPoint screenshots has been
 |---|---|
 | Native macOS menu bar from `menu_tree()`, filled out to PowerPoint's menu items | 3–5 |
 | Format Shape pane depth | 6–10 |
-| Missing dialogs (Font, Bullets and Numbering, Find/Replace, Replace Fonts, Action Settings, Print, Insert Object) | 8–14 |
+| Missing dialogs (Font, Bullets and Numbering, Replace Fonts, Action Settings, Print, Insert Object) | 8–14 |
 | Window chrome, system appearance, palette fixes (#41, #71, #79) | 3–5 |
 | Grid Options, edit points UI, crop depth | 4–7 |
 | Multiple windows | 3–5 |
@@ -148,6 +149,7 @@ imitate Microsoft's. No pixel comparison against PowerPoint screenshots has been
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-10-13 | minor | Cmd+F and Edit ▸ Find… open a find bar; find next/previous, replace and replace all |
 | 2026-10-12 | minor | File tab (Backstage) observed in PowerPoint for Windows and matched (#76); the start screen is File › Home |
 | 2026-10-12 | minor | Off-slide objects drawn and editable around the slide in Normal view (#270) |
 | 2026-10-12 | minor | Selection Pane matched to PowerPoint (#133): drag and drop, arrows, groups, eye, Lock |

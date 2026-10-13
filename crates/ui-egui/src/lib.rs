@@ -12,6 +12,7 @@ pub mod control;
 pub mod credits;
 pub mod dialogs;
 pub mod fillui;
+pub mod find;
 pub mod icons;
 pub mod media;
 pub mod menus;
@@ -160,6 +161,7 @@ pub const UI_COMMANDS: &[(&str, &str, Option<&str>, &str)] = &[
     ("app.print", "Print", Some("Cmd+P"), "{layout?, perPage?, slides?, includeHidden?, frame?}"),
     ("app.about", "About DeckCraft", None, "{}"),
     ("app.palette", "Command Palette", Some("Cmd+Shift+P"), "{}"),
+    ("app.find", "Find", Some("Cmd+F"), "{on?: bool, query?: string, matchCase?: bool}"),
     ("app.preferences", "Preferences…", Some("Cmd+,"), "{}"),
     ("app.openDialog", "Open…", None, "{purpose?}"),
     ("app.insertPictureDialog", "Picture from File…", None, "{}"),
@@ -202,6 +204,8 @@ pub struct SlideApp {
     /// Where the canvas texture (the slide and the pasteboard drawn around it) is on screen.
     pub canvas_region: Option<egui::Rect>,
     pub palette: Option<(String, usize)>,
+    /// Find and replace bar (Cmd+F, Edit ▸ Find…).
+    pub find: Option<find::FindBar>,
     /// Integrated title bar (macOS traffic lights over our chrome).
     pub integrated_titlebar: bool,
     /// The File tab's full-window view (Backstage). Over a presentation it replaces the ribbon,
@@ -251,6 +255,7 @@ impl SlideApp {
             slide_rect: None,
             canvas_region: None,
             palette: None,
+            find: None,
             integrated_titlebar: false,
             backstage: None,
             pending_urls: vec![],
@@ -533,7 +538,11 @@ impl SlideApp {
                 return Ok(json!({"printed": self.print_pdf(p.clone())}));
             }
             "app.about" => self.dialog = Some(dialogs::Dialog::new("about")),
-            "app.palette" => self.palette = Some((String::new(), 0)),
+            "app.palette" => {
+                self.find = None;
+                self.palette = Some((String::new(), 0));
+            }
+            "app.find" => return find::open(self, p),
             "app.preferences" => self.dialog = Some(dialogs::Dialog::new("preferences")),
             "app.openDialog" => self.pick_and_open(),
             "app.insertPictureDialog" => self.pick_and_insert("picture", "insert.picture"),
@@ -845,7 +854,7 @@ impl SlideApp {
 
     /// Keyboard and clipboard for the slide (when no text field has focus).
     fn keyboard(&mut self, ctx: &egui::Context) {
-        if ctx.memory(|m| m.focused().is_some()) || self.dialog.as_ref().is_some_and(|d| d.modal()) || self.palette.is_some() {
+        if ctx.memory(|m| m.focused().is_some()) || self.dialog.as_ref().is_some_and(|d| d.modal()) || self.palette.is_some() || self.find.is_some() {
             return;
         }
         let events = ctx.input(|i| i.events.clone());
@@ -982,6 +991,7 @@ impl SlideApp {
         toast::show(self, &ctx);
         dialogs::show(self, &ctx);
         menus::palette(self, &ctx);
+        find::bar(self, &ctx);
         for url in std::mem::take(&mut self.pending_urls) {
             ctx.open_url(egui::OpenUrl::new_tab(url));
         }

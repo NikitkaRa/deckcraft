@@ -1,6 +1,6 @@
 # DeckCraft architecture
 
-> **Last reviewed:** 2026-10-13 · **Last updated:** 2026-10-13 · **Change:** minor (transition frames: perspective meshes, slide parts, headless compositor; previous: created from the code on main at d556ff9) · **Target:** Microsoft PowerPoint for Mac 16.113 (Microsoft 365)
+> **Last reviewed:** 2026-10-13 · **Last updated:** 2026-10-13 · **Change:** minor (find and replace commands; previous: transition frames) · **Target:** Microsoft PowerPoint for Mac 16.113 (Microsoft 365)
 
 How DeckCraft is built today. The binding rules (layering, everything is a command, thin UI, never
 break wasm, never crash) are in [AGENTS.md](../AGENTS.md) §3–§5; this document describes what
@@ -20,7 +20,7 @@ nothing below L6 uses egui, eframe, winit or rfd.
 | L2 | `text`, `anim`, `format`, `media` | Shaping (HarfRust), UAX #9 bidi, UAX #14 line breaking, autofit, caret hit testing; per-shape animation state over time, the show state machine, transition frame layouts, Morph matching; `.deckcraft` (zip + JSON + media) and outline text; media probing, decoding, mixer and clock |
 | L3 | `render`, `pptx` | `vello_cpu` raster of slides, masters and layouts (fills, outlines, effects, pictures, tables, charts, Morph frames); PPTX import/export from ECMA-376 |
 | L4 | `pdf` | PDF export through krilla |
-| L5 | `engine` | Sessions, documents, selection, undo history on shared slide snapshots, the command registry (226 commands in `cmd/*`), pointer tools, keys, AutoRecover, the panic guard (`guard.rs`) |
+| L5 | `engine` | Sessions, documents, selection, undo history on shared slide snapshots, the command registry (234 distinct commands in `cmd/*`), pointer tools, keys, AutoRecover, the panic guard (`guard.rs`) |
 | L6 | `ui-egui`, `mcp` | The PowerPoint-style interface (ribbon with 10 tabs + contextual tabs, canvas, thumbnails, panes, 27 dialogs, show and presenter windows, the JSON control channel); the MCP server (JSON-RPC 2.0 over stdio), headless or connected to a running app |
 | apps | `deckcraft` (desktop: eframe/wgpu, cpal audio, logging), `deckcraft-cli` (run, render, convert, mcp, app), `deckcraft-web` (trunk; WebGPU with WebGL2 fallback), `xtask` | Exempt from layering |
 
@@ -78,5 +78,6 @@ macOS, Windows, Linux, FreeBSD and web artifacts.
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-10-13 | minor | `edit.find` and `edit.replace`. Distinct commands: 234 (the written 226 had fallen behind the registry) |
 | 2026-10-13 | minor | Transitions: perspective meshes, background/content parts, CPU compositor |
 | 2026-10-10 | major | Created from the code on main (d556ff9) and AGENTS.md §4 |

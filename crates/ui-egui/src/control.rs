@@ -73,6 +73,7 @@ pub fn inspect(app: &SlideApp, ctx: &egui::Context) -> Value {
         "slideRect": app.slide_rect.map(|c| json!([c.left(), c.top(), c.width(), c.height()])),
         "canvasScale": app.canvas_scale,
         "dialog": app.dialog.as_ref().map(|d| d.id.clone()),
+        "find": app.find.is_some(),
         "home": app.backstage_open(),
         "backstage": app.backstage.as_ref().map(|b| b.page.id()),
         "showing": app.show.as_ref().map(|s| json!({"slide": s.state.slide, "step": s.state.step, "ended": s.ended})),
