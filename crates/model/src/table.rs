@@ -77,6 +77,82 @@ impl Default for Table {
     }
 }
 
+/// A merged block: its anchor cell and how many rows and columns it covers.
+struct MergeRect {
+    r: usize,
+    c: usize,
+    rows: usize,
+    cols: usize,
+}
+
+/// How far a stored span actually reaches. Hostile spans stop at the grid.
+fn fit_span(span: u32, index: usize, len: usize) -> usize {
+    let room = len.saturating_sub(index);
+    if room == 0 {
+        return 1;
+    }
+    usize::try_from(span.max(1)).unwrap_or(room).min(room).max(1)
+}
+
+fn span_u32(n: usize) -> u32 {
+    u32::try_from(n).unwrap_or(u32::MAX).max(1)
+}
+
+fn covered_by(rects: &[MergeRect], r: usize, c: usize) -> bool {
+    rects.iter().any(|rect| r >= rect.r && c >= rect.c && r < rect.r.saturating_add(rect.rows) && c < rect.c.saturating_add(rect.cols))
+}
+
+/// `rows` selects the vertical axis; otherwise the column axis.
+fn shift_inserted(rects: &mut [MergeRect], at: usize, rows: bool) {
+    for rect in rects.iter_mut() {
+        let (origin, span) = if rows { (rect.r, rect.rows) } else { (rect.c, rect.cols) };
+        let (origin, span) = if origin >= at {
+            (origin.saturating_add(1), span)
+        } else if at < origin.saturating_add(span) {
+            (origin, span.saturating_add(1))
+        } else {
+            (origin, span)
+        };
+        if rows {
+            rect.r = origin;
+            rect.rows = span;
+        } else {
+            rect.c = origin;
+            rect.cols = span;
+        }
+    }
+}
+
+fn shift_deleted(rects: Vec<MergeRect>, at: usize, rows: bool) -> Vec<MergeRect> {
+    let mut kept = Vec::new();
+    for mut rect in rects {
+        let (origin, span) = if rows { (rect.r, rect.rows) } else { (rect.c, rect.cols) };
+        let (origin, span) = if origin == at {
+            if span <= 1 {
+                continue;
+            }
+            (origin, span.saturating_sub(1))
+        } else if origin > at {
+            (origin.saturating_sub(1), span)
+        } else if at < origin.saturating_add(span) {
+            (origin, span.saturating_sub(1))
+        } else {
+            (origin, span)
+        };
+        if rows {
+            rect.r = origin;
+            rect.rows = span;
+        } else {
+            rect.c = origin;
+            rect.cols = span;
+        }
+        if rect.rows > 1 || rect.cols > 1 {
+            kept.push(rect);
+        }
+    }
+    kept
+}
+
 impl Table {
     pub fn new(rows: usize, cols: usize, width: f64, row_height: f64) -> Self {
         let rows = rows.clamp(1, 1000);
@@ -106,38 +182,139 @@ impl Table {
     pub fn height(&self) -> f64 {
         self.rows.iter().map(|r| r.height).sum()
     }
+    /// Insert a row at `at` (clamped to the end). A merge the new row cuts through grows to
+    /// include it. A merge that starts at or below `at` shifts down, unchanged.
     pub fn insert_row(&mut self, at: usize) {
         let at = at.min(self.rows.len());
+        self.normalize();
+        let mut rects = self.merge_rects();
+        shift_inserted(&mut rects, at, true);
         let h = self.rows.get(at.saturating_sub(1)).map(|r| r.height).unwrap_or(30.0);
-        self.rows.insert(at, Row { height: h, cells: (0..self.cols.len()).map(|_| Cell::new("")).collect() });
+        let n = self.cols.len();
+        self.rows.insert(at, Row { height: h, cells: (0..n).map(|_| Cell::new("")).collect() });
+        self.paint_merges(&rects);
     }
+    /// Insert a column at `at` (clamped to the end). A merge the new column cuts through grows
+    /// to include it. A merge that starts at or to the right of `at` shifts right, unchanged.
     pub fn insert_col(&mut self, at: usize) {
         let at = at.min(self.cols.len());
+        self.normalize();
+        let mut rects = self.merge_rects();
+        shift_inserted(&mut rects, at, false);
         let w = self.cols.get(at.saturating_sub(1)).copied().unwrap_or(80.0);
         self.cols.insert(at, w);
         for r in &mut self.rows {
             let i = at.min(r.cells.len());
             r.cells.insert(i, Cell::new(""));
         }
+        self.paint_merges(&rects);
     }
+    /// Delete a row. A merge that contained it shrinks. Deleting a merge's anchor row promotes
+    /// the cell below, which keeps the merged text. Returns false when `at` is out of range or
+    /// this is the last row.
     pub fn delete_row(&mut self, at: usize) -> bool {
         if self.rows.len() <= 1 || at >= self.rows.len() {
             return false;
         }
+        self.normalize();
+        let rects = self.merge_rects();
+        for rect in &rects {
+            if rect.r == at && rect.rows > 1 {
+                self.promote(rect.r, rect.c, rect.r.saturating_add(1), rect.c);
+            }
+        }
+        let rects = shift_deleted(rects, at, true);
         self.rows.remove(at);
+        self.paint_merges(&rects);
         true
     }
+    /// Delete a column. A merge that contained it shrinks. Deleting a merge's anchor column
+    /// promotes the cell to its right, which keeps the merged text. Returns false when `at` is
+    /// out of range or this is the last column.
     pub fn delete_col(&mut self, at: usize) -> bool {
         if self.cols.len() <= 1 || at >= self.cols.len() {
             return false;
         }
+        self.normalize();
+        let rects = self.merge_rects();
+        for rect in &rects {
+            if rect.c == at && rect.cols > 1 {
+                self.promote(rect.r, rect.c, rect.r, rect.c.saturating_add(1));
+            }
+        }
+        let rects = shift_deleted(rects, at, false);
         self.cols.remove(at);
         for r in &mut self.rows {
             if at < r.cells.len() {
                 r.cells.remove(at);
             }
         }
+        self.paint_merges(&rects);
         true
+    }
+    /// Merged rectangles, from anchors that are not themselves covered. A cell already inside an
+    /// earlier rectangle is not a second anchor.
+    fn merge_rects(&self) -> Vec<MergeRect> {
+        let mut out = Vec::new();
+        let n_rows = self.rows.len();
+        let n_cols = self.cols.len();
+        for (r, row) in self.rows.iter().enumerate() {
+            for (c, cell) in row.cells.iter().enumerate().take(n_cols) {
+                if cell.is_covered() || covered_by(&out, r, c) {
+                    continue;
+                }
+                let rows = fit_span(cell.row_span, r, n_rows);
+                let cols = fit_span(cell.grid_span, c, n_cols);
+                if rows > 1 || cols > 1 {
+                    out.push(MergeRect { r, c, rows, cols });
+                }
+            }
+        }
+        out
+    }
+    /// Move a merge's anchor onto the cell that survives when the anchor's row or column is
+    /// deleted. The anchor's text wins; an empty anchor keeps text the survivor already had.
+    fn promote(&mut self, from_r: usize, from_c: usize, to_r: usize, to_c: usize) {
+        let Some(mut src) = self.cell(from_r, from_c).cloned() else { return };
+        if src.text.is_empty()
+            && let Some(kept) = self.cell(to_r, to_c).filter(|cell| !cell.text.is_empty()).map(|cell| cell.text.clone())
+        {
+            src.text = kept;
+        }
+        if let Some(dst) = self.cell_mut(to_r, to_c) {
+            *dst = src;
+        }
+    }
+    /// Clear merge flags, then mark each rectangle the way [`Table::merge`] does: the anchor
+    /// carries the spans, and every other cell is covered from the left and/or from above.
+    fn paint_merges(&mut self, rects: &[MergeRect]) {
+        for row in &mut self.rows {
+            for cell in &mut row.cells {
+                cell.h_merge = false;
+                cell.v_merge = false;
+                cell.grid_span = 1;
+                cell.row_span = 1;
+            }
+        }
+        for rect in rects {
+            for dr in 0..rect.rows {
+                for dc in 0..rect.cols {
+                    let (Some(r), Some(c)) = (rect.r.checked_add(dr), rect.c.checked_add(dc)) else { continue };
+                    let Some(cell) = self.cell_mut(r, c) else { continue };
+                    if dr == 0 && dc == 0 {
+                        cell.grid_span = span_u32(rect.cols);
+                        cell.row_span = span_u32(rect.rows);
+                        cell.h_merge = false;
+                        cell.v_merge = false;
+                    } else {
+                        cell.grid_span = 1;
+                        cell.row_span = 1;
+                        cell.h_merge = dc > 0;
+                        cell.v_merge = dr > 0;
+                    }
+                }
+            }
+        }
     }
     /// Merge the rectangle (r0,c0)–(r1,c1) inclusive into its top-left cell.
     pub fn merge(&mut self, r0: usize, c0: usize, r1: usize, c1: usize) -> bool {
@@ -348,5 +525,175 @@ mod tests {
         let mut one = Table::new(1, 1, 10.0, 10.0);
         assert!(!one.delete_row(0) && !one.delete_col(0));
         assert!(table_styles().len() > 30);
+    }
+
+    /// Every covered cell belongs to exactly one anchor, and that anchor's span is the block.
+    fn assert_sound(t: &Table) {
+        let mut claimed = std::collections::HashSet::new();
+        for (r, row) in t.rows.iter().enumerate() {
+            for (c, cell) in row.cells.iter().enumerate().take(t.n_cols()) {
+                if cell.is_covered() {
+                    continue;
+                }
+                let rows = cell.row_span.max(1) as usize;
+                let cols = cell.grid_span.max(1) as usize;
+                assert!(r.saturating_add(rows) <= t.n_rows() && c.saturating_add(cols) <= t.n_cols(), "span leaves the grid at {r},{c}");
+                for rr in r..r.saturating_add(rows) {
+                    for cc in c..c.saturating_add(cols) {
+                        assert!(claimed.insert((rr, cc)), "cell {rr},{cc} is in two merges");
+                        let other = t.cell(rr, cc).expect("cell");
+                        if rr == r && cc == c {
+                            assert!(!other.h_merge && !other.v_merge);
+                        } else {
+                            assert_eq!(other.h_merge, cc > c, "h_merge at {rr},{cc}");
+                            assert_eq!(other.v_merge, rr > r, "v_merge at {rr},{cc}");
+                            assert_eq!((other.grid_span, other.row_span), (1, 1));
+                        }
+                    }
+                }
+            }
+        }
+        for (r, row) in t.rows.iter().enumerate() {
+            for (c, cell) in row.cells.iter().enumerate().take(t.n_cols()) {
+                if cell.is_covered() {
+                    assert!(claimed.contains(&(r, c)), "covered cell {r},{c} has no anchor");
+                }
+            }
+        }
+    }
+
+    fn head(rows: usize, cols: usize) -> Table {
+        let mut t = Table::new(rows, cols, 400.0, 20.0);
+        assert!(t.merge(0, 1, 2, 2));
+        let anchor = t.cell_mut(0, 1).expect("anchor");
+        anchor.text = TextBody::from_text("Head");
+        anchor.margins = Some([1.0, 2.0, 3.0, 4.0]);
+        t
+    }
+
+    #[test]
+    fn inserting_through_a_merge_grows_it_and_keeps_the_text() {
+        let mut t = head(4, 4);
+        t.insert_row(0);
+        assert_sound(&t);
+        assert_eq!(t.cell(1, 1).map(|c| (c.grid_span, c.row_span, c.text.text())), Some((2, 3, "Head".into())));
+        assert!(!t.cell(0, 1).is_some_and(|c| c.is_covered()), "the new row is above the merge");
+
+        let mut t = head(4, 4);
+        t.insert_row(1);
+        assert_sound(&t);
+        let anchor = t.cell(0, 1).expect("anchor");
+        assert_eq!((anchor.grid_span, anchor.row_span, anchor.text.text()), (2, 4, "Head".into()));
+        assert_eq!(anchor.margins, Some([1.0, 2.0, 3.0, 4.0]));
+        assert!(t.cell(1, 1).is_some_and(|c| c.v_merge && !c.h_merge && c.text.is_empty()));
+        assert!(t.cell(1, 2).is_some_and(|c| c.v_merge && c.h_merge));
+        assert!(!t.cell(4, 1).is_some_and(|c| c.is_covered()), "the row below the merge stays free");
+
+        let mut t = head(4, 4);
+        t.insert_row(3);
+        assert_sound(&t);
+        assert_eq!(t.cell(0, 1).map(|c| (c.grid_span, c.row_span)), Some((2, 3)));
+
+        let mut t = head(4, 4);
+        t.insert_col(1);
+        assert_sound(&t);
+        assert_eq!(t.cell(0, 2).map(|c| (c.grid_span, c.row_span, c.text.text())), Some((2, 3, "Head".into())));
+
+        let mut t = head(4, 4);
+        t.insert_col(2);
+        assert_sound(&t);
+        let anchor = t.cell(0, 1).expect("anchor");
+        assert_eq!((anchor.grid_span, anchor.row_span), (3, 3));
+        assert!(t.cell(0, 2).is_some_and(|c| c.h_merge && !c.v_merge && c.text.is_empty()));
+        assert!(t.cell(2, 2).is_some_and(|c| c.h_merge && c.v_merge));
+
+        let mut t = head(4, 4);
+        t.insert_col(3);
+        assert_sound(&t);
+        assert_eq!(t.cell(0, 1).map(|c| (c.grid_span, c.row_span)), Some((2, 3)));
+    }
+
+    #[test]
+    fn deleting_a_merged_row_or_column_shrinks_or_promotes_the_anchor() {
+        let mut t = head(4, 4);
+        assert!(t.delete_row(0));
+        assert_sound(&t);
+        let anchor = t.cell(0, 1).expect("promoted");
+        assert_eq!((anchor.grid_span, anchor.row_span, anchor.text.text()), (2, 2, "Head".into()));
+        assert_eq!(anchor.margins, Some([1.0, 2.0, 3.0, 4.0]));
+        assert!(t.cell(0, 2).is_some_and(|c| c.h_merge && !c.v_merge));
+        assert!(t.cell(1, 1).is_some_and(|c| c.v_merge && !c.h_merge));
+        assert!(t.cell(1, 2).is_some_and(|c| c.h_merge && c.v_merge));
+
+        let mut t = head(4, 4);
+        assert!(t.delete_row(1));
+        assert_sound(&t);
+        assert_eq!(t.cell(0, 1).map(|c| (c.grid_span, c.row_span, c.text.text())), Some((2, 2, "Head".into())));
+        assert!(t.cell(1, 2).is_some_and(|c| c.h_merge && c.v_merge));
+        assert!(!t.cell(2, 1).is_some_and(|c| c.is_covered()));
+
+        let mut t = head(4, 4);
+        assert!(t.delete_row(3));
+        assert_sound(&t);
+        assert_eq!(t.cell(0, 1).map(|c| (c.grid_span, c.row_span, c.text.text())), Some((2, 3, "Head".into())));
+
+        let mut t = head(4, 4);
+        assert!(t.delete_col(1));
+        assert_sound(&t);
+        let anchor = t.cell(0, 1).expect("promoted");
+        assert_eq!((anchor.grid_span, anchor.row_span, anchor.text.text()), (1, 3, "Head".into()));
+        assert_eq!(anchor.margins, Some([1.0, 2.0, 3.0, 4.0]));
+        assert!(t.cell(1, 1).is_some_and(|c| c.v_merge && !c.h_merge));
+        assert!(!t.cell(0, 1).is_some_and(|c| c.h_merge));
+
+        let mut t = head(4, 4);
+        assert!(t.delete_col(2));
+        assert_sound(&t);
+        assert_eq!(t.cell(0, 1).map(|c| (c.grid_span, c.row_span, c.text.text())), Some((1, 3, "Head".into())));
+
+        let mut t = head(4, 4);
+        assert!(t.delete_col(0));
+        assert_sound(&t);
+        assert_eq!(t.cell(0, 0).map(|c| (c.grid_span, c.row_span, c.text.text())), Some((2, 3, "Head".into())));
+    }
+
+    #[test]
+    fn deleting_the_anchor_keeps_visible_text_and_a_one_cell_remainder() {
+        let mut t = Table::new(2, 3, 200.0, 20.0);
+        assert!(t.merge(0, 0, 0, 2));
+        t.cell_mut(0, 0).expect("anchor").text = TextBody::from_text("visible");
+        t.cell_mut(0, 1).expect("covered").text = TextBody::from_text("hidden");
+        assert!(t.delete_col(0));
+        assert_sound(&t);
+        assert_eq!(t.cell(0, 0).map(|c| (c.grid_span, c.row_span, c.text.text())), Some((2, 1, "visible".into())));
+        assert!(t.delete_col(0));
+        assert_sound(&t);
+        assert_eq!(t.cell(0, 0).map(|c| (c.grid_span, c.row_span, c.text.text(), c.is_covered())), Some((1, 1, "visible".into(), false)));
+        assert!(t.rows.iter().flat_map(|row| &row.cells).all(|c| !c.is_covered()));
+
+        let mut t = Table::new(2, 1, 40.0, 20.0);
+        assert!(t.merge(0, 0, 1, 0));
+        t.cell_mut(1, 0).expect("covered").text = TextBody::from_text("kept");
+        assert!(t.delete_row(0));
+        assert_sound(&t);
+        assert_eq!(t.cell(0, 0).map(|c| c.text.text()), Some("kept".into()));
+    }
+
+    #[test]
+    fn a_second_merge_is_left_intact_and_the_edit_round_trips() {
+        let mut t = Table::new(4, 4, 400.0, 20.0);
+        assert!(t.merge(0, 0, 1, 0));
+        assert!(t.merge(2, 2, 3, 3));
+        t.cell_mut(0, 0).expect("v").text = TextBody::from_text("V");
+        t.cell_mut(2, 2).expect("h").text = TextBody::from_text("H");
+        t.insert_row(1);
+        assert!(t.delete_col(3));
+        assert_sound(&t);
+        assert_eq!(t.cell(0, 0).map(|c| (c.grid_span, c.row_span, c.text.text())), Some((1, 3, "V".into())));
+        assert_eq!(t.cell(3, 2).map(|c| (c.grid_span, c.row_span, c.text.text())), Some((1, 2, "H".into())));
+        let saved = serde_json::to_string(&t).expect("serialize");
+        let back: Table = serde_json::from_str(&saved).expect("deserialize");
+        assert_eq!(back, t);
+        assert_sound(&back);
     }
 }

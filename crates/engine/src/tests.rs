@@ -835,3 +835,84 @@ fn slide_ranges_parse_like_powerpoints_print_box() {
     let opts = cmd::file::pdf_options(&json!({"slides": [0, 7, 1]}), 2).unwrap();
     assert_eq!(opts.slides, Some(vec![0, 1]), "indices past the end are dropped");
 }
+
+fn table_by_id(s: &Session, id: u64) -> deckcraft_model::Table {
+    let st = s.doc().unwrap();
+    let sh = st.shape(deckcraft_model::ShapeId(id as u32)).unwrap();
+    match &sh.kind {
+        deckcraft_model::ShapeKind::Table(t) => t.clone(),
+        _ => panic!("not a table"),
+    }
+}
+
+fn only_table(p: &deckcraft_model::Presentation) -> deckcraft_model::Table {
+    let mut found = None;
+    for slide in &p.slides {
+        for sh in &slide.shapes {
+            if let deckcraft_model::ShapeKind::Table(t) = &sh.kind {
+                found = Some(t.clone());
+            }
+        }
+    }
+    found.expect("table")
+}
+
+fn merge_topology(t: &deckcraft_model::Table) -> Vec<(usize, usize, u32, u32, bool, bool, String)> {
+    let mut out = Vec::new();
+    for (r, row) in t.rows.iter().enumerate() {
+        for (c, cell) in row.cells.iter().enumerate() {
+            out.push((r, c, cell.grid_span, cell.row_span, cell.h_merge, cell.v_merge, cell.text.text()));
+        }
+    }
+    out
+}
+
+/// Inserting or deleting through a merge keeps one anchor per covered cell, keeps the merged
+/// text, undoes, and survives a native save and a PPTX round trip (#408).
+#[test]
+fn merged_table_edits_keep_topology_text_undo_and_roundtrip() {
+    let mut s = session();
+    let data = json!([["A", "B", "C", "D"], ["E", "F", "G", "H"], ["I", "J", "K", "L"], ["M", "N", "O", "P"]]);
+    let id = s.execute("insert.table", &json!({"rows": 4, "cols": 4, "data": data})).unwrap()["id"].as_u64().unwrap();
+    s.execute("table.merge", &json!({"id": id, "from": [0, 0], "to": [1, 1]})).unwrap();
+    let merged = table_by_id(&s, id);
+    assert_eq!(merged.cell(0, 0).unwrap().text.text(), "A\nB\nE\nF");
+
+    s.execute("table.insertRowBelow", &json!({"id": id, "row": 0})).unwrap();
+    let row = table_by_id(&s, id);
+    assert_eq!(row.n_rows(), 5);
+    assert_eq!((row.cell(0, 0).unwrap().grid_span, row.cell(0, 0).unwrap().row_span), (2, 3));
+    assert!(row.cell(1, 0).unwrap().v_merge && !row.cell(1, 0).unwrap().h_merge);
+    assert!(row.cell(1, 1).unwrap().v_merge && row.cell(1, 1).unwrap().h_merge);
+    assert_eq!(row.cell(0, 0).unwrap().text.text(), "A\nB\nE\nF");
+
+    s.execute("table.insertColumnRight", &json!({"id": id, "col": 0})).unwrap();
+    let col = table_by_id(&s, id);
+    assert_eq!(col.n_cols(), 5);
+    assert_eq!(col.cell(0, 0).unwrap().grid_span, 3);
+    assert!(col.cell(0, 1).unwrap().h_merge && !col.cell(0, 1).unwrap().v_merge);
+    assert!(col.cell(1, 1).unwrap().h_merge && col.cell(1, 1).unwrap().v_merge);
+
+    s.execute("table.deleteRow", &json!({"id": id, "row": 0})).unwrap();
+    let deleted = table_by_id(&s, id);
+    assert_eq!(deleted.n_rows(), 4);
+    assert_eq!((deleted.cell(0, 0).unwrap().grid_span, deleted.cell(0, 0).unwrap().row_span), (3, 2));
+    assert_eq!(deleted.cell(0, 0).unwrap().text.text(), "A\nB\nE\nF");
+    assert!(deleted.cell(0, 1).unwrap().h_merge && !deleted.cell(0, 1).unwrap().v_merge);
+    assert!(deleted.cell(1, 0).unwrap().v_merge && !deleted.cell(1, 0).unwrap().h_merge);
+    assert!(deleted.cell(1, 2).unwrap().h_merge && deleted.cell(1, 2).unwrap().v_merge);
+
+    s.execute("edit.undo", &json!({})).unwrap();
+    s.execute("edit.undo", &json!({})).unwrap();
+    s.execute("edit.undo", &json!({})).unwrap();
+    assert_eq!(table_by_id(&s, id), merged);
+    s.execute("edit.redo", &json!({})).unwrap();
+    s.execute("edit.redo", &json!({})).unwrap();
+    s.execute("edit.redo", &json!({})).unwrap();
+    assert_eq!(table_by_id(&s, id), deleted);
+
+    let native = deckcraft_format::save(&s.doc().unwrap().doc).unwrap();
+    assert_eq!(only_table(&deckcraft_format::load(&native).unwrap()), deleted);
+    let pptx = deckcraft_pptx::export(&s.doc().unwrap().doc).unwrap();
+    assert_eq!(merge_topology(&only_table(&deckcraft_pptx::import(&pptx).unwrap())), merge_topology(&deleted));
+}
