@@ -11,7 +11,7 @@ use deckcraft_model::text::{Anchor, TextDir};
 use deckcraft_model::{Geom, MediaClip, PhType, Placeholder, Shape, ShapeId, ShapeKind, ShapeStyle};
 
 use super::{Imp, Part, dml};
-use crate::xml::El;
+use crate::xml::{El, Node};
 
 /// File shape ids at or above this are reassigned.
 pub const MAX_KEPT_ID: u32 = 1 << 30;
@@ -423,6 +423,12 @@ fn smartart(imp: &mut Imp, part: &Part, gd: &El, frame: &Shape, depth: usize) ->
     let mut d = imp.pkg.xml(&drawing_rel)?;
     super::resolve_mc(&mut d.root, 0);
     let dpart = Part::new(imp.pkg, &drawing_rel, &d);
+    if let Some(t) = d.root.children.iter_mut().find_map(|n| match n {
+        Node::El(e) if e.is("spTree") => Some(e),
+        _ => None,
+    }) {
+        split_text_xfrm(t, 0);
+    }
     let tree = d.root.child("spTree")?;
     let mut sub = IdCtx { fresh: true, ..Default::default() };
     let children = sp_tree(imp, &dpart, &mut sub, tree, depth + 1);
@@ -433,6 +439,62 @@ fn smartart(imp: &mut Imp, part: &Part, gd: &El, frame: &Shape, depth: usize) ->
     let x = frame.xfrm.unwrap_or_default();
     g.kind = ShapeKind::Group { children, child: Xfrm::new(0.0, 0.0, x.w, x.h) };
     Some(g)
+}
+
+fn el(name: &str, attrs: Vec<(String, String)>, children: Vec<El>) -> El {
+    El { name: name.into(), attrs, children: children.into_iter().map(Node::El).collect() }
+}
+
+/// A SmartArt drawing shape lays its text out in its own rectangle, `dsp:txXfrm`, which often
+/// turns back the shape's rotation (#231, #232). Each such shape becomes the shape without text
+/// plus an unfilled, unlined text box at `txXfrm`, turned by both rotations, so the text is drawn upright and full width.
+fn split_text_xfrm(tree: &mut El, depth: usize) {
+    if depth > crate::xml::MAX_DEPTH {
+        return;
+    }
+    let mut out = Vec::with_capacity(tree.children.len());
+    for n in std::mem::take(&mut tree.children) {
+        let Node::El(mut sp) = n else {
+            out.push(n);
+            continue;
+        };
+        if sp.is("grpSp") {
+            split_text_xfrm(&mut sp, depth + 1);
+        }
+        let tx = sp.child("txXfrm").cloned();
+        let body = sp.child("txBody").cloned();
+        let (Some(tx), Some(body), true) = (tx, body, sp.is("sp")) else {
+            out.push(Node::El(sp));
+            continue;
+        };
+        sp.children.retain(|c| !matches!(c, Node::El(e) if e.is("txXfrm") || e.is("txBody")));
+        let mut kids: Vec<El> = sp.elements().filter(|e| e.is("nvSpPr")).cloned().collect();
+        // The text rectangle's rotation adds to the shape's: 180° + 180° and 90° − 90° are upright.
+        let rot_of = |e: Option<&El>| e.and_then(|e| e.attr("rot")).and_then(|r| r.parse::<i64>().ok()).unwrap_or(0);
+        let rot = (rot_of(sp.path(&["spPr", "xfrm"])) + rot_of(Some(&tx))).rem_euclid(21_600_000);
+        let mut xfrm = El { name: "a:xfrm".into(), ..tx };
+        xfrm.attrs.retain(|(k, _)| k != "rot");
+        if rot != 0 {
+            xfrm.attrs.push(("rot".into(), rot.to_string()));
+        }
+        let none = || el("a:noFill", vec![], vec![]);
+        kids.push(el(
+            "dsp:spPr",
+            vec![],
+            vec![
+                xfrm,
+                el("a:prstGeom", vec![("prst".into(), "rect".into())], vec![el("a:avLst", vec![], vec![])]),
+                none(),
+                el("a:ln", vec![], vec![none()]),
+            ],
+        ));
+        kids.extend(sp.elements().filter(|e| e.is("style")).cloned());
+        kids.push(body);
+        let text = el(&sp.name, sp.attrs.clone(), kids);
+        out.push(Node::El(sp));
+        out.push(Node::El(text));
+    }
+    tree.children = out;
 }
 
 fn table(imp: &mut Imp, part: &Part, tbl: &El) -> Table {
