@@ -1,9 +1,9 @@
 //! Slide Show: full-screen playback with transitions and animations (`deckcraft-anim`),
 //! keyboard/mouse navigation, pen, black/white screens, presenter view and rehearsed timings.
 
-use deckcraft_anim::{Layer, LinkJump, ShowAction, ShowState, Source, Timeline};
+use deckcraft_anim::{BookmarkClock, Layer, LinkJump, ShowAction, ShowState, Source, Timeline};
 use deckcraft_model::text::Hyperlink;
-use deckcraft_model::{Presentation, ShapeId};
+use deckcraft_model::{AnimClass, Presentation, Rgba, ShapeId};
 use deckcraft_render::{ParaState, RenderOpts, ShapeState};
 use egui::{Align2, Color32, CornerRadius, Mesh, Pos2, Rect, Sense, Stroke, TextureHandle, Ui, pos2, vec2};
 use serde_json::json;
@@ -29,7 +29,13 @@ pub struct Show {
     next_tex: Option<(usize, TextureHandle)>,
     blank: Option<Color32>,
     pen: bool,
-    strokes: Vec<Vec<Pos2>>,
+    /// Ink colour for the next stroke. Starts as the file's pen colour; the show toolbar can
+    /// override it without writing the file.
+    pen_color: Rgba,
+    /// Each stroke keeps the colour it was drawn with.
+    strokes: Vec<(Color32, Vec<Pos2>)>,
+    /// Pause bookmarks already reached on this visit, and the video waiting to be resumed.
+    bookmarks: BookmarkClock,
     goto: String,
     started: bool,
     show_start: f64,
@@ -89,7 +95,9 @@ impl Show {
             next_tex: None,
             blank: None,
             pen: false,
+            pen_color: doc.show.pen_color,
             strokes: vec![],
+            bookmarks: BookmarkClock::default(),
             goto: String::new(),
             started: false,
             show_start: 0.0,
@@ -150,6 +158,7 @@ impl Show {
                 self.step_start = now;
                 self.step_end = now;
                 self.strokes.clear();
+                self.bookmarks.clear();
                 if self.preview_only {
                     return false;
                 }
@@ -157,6 +166,7 @@ impl Show {
             }
             ShowAction::End => {
                 self.ended = true;
+                self.bookmarks.clear();
                 if self.preview_only {
                     return false;
                 }
@@ -276,13 +286,18 @@ pub fn ui(app: &mut SlideApp, ui: &mut Ui) {
         show.last_move = now;
     }
     let mut actions: Vec<ShowAction> = vec![];
+    let mut resume_forward = false;
     for (k, m) in keys {
         use egui::Key::*;
         match k {
             Escape | Minus => keep = false,
+            K if !m.command => toggle_slide_video(app, &mut show, &doc),
+            P if m.alt && !m.command => toggle_slide_video(app, &mut show, &doc),
             ArrowRight | ArrowDown | Space | PageDown | N => {
                 if show.ended {
                     keep = false;
+                } else if show.bookmarks.hold.is_some() {
+                    resume_forward = true;
                 } else {
                     actions.push(show.state.next(&doc));
                 }
@@ -293,11 +308,13 @@ pub fn ui(app: &mut SlideApp, ui: &mut Ui) {
                     show.goto.clear();
                 } else if show.ended {
                     keep = false;
+                } else if show.bookmarks.hold.is_some() {
+                    resume_forward = true;
                 } else {
                     actions.push(show.state.next(&doc));
                 }
             }
-            ArrowLeft | ArrowUp | Backspace | PageUp | P if !(k == P && m.command) => {
+            ArrowLeft | ArrowUp | Backspace | PageUp | P if !(k == P && (m.command || m.alt)) => {
                 show.ended = false;
                 actions.push(show.state.prev(&doc));
             }
@@ -314,13 +331,16 @@ pub fn ui(app: &mut SlideApp, ui: &mut Ui) {
             _ => {}
         }
     }
-    let on_slide = !show.pen && !show.ended && show.blank.is_none() && !show.reading_bar_hit(&ctx);
+    let on_slide = !show.pen && !show.ended && show.blank.is_none() && !show.reading_bar_hit(&ctx, &doc);
     let gif_click = if clicked && on_slide { gif_hit(&ctx, ui, &show, &doc, app) } else { None };
     let media_click = if clicked && on_slide && gif_click.is_none() { media_hit(&ctx, ui, &show, &doc) } else { None };
     let link = if on_slide && gif_click.is_none() && media_click.is_none() { link_hit(&ctx, ui, &mut show, &doc) } else { None };
     if let Some(id) = gif_click {
         let _ = app.run("media.gifPlay", json!({"id": id}));
     } else if let Some((id, clip)) = media_click {
+        if show.bookmarks.hold == Some(id) {
+            show.bookmarks.hold = None;
+        }
         app.media.toggle(&doc, id, &clip, crate::media::Owner::Show);
     } else if clicked && let Some(l) = &link {
         let last = show.last_viewed;
@@ -330,17 +350,23 @@ pub fn ui(app: &mut SlideApp, ui: &mut Ui) {
             LinkJump::Exit => keep = false,
             LinkJump::None => {}
         }
-    } else if clicked && !show.pen && !show.reading_bar_hit(&ctx) {
+    } else if clicked && !show.pen && !show.reading_bar_hit(&ctx, &doc) {
         if show.ended {
             keep = false;
         } else if show.blank.is_some() {
             show.blank = None;
+        } else if show.bookmarks.hold.is_some() {
+            resume_forward = true;
         } else {
             actions.push(show.state.next(&doc));
         }
     }
     if secondary && !show.ended {
         actions.push(show.state.prev(&doc));
+    }
+    // A bookmark pause eats the next advance: that click resumes the video.
+    if resume_forward && !resume_held(app, &mut show, &doc) && !show.ended {
+        actions.push(show.state.next(&doc));
     }
     // Apply input first: a step started by this click must restart the clock before it is read.
     for a in actions.drain(..) {
@@ -357,7 +383,7 @@ pub fn ui(app: &mut SlideApp, ui: &mut Ui) {
             actions.push(show.state.step_done(&doc));
             show.step_end = now;
         }
-    } else if show.trans.is_none() {
+    } else if show.trans.is_none() && show.bookmarks.hold.is_none() {
         // Auto-advance (After: timings) or autoplay preview.
         let idle = now - show.step_end.max(show.slide_start);
         let cur_step = show.state.step;
@@ -376,6 +402,9 @@ pub fn ui(app: &mut SlideApp, ui: &mut Ui) {
         }
     }
     show_media(app, &mut show, &doc);
+    if media_bookmarks(app, &mut show, &doc) {
+        ctx.request_repaint();
+    }
     // Draw.
     let full = ui.max_rect();
     let painter = ui.painter_at(full);
@@ -571,10 +600,10 @@ pub fn ui(app: &mut SlideApp, ui: &mut Ui) {
     let resp = ui.interact(full, ui.id().with("show_pen"), if show.pen { Sense::drag() } else { Sense::hover() });
     if show.pen {
         if resp.drag_started() {
-            show.strokes.push(vec![]);
+            show.strokes.push((theme::to_color32(show.pen_color), vec![]));
         }
         if resp.dragged()
-            && let (Some(p), Some(s)) = (resp.interact_pointer_pos(), show.strokes.last_mut())
+            && let (Some(p), Some((_, s))) = (resp.interact_pointer_pos(), show.strokes.last_mut())
         {
             s.push(pos2((p.x - srect.min.x) / srect.width(), (p.y - srect.min.y) / srect.height()));
         }
@@ -585,10 +614,9 @@ pub fn ui(app: &mut SlideApp, ui: &mut Ui) {
         ctx.set_cursor_icon(egui::CursorIcon::None);
         ctx.request_repaint_after(std::time::Duration::from_millis(500));
     }
-    let pen_col = theme::to_color32(doc.show.pen_color);
-    for s in &show.strokes {
+    for (pen_col, s) in &show.strokes {
         let pts: Vec<Pos2> = s.iter().map(|q| pos2(srect.min.x + q.x * srect.width(), srect.min.y + q.y * srect.height())).collect();
-        painter.add(egui::Shape::line(pts, Stroke::new(3.0, pen_col)));
+        painter.add(egui::Shape::line(pts, Stroke::new(3.0, *pen_col)));
     }
     // Reading view bar / on-screen controls.
     if show.reading {
@@ -609,34 +637,38 @@ pub fn ui(app: &mut SlideApp, ui: &mut Ui) {
         if child.button("Close").clicked() {
             keep = false;
         }
-        if child.button("▶").clicked() {
-            let a = show.state.next(&doc);
-            if !show.apply(a, &doc, now) {
-                keep = false;
-            }
+        if child.button("▶").clicked() && !forward(app, &mut show, &doc, now) {
+            keep = false;
         }
         if child.button("◀").clicked() {
             let a = show.state.prev(&doc);
             show.apply(a, &doc, now);
         }
-    } else if now - show.last_move < 2.5 {
-        let bar = Rect::from_min_size(pos2(full.min.x + 20.0, full.max.y - 50.0), vec2(250.0, 34.0));
+    } else if show.pen || now - show.last_move < 2.5 {
+        let swatches = pen_swatches(doc.show.pen_color);
+        let bar = controls_rect(full, srect, swatches.len());
         painter.rect_filled(bar, CornerRadius::same(17), Color32::from_black_alpha(140));
         let mut child =
-            ui.new_child(egui::UiBuilder::new().max_rect(bar.shrink2(vec2(10.0, 4.0))).layout(egui::Layout::left_to_right(egui::Align::Center)));
-        let b = |ui: &mut Ui, s: &str| ui.add(egui::Button::new(egui::RichText::new(s).color(Color32::WHITE).size(15.0)).frame(false));
+            ui.new_child(egui::UiBuilder::new().max_rect(bar.shrink2(vec2(8.0, 4.0))).layout(egui::Layout::left_to_right(egui::Align::Center)));
+        let b = |ui: &mut Ui, s: &str| ui.add(egui::Button::new(egui::RichText::new(s).color(Color32::WHITE).size(14.0)).frame(false));
         if b(&mut child, "◀").clicked() {
             let a = show.state.prev(&doc);
             show.apply(a, &doc, now);
         }
-        if b(&mut child, "▶").clicked() {
-            let a = show.state.next(&doc);
-            if !show.apply(a, &doc, now) {
-                keep = false;
-            }
+        if b(&mut child, "▶").clicked() && !forward(app, &mut show, &doc, now) {
+            keep = false;
         }
-        if b(&mut child, if show.pen { "✏ on" } else { "✏" }).clicked() {
+        if b(&mut child, &pen_button_label(show.pen)).clicked() {
             show.pen = !show.pen;
+        }
+        for c in swatches {
+            let mark = egui::Button::new(egui::RichText::new("●").size(14.0).color(theme::to_color32(c)))
+                .frame(false)
+                .stroke(Stroke::new(if show.pen_color == c { 2.0 } else { 0.0 }, Color32::WHITE));
+            if child.add(mark).on_hover_text("Pen colour").clicked() {
+                show.pen_color = c;
+                show.pen = true;
+            }
         }
         if b(&mut child, "⬛").clicked() {
             show.blank = Some(Color32::BLACK);
@@ -662,7 +694,7 @@ pub fn ui(app: &mut SlideApp, ui: &mut Ui) {
     }
     // Presenter view in a second window.
     if show.presenter && !show.reading && !show.ended {
-        presenter_window(&ctx, &mut show, &doc, now, &mut keep);
+        presenter_window(app, &ctx, &mut show, &doc, now, &mut keep);
     }
     if keep {
         app.show = Some(show);
@@ -684,6 +716,114 @@ pub fn ui(app: &mut SlideApp, ui: &mut Ui) {
         let last = show.state.slide;
         let _ = app.run("slide.go", json!({"index": last}));
     }
+}
+
+/// Fluorescent colours for dark slides, plus the colour stored on the file.
+fn pen_swatches(file: Rgba) -> Vec<Rgba> {
+    const NEON: [Rgba; 5] = [Rgba::rgb(255, 255, 0), Rgba::rgb(57, 255, 20), Rgba::rgb(0, 255, 255), Rgba::rgb(255, 45, 180), Rgba::rgb(255, 95, 0)];
+    let mut v = vec![file];
+    for c in NEON {
+        if c != file {
+            v.push(c);
+        }
+    }
+    v
+}
+
+fn pen_button_label(on: bool) -> String {
+    let key = if cfg!(target_os = "macos") { "⌘P" } else { "Ctrl+P" };
+    if on { format!("✏ on {key}") } else { format!("✏ {key}") }
+}
+
+/// Show controls, on the slide and inset from the window so a 16:9 deck on a 16:10 screen
+/// does not leave the bar in the letterbox.
+fn controls_rect(full: Rect, srect: Rect, swatches: usize) -> Rect {
+    let h = 34.0;
+    let w = (248.0 + swatches as f32 * 22.0).min((full.width() - 16.0).max(h));
+    let y = (srect.max.y - h - 12.0).min(full.max.y - h - 28.0).max(full.min.y);
+    let x = (srect.min.x + 12.0).max(full.min.x).min((full.max.x - w).max(full.min.x));
+    Rect::from_min_size(pos2(x, y), vec2(w, h))
+}
+
+fn pause_names(doc: &Presentation, slide: usize, shape: ShapeId) -> Vec<String> {
+    let Some(s) = doc.slides.get(slide) else { return vec![] };
+    s.animations
+        .iter()
+        .filter_map(|a| {
+            if a.shape == shape && a.class == AnimClass::Media && a.effect == "pause" {
+                a.bookmark.clone().filter(|n| !n.trim().is_empty())
+            } else {
+                None
+            }
+        })
+        .take(1_000)
+        .collect()
+}
+
+/// Pause a playing clip when its position reaches a bookmark that has a pause effect.
+fn media_bookmarks(app: &mut SlideApp, show: &mut Show, doc: &Presentation) -> bool {
+    if show.ended || show.bookmarks.hold.is_some() {
+        return false;
+    }
+    let slide = show.state.slide;
+    for (id, _, clip) in crate::media::slide_media(doc, slide) {
+        if clip.bookmarks.is_empty() {
+            continue;
+        }
+        let Some(st) = app.media.status(id) else { continue };
+        if st.state != deckcraft_media::PlayState::Playing {
+            continue;
+        }
+        let pos = (st.position.max(0.0) * 1000.0).round();
+        if !pos.is_finite() {
+            continue;
+        }
+        let pos_ms = pos.min(86_400_000.0) as u32;
+        let pauses = pause_names(doc, slide, id);
+        let Some(t) = show.bookmarks.due(id, &clip.bookmarks, &pauses, pos_ms) else { continue };
+        app.media.seek(doc, id, &clip, t as f64 / 1000.0, crate::media::Owner::Show);
+        app.media.pause(id);
+        show.bookmarks.mark(id, t);
+        return true;
+    }
+    false
+}
+
+/// Resume the video a bookmark paused. `false` when nothing was held.
+fn resume_held(app: &mut SlideApp, show: &mut Show, doc: &Presentation) -> bool {
+    let Some(id) = show.bookmarks.hold else { return false };
+    let clip = crate::media::slide_media(doc, show.state.slide).into_iter().find(|(i, _, _)| *i == id).map(|(_, _, c)| c);
+    show.bookmarks.hold = None;
+    let Some(clip) = clip else { return false };
+    app.media.play(doc, id, &clip, None, crate::media::Owner::Show);
+    true
+}
+
+/// The next advance: resume a bookmark hold, otherwise step the show.
+fn forward(app: &mut SlideApp, show: &mut Show, doc: &Presentation, now: f64) -> bool {
+    if resume_held(app, show, doc) {
+        return true;
+    }
+    let a = show.state.next(doc);
+    show.apply(a, doc, now)
+}
+
+/// Alt+P and K: pause or resume the slide's video. A bookmark hold resumes and is cleared,
+/// so the following click advances.
+fn toggle_slide_video(app: &mut SlideApp, show: &mut Show, doc: &Presentation) {
+    let clips: Vec<_> = crate::media::slide_media(doc, show.state.slide).into_iter().filter(|(_, _, c)| c.video).collect();
+    let id = clips
+        .iter()
+        .find(|(id, _, _)| app.media.is_playing(*id))
+        .map(|c| c.0)
+        .or_else(|| show.bookmarks.hold.filter(|id| clips.iter().any(|c| c.0 == *id)))
+        .or_else(|| clips.first().map(|c| c.0));
+    let Some(id) = id else { return };
+    let Some((_, _, clip)) = clips.into_iter().find(|(i, _, _)| *i == id) else { return };
+    if show.bookmarks.hold == Some(id) {
+        show.bookmarks.hold = None;
+    }
+    app.media.toggle(doc, id, &clip, crate::media::Owner::Show);
 }
 
 /// Start the media of a newly shown slide: media from the previous slide stops unless it plays
@@ -759,16 +899,25 @@ fn gif_hit(ctx: &egui::Context, ui: &Ui, show: &Show, doc: &Presentation, app: &
 }
 
 impl Show {
-    fn reading_bar_hit(&self, ctx: &egui::Context) -> bool {
+    fn reading_bar_hit(&self, ctx: &egui::Context, doc: &Presentation) -> bool {
         // Clicks on the on-screen controls must not also advance.
         ctx.input(|i| i.pointer.interact_pos()).is_some_and(|p| {
             let r = ctx.content_rect();
-            (self.reading && p.y > r.max.y - 34.0) || (!self.reading && p.y > r.max.y - 56.0 && p.x < r.min.x + 280.0)
+            if self.reading && p.y > r.max.y - 34.0 {
+                return true;
+            }
+            let srect = fit(r, doc);
+            controls_rect(r, srect, pen_swatches(doc.show.pen_color).len()).contains(p)
         })
     }
 }
 
-fn presenter_window(ctx: &egui::Context, show: &mut Show, doc: &Presentation, now: f64, keep: &mut bool) {
+enum PresenterCmd {
+    Next,
+    Prev,
+}
+
+fn presenter_window(app: &mut SlideApp, ctx: &egui::Context, show: &mut Show, doc: &Presentation, now: f64, keep: &mut bool) {
     let cur = show.state.slide;
     let next = deckcraft_anim::show_order(doc).into_iter().find(|i| *i > cur);
     let cur_tex = show.tex.as_ref().map(|(_, t)| t.clone());
@@ -789,7 +938,7 @@ fn presenter_window(ctx: &egui::Context, show: &mut Show, doc: &Presentation, no
     let next_tex = show.next_tex.as_ref().filter(|(k, _)| Some(*k) == next).map(|(_, t)| t.clone());
     let notes = doc.slides.get(cur).map(|s| s.notes_text()).unwrap_or_default();
     let elapsed = now - show.show_start;
-    let mut actions = vec![];
+    let mut cmds: Vec<PresenterCmd> = vec![];
     ctx.show_viewport_immediate(
         egui::ViewportId::from_hash_of("deckcraft_presenter"),
         egui::ViewportBuilder::default().with_title("Presenter View — DeckCraft").with_inner_size([1100.0, 700.0]),
@@ -813,10 +962,10 @@ fn presenter_window(ctx: &egui::Context, show: &mut Show, doc: &Presentation, no
                             *keep = false;
                         }
                         if ui.button("Next ▶").clicked() {
-                            actions.push(show.state.next(doc));
+                            cmds.push(PresenterCmd::Next);
                         }
                         if ui.button("◀ Previous").clicked() {
-                            actions.push(show.state.prev(doc));
+                            cmds.push(PresenterCmd::Prev);
                         }
                     });
                 });
@@ -854,8 +1003,15 @@ fn presenter_window(ctx: &egui::Context, show: &mut Show, doc: &Presentation, no
             }
         },
     );
-    for a in actions {
-        if !show.apply(a, doc, now) {
+    for c in cmds {
+        let stay = match c {
+            PresenterCmd::Next => forward(app, show, doc, now),
+            PresenterCmd::Prev => {
+                let a = show.state.prev(doc);
+                show.apply(a, doc, now)
+            }
+        };
+        if !stay {
             *keep = false;
         }
     }
@@ -884,5 +1040,26 @@ mod tests {
         assert_eq!(tr.old.as_ref().map(TextureHandle::id), Some(red.id()));
         assert_eq!(tr.from, Some(0));
         assert!(show.tex.is_none(), "the new slide gets a texture of its own instead of overwriting the old one");
+    }
+
+    #[test]
+    fn show_controls_stay_on_a_letterboxed_slide() {
+        // 16:10 window, 16:9 slide: the bar used to sit in the black band under the slide.
+        let full = Rect::from_min_max(pos2(0.0, 0.0), pos2(1600.0, 1000.0));
+        let srect = Rect::from_center_size(full.center(), vec2(1600.0, 900.0));
+        let bar = controls_rect(full, srect, 6);
+        assert!(bar.max.y <= srect.max.y, "bar {} extends past the slide {}", bar.max.y, srect.max.y);
+        assert!(bar.min.y >= srect.min.y);
+        assert!(bar.min.x >= full.min.x && bar.max.x <= full.max.x);
+        assert!(bar.max.y <= full.max.y - 8.0);
+        assert!(pen_button_label(false).contains('P'));
+        assert!(pen_button_label(true).contains("on"));
+        let swatches = pen_swatches(Rgba::rgb(255, 0, 0));
+        assert!(swatches.contains(&Rgba::rgb(255, 255, 0)));
+        assert!(swatches.contains(&Rgba::rgb(57, 255, 20)));
+        assert!(swatches.contains(&Rgba::rgb(0, 255, 255)));
+        assert!(swatches.contains(&Rgba::rgb(255, 45, 180)));
+        assert!(swatches.contains(&Rgba::rgb(255, 95, 0)));
+        assert_eq!(swatches[0], Rgba::rgb(255, 0, 0));
     }
 }

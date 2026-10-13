@@ -1,6 +1,6 @@
 # Slide show and presenter view: parity with PowerPoint
 
-> **Last reviewed:** 2026-10-10 · **Last updated:** 2026-10-10 · **Change:** major (created; measured from `crates/ui-egui/src/show.rs` and `crates/anim/src/show.rs` against PowerPoint 16.113's Slide Show tab and menu) · **Target:** Microsoft PowerPoint for Mac 16.113 (Microsoft 365)
+> **Last reviewed:** 2026-10-13 · **Last updated:** 2026-10-13 · **Change:** minor (bookmark pauses, Alt+P/K, pen colours on the show toolbar; previous: major, created) · **Target:** Microsoft PowerPoint for Mac 16.113 (Microsoft 365)
 
 Presenting is the job PowerPoint is hired for. This doc covers the show window, presenter view,
 rehearsal and recording. Transition and animation playback are in
@@ -20,11 +20,11 @@ ready** (estimated), **10–16 h** to parity.
 | Step clock: a click after a long pause plays its step (#11) | yes | yes | |
 | Hidden slides skipped | yes | yes | |
 | Hyperlinks and action settings followed (slides, web, mail, End Show, Last Viewed) | yes | yes | Only `http(s)` and `mailto` open outside the show, by design (`safe_url`) |
-| Media playback with controls, play across slides, full-screen video | yes | yes | WMA/WMV not decodable |
+| Media playback with controls, play across slides, full-screen video | yes | yes | A bookmark pause stops the video; the next click resumes. Alt+P and K toggle play. WMA/WMV not decodable |
 | Animated GIFs play; pause from their corner button | yes | yes (#39) | |
 | See All Slides grid during the show | yes | no | |
 | Zoom into part of a slide during the show | yes | no | |
-| Pen and highlighter ink | yes | pen only (Cmd+P pen, Cmd+A arrow, E erases all ink) | No highlighter, per-stroke eraser, ink colours, or keep/discard annotations prompt |
+| Pen and highlighter ink | yes | pen, with colours (Cmd+P pen, labelled on the toolbar; Cmd+A arrow, E erases all ink) | Toolbar swatches: the file colour plus neon yellow, green, cyan, pink and orange. No highlighter, per-stroke eraser, or keep/discard prompt |
 | Laser pointer | yes | **no** | 1–2 h |
 | Subtitles and live captions | yes (cloud speech) | no | AI dimension |
 | Custom shows | yes | yes | |
@@ -73,4 +73,5 @@ Reading View in a window with navigation: present (checklist row done).
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-10-13 | minor | Show pauses at media bookmarks; Alt+P and K toggle video; pen toolbar stays on the slide and offers fluorescent colours (#362) |
 | 2026-10-10 | major | Created: show, presenter view, rehearse and record, compared with PowerPoint 16.113's Slide Show tab and menu |

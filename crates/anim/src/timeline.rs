@@ -7,6 +7,10 @@ use deckcraft_model::{AnimClass, AnimStart, Animation, ColorScheme, Rgba, Scheme
 use crate::AnimState;
 use crate::effects::{EffectSpec, exit_base, motion_path};
 
+fn is_bookmark(a: &Animation) -> bool {
+    a.bookmark.as_deref().is_some_and(|s| !s.trim().is_empty())
+}
+
 /// Delay between paragraphs of a by-paragraph build that isn't on click (seconds).
 pub const PARAGRAPH_STAGGER: f64 = 0.5;
 const MAX_EFFECTS: usize = 100_000;
@@ -154,6 +158,9 @@ impl Timeline {
         // Sequences in order of first appearance: main first.
         let mut seqs: Vec<Sequence> = vec![Sequence::Main];
         for a in &slide.animations {
+            if is_bookmark(a) {
+                continue;
+            }
             if let Some(tr) = a.trigger {
                 let s = Sequence::Trigger(tr);
                 if !seqs.contains(&s) {
@@ -166,6 +173,10 @@ impl Timeline {
             let mut group_begin = 0.0f64;
             let mut max_end = 0.0f64;
             for (ai, a) in slide.animations.iter().enumerate() {
+                // A bookmark pause is an interactive sequence, not a click on the slide.
+                if is_bookmark(a) {
+                    continue;
+                }
                 let aseq = a.trigger.map(Sequence::Trigger).unwrap_or(Sequence::Main);
                 if aseq != seq {
                     continue;

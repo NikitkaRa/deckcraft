@@ -12,6 +12,7 @@
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 #![forbid(unsafe_code)]
 
+mod bookmark;
 mod easing;
 mod effects;
 mod mesh;
@@ -31,6 +32,7 @@ mod transition_tests;
 pub use deckcraft_model::Rgba;
 use serde::{Deserialize, Serialize};
 
+pub use bookmark::BookmarkClock;
 pub use easing::ease;
 pub use mesh::{MeshVertex, layer_mesh};
 pub use morph::{MorphFrame, MorphPath, MorphText, morph_frame, morph_pairs, morph_xfrm};

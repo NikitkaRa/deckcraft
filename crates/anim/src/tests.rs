@@ -246,6 +246,15 @@ fn after_hide_on_next_click() {
 }
 
 #[test]
+fn a_bookmark_pause_is_not_a_click_step() {
+    let mut pause = anim(1, AnimClass::Media, "pause", AnimStart::OnClick);
+    pause.bookmark = Some("stop 1".into());
+    let tl = Timeline::new(&slide_with(vec![pause, anim(2, AnimClass::Entrance, "fade", AnimStart::OnClick)]), W, H);
+    assert_eq!(tl.steps(), 1);
+    assert!(tl.effects().iter().all(|e| e.shape != ShapeId(1)));
+}
+
+#[test]
 fn triggered_sequences() {
     let mut a = anim(1, AnimClass::Entrance, "fade", AnimStart::OnClick);
     a.trigger = Some(ShapeId(3));

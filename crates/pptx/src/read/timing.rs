@@ -51,25 +51,40 @@ pub fn transition(imp: &mut Imp, part: &Part, t: &El) -> Option<Transition> {
 struct Found<'a> {
     ctn: &'a El,
     trigger: Option<u32>,
+    /// `onMediaBookmark` name from an ancestor interactive sequence.
+    bookmark: Option<String>,
 }
 
-fn collect<'a>(e: &'a El, trigger: Option<u32>, out: &mut Vec<Found<'a>>, depth: usize) {
+fn bookmark_name(cond: &El) -> Option<String> {
+    let raw = cond.find("bmkTgt").and_then(|e| e.attr("bmkName")).or_else(|| cond.find("bmk").and_then(|e| e.attr("name")))?;
+    let name: String = raw.trim().chars().filter(|c| !c.is_control()).take(200).collect();
+    (!name.is_empty()).then_some(name)
+}
+
+fn collect<'a>(e: &'a El, trigger: Option<u32>, bookmark: Option<&str>, out: &mut Vec<Found<'a>>, depth: usize) {
     if depth > 64 || out.len() > 10_000 {
         return;
     }
     for c in e.elements() {
         if c.is("cTn") && c.has_attr("presetClass") {
-            out.push(Found { ctn: c, trigger });
+            out.push(Found { ctn: c, trigger, bookmark: bookmark.map(str::to_string) });
             continue;
         }
-        let mut trig = trigger;
         if c.is("seq")
             && let Some(ctn) = c.child("cTn")
             && ctn.attr("nodeType") == Some("interactiveSeq")
+            && let Some(cond) = ctn.path(&["stCondLst", "cond"])
         {
-            trig = ctn.path(&["stCondLst", "cond", "tgtEl", "spTgt"]).and_then(|s| s.u32("spid"));
+            if cond.attr("evt") == Some("onMediaBookmark") {
+                let owned = bookmark_name(cond);
+                collect(c, None, owned.as_deref(), out, depth + 1);
+            } else {
+                let trig = cond.path(&["tgtEl", "spTgt"]).and_then(|s| s.u32("spid"));
+                collect(c, trig, None, out, depth + 1);
+            }
+        } else {
+            collect(c, trigger, bookmark, out, depth + 1);
         }
-        collect(c, trig, out, depth + 1);
     }
 }
 
@@ -97,7 +112,7 @@ pub fn animations(imp: &mut Imp, part: &Part, ctx: &IdCtx, timing: &El, _shapes:
     let _ = (imp, part);
     let Some(tn) = timing.child("tnLst") else { return vec![] };
     let mut found = vec![];
-    collect(tn, None, &mut found, 0);
+    collect(tn, None, None, &mut found, 0);
     // Paragraph builds (`bldP build="p"`) by (spid, grpId).
     let by_para: Vec<(u32, String)> = timing
         .child("bldLst")
@@ -118,7 +133,20 @@ pub fn animations(imp: &mut Imp, part: &Part, ctx: &IdCtx, timing: &El, _shapes:
         let Some(file_id) = tgt.u32("spid") else { continue };
         let Some(shape) = ctx.lookup(file_id) else { continue };
         let paragraph = tgt.path(&["txEl", "pRg"]).and_then(|p| p.u32("st"));
-        let effect = maps::effect_for_preset(class, preset).unwrap_or_else(|| maps::fallback_effect(class));
+        let mut effect = maps::effect_for_preset(class, preset).unwrap_or_else(|| maps::fallback_effect(class));
+        if class == AnimClass::Media
+            && let Some(cmd) = c.find("cmd").and_then(|e| e.attr("cmd"))
+        {
+            effect = if cmd == "togglePause" || cmd == "pause" {
+                "pause"
+            } else if cmd == "stop" {
+                "stop"
+            } else if cmd.starts_with("play") {
+                "play"
+            } else {
+                effect
+            };
+        }
         let start = match c.attr("nodeType") {
             Some("clickEffect") => AnimStart::OnClick,
             Some("afterEffect") => AnimStart::AfterPrevious,
@@ -133,7 +161,8 @@ pub fn animations(imp: &mut Imp, part: &Part, ctx: &IdCtx, timing: &El, _shapes:
             duration_ms: max_dur(c, 0).unwrap_or(0),
             delay_ms: c.path(&["stCondLst", "cond"]).and_then(|d| ms_attr(d, "delay")).unwrap_or(0),
             paragraph,
-            trigger: f.trigger.and_then(|t| ctx.lookup(t)),
+            trigger: if f.bookmark.is_some() { None } else { f.trigger.and_then(|t| ctx.lookup(t)) },
+            bookmark: f.bookmark.clone(),
             preset_id: Some(preset),
             preset_subtype: Some(sub),
             auto_reverse: c.bool("autoRev").unwrap_or(false),

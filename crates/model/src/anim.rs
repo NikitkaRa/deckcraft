@@ -262,6 +262,9 @@ pub struct Animation {
     pub path: Option<String>,
     /// Triggered by a click on another shape.
     pub trigger: Option<ShapeId>,
+    /// Name of a media bookmark that starts this effect (`onMediaBookmark`), not a click.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bookmark: Option<String>,
     /// Emphasis amount: spin degrees, grow/shrink scale (1.5 = 150%), transparency…
     pub amount: Option<f64>,
     /// Emphasis colour (fill/line/font colour change).
@@ -294,6 +297,7 @@ impl Default for Animation {
             paragraph: None,
             path: None,
             trigger: None,
+            bookmark: None,
             amount: None,
             color: None,
             preset_id: None,

@@ -991,3 +991,54 @@ fn transition_defaults_read_like_powerpoint() {
         assert_eq!((t.kind.as_str(), t.option.as_str(), t.duration_ms), (*kind, *option, 2000), "{el}");
     }
 }
+
+#[test]
+fn media_bookmark_pauses_round_trip() {
+    let mut p = defaults::new_presentation(None);
+    let video = p.add_media("clip.mp4", "video/mp4", b"\x00\x00\x00\x18ftypmp42not-a-real-video".to_vec());
+    let mut vid = shape(&mut p, "Clip", 100.0, 80.0, 320.0, 180.0);
+    vid.kind = ShapeKind::Media(MediaClip {
+        media: video,
+        video: true,
+        volume: 1.0,
+        bookmarks: vec![("stop 1".into(), 1500), ("stop 2".into(), 4000)],
+        autoplay: true,
+        ..Default::default()
+    });
+    let vid_id = vid.id;
+    let slide_id = p.slides[0].id;
+    let s = p.slide_mut(slide_id).expect("slide");
+    let title = s.shapes[0].id;
+    s.shapes.push(vid);
+    s.animations = vec![
+        Animation { shape: vid_id, class: AnimClass::Media, effect: "pause".into(), bookmark: Some("stop 1".into()), ..Default::default() },
+        Animation { shape: vid_id, class: AnimClass::Media, effect: "pause".into(), bookmark: Some("stop 2".into()), ..Default::default() },
+        Animation { shape: title, effect: "fade".into(), ..Default::default() },
+    ];
+    let bytes = deckcraft_pptx::export(&p).expect("export");
+    let mut zip = zip::ZipArchive::new(std::io::Cursor::new(bytes.clone())).expect("zip");
+    let mut xml = String::new();
+    std::io::Read::read_to_string(&mut zip.by_name("ppt/slides/slide1.xml").expect("slide"), &mut xml).expect("read");
+    assert!(xml.contains("evt=\"onMediaBookmark\""), "{xml}");
+    assert!(xml.contains("bmkName=\"stop 1\""), "{xml}");
+    assert!(xml.contains("bmkName=\"stop 2\""), "{xml}");
+    assert!(xml.contains("name=\"stop 1\""), "{xml}");
+    assert!(xml.contains("time=\"1500\""), "{xml}");
+    // The pause is not a click in the main sequence: that sequence still only advances the fade.
+    let main = xml.split("nodeType=\"mainSeq\"").nth(1).expect("main sequence");
+    let main = main.split("nodeType=\"interactiveSeq\"").next().unwrap_or(main);
+    assert!(!main.contains("onMediaBookmark"), "{main}");
+    let q = deckcraft_pptx::import(&bytes).expect("import");
+    let slide = &q.slides[0];
+    let pauses: Vec<_> = slide.animations.iter().filter(|a| a.effect == "pause").collect();
+    assert_eq!(pauses.len(), 2);
+    assert_eq!(pauses[0].bookmark.as_deref(), Some("stop 1"));
+    assert_eq!(pauses[1].bookmark.as_deref(), Some("stop 2"));
+    assert!(pauses.iter().all(|a| a.trigger.is_none() && a.class == AnimClass::Media));
+    let fade = slide.animations.iter().find(|a| a.effect == "fade").expect("fade");
+    assert!(fade.bookmark.is_none());
+    match &by_name(slide, "Clip").kind {
+        ShapeKind::Media(m) => assert_eq!(m.bookmarks, vec![("stop 1".into(), 1500), ("stop 2".into(), 4000)]),
+        other => panic!("expected media, got {other:?}"),
+    }
+}

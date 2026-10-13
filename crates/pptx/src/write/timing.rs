@@ -489,6 +489,57 @@ fn group<'a>(effects: Vec<Eff<'a>>) -> Groups<'a> {
     clicks
 }
 
+fn bookmark_label(s: &str) -> Option<String> {
+    let name: String = s.trim().chars().filter(|c| !c.is_control()).take(200).collect();
+    (!name.is_empty()).then_some(name)
+}
+
+fn trig_cond(w: &mut W, evt: &str, body: impl FnOnce(&mut W)) {
+    w.open("p:cond", A::new().a("evt", evt).a("delay", 0));
+    w.open0("p:tgtEl");
+    body(w);
+    w.close("p:tgtEl");
+    w.close("p:cond");
+}
+
+/// One interactive sequence: a shape click, or a media bookmark.
+fn interactive(w: &mut W, x: &mut Exp, ids: &mut Ids, effs: Vec<Eff>, cond: impl Fn(&mut W)) {
+    let effs: Vec<Eff> = effs
+        .into_iter()
+        .enumerate()
+        .map(|(i, e)| Eff {
+            start: if i == 0 {
+                AnimStart::OnClick
+            } else if e.start == AnimStart::OnClick {
+                AnimStart::AfterPrevious
+            } else {
+                e.start
+            },
+            ..e
+        })
+        .collect();
+    let clicks = group(effs);
+    w.open("p:seq", A::new().a("concurrent", 1).a("nextAc", "seek"));
+    w.open(
+        "p:cTn",
+        A::new().a("id", ids.next()).a("restart", "whenNotActive").a("fill", "hold").a("evtFilter", "cancelBubble").a("nodeType", "interactiveSeq"),
+    );
+    w.open0("p:stCondLst");
+    cond(w);
+    w.close("p:stCondLst");
+    w.open("p:endSync", A::new().a("evt", "end").a("delay", 0));
+    w.empty("p:rtn", A::new().a("val", "all"));
+    w.close("p:endSync");
+    w.open0("p:childTnLst");
+    click_pars(w, x, ids, &clicks, true);
+    w.close("p:childTnLst");
+    w.close("p:cTn");
+    w.open0("p:nextCondLst");
+    cond(w);
+    w.close("p:nextCondLst");
+    w.close("p:seq");
+}
+
 fn click_pars(w: &mut W, x: &mut Exp, ids: &mut Ids, clicks: &Groups, interactive: bool) {
     for (ci, (auto, afters)) in clicks.iter().enumerate() {
         w.open0("p:par");
@@ -537,6 +588,7 @@ pub fn timing(w: &mut W, x: &mut Exp, anims: &[Animation], shapes: &[Shape], idm
     let mut grp_count: std::collections::HashMap<u32, u32> = Default::default();
     let mut main: Vec<Eff> = vec![];
     let mut triggered: Vec<(u32, Vec<Eff>)> = vec![];
+    let mut bookmarked: Vec<(String, Vec<Eff>)> = vec![];
     let mut bld: Vec<(u32, u32, bool)> = vec![];
     for a in anims.iter().take(10_000) {
         let Some(spid) = idmap.get(a.shape) else {
@@ -576,15 +628,22 @@ pub fn timing(w: &mut W, x: &mut Exp, anims: &[Animation], shapes: &[Shape], idm
         if matches!(shape.kind, ShapeKind::Shape) && shape.text.is_some() {
             bld.push((spid, grp, by_para));
         }
-        match a.trigger.and_then(|t| idmap.get(t)) {
-            Some(t) => match triggered.iter_mut().find(|(s, _)| *s == t) {
+        if let Some(name) = a.bookmark.as_deref().and_then(bookmark_label) {
+            match bookmarked.iter_mut().find(|(n, _)| *n == name) {
                 Some((_, v)) => v.extend(effs),
-                None => triggered.push((t, effs)),
-            },
-            None => main.extend(effs),
+                None => bookmarked.push((name, effs)),
+            }
+        } else {
+            match a.trigger.and_then(|t| idmap.get(t)) {
+                Some(t) => match triggered.iter_mut().find(|(s, _)| *s == t) {
+                    Some((_, v)) => v.extend(effs),
+                    None => triggered.push((t, effs)),
+                },
+                None => main.extend(effs),
+            }
         }
     }
-    if main.is_empty() && triggered.is_empty() {
+    if main.is_empty() && triggered.is_empty() && bookmarked.is_empty() {
         return;
     }
     let mut ids = Ids(0);
@@ -618,53 +677,18 @@ pub fn timing(w: &mut W, x: &mut Exp, anims: &[Animation], shapes: &[Shape], idm
         w.close("p:seq");
     }
     for (trig, effs) in triggered {
-        // Everything a trigger starts plays from its click.
-        let effs: Vec<Eff> = effs
-            .into_iter()
-            .enumerate()
-            .map(|(i, e)| Eff {
-                start: if i == 0 {
-                    AnimStart::OnClick
-                } else if e.start == AnimStart::OnClick {
-                    AnimStart::AfterPrevious
-                } else {
-                    e.start
-                },
-                ..e
-            })
-            .collect();
-        let clicks = group(effs);
-        let trig_cond = |w: &mut W| {
-            w.open("p:cond", A::new().a("evt", "onClick").a("delay", 0));
-            w.open0("p:tgtEl");
-            w.empty("p:spTgt", A::new().a("spid", trig));
-            w.close("p:tgtEl");
-            w.close("p:cond");
-        };
-        w.open("p:seq", A::new().a("concurrent", 1).a("nextAc", "seek"));
-        w.open(
-            "p:cTn",
-            A::new()
-                .a("id", ids.next())
-                .a("restart", "whenNotActive")
-                .a("fill", "hold")
-                .a("evtFilter", "cancelBubble")
-                .a("nodeType", "interactiveSeq"),
-        );
-        w.open0("p:stCondLst");
-        trig_cond(w);
-        w.close("p:stCondLst");
-        w.open("p:endSync", A::new().a("evt", "end").a("delay", 0));
-        w.empty("p:rtn", A::new().a("val", "all"));
-        w.close("p:endSync");
-        w.open0("p:childTnLst");
-        click_pars(w, x, &mut ids, &clicks, true);
-        w.close("p:childTnLst");
-        w.close("p:cTn");
-        w.open0("p:nextCondLst");
-        trig_cond(w);
-        w.close("p:nextCondLst");
-        w.close("p:seq");
+        interactive(w, x, &mut ids, effs, |w| {
+            trig_cond(w, "onClick", |w| {
+                w.empty("p:spTgt", A::new().a("spid", trig));
+            });
+        });
+    }
+    for (name, effs) in bookmarked {
+        interactive(w, x, &mut ids, effs, |w| {
+            trig_cond(w, "onMediaBookmark", |w| {
+                w.empty("p14:bmkTgt", A::new().a("xmlns:p14", NS_P14).a("bmkName", &name));
+            });
+        });
     }
     w.close("p:childTnLst");
     w.close("p:cTn");
