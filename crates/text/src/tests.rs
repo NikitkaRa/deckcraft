@@ -182,6 +182,25 @@ fn shrink_on_overflow() {
 }
 
 #[test]
+fn a_saved_shrink_is_used_while_the_text_fits() {
+    // PowerPoint saved 62.5% / 20%: a short text that would fit at 100% is still drawn at 62.5%.
+    let (p, mut sh) = setup("Short", 600.0, 200.0);
+    sh.text.as_mut().unwrap().body.autofit = Some(AutoFit::Shrink { font_scale: 0.625, line_reduction: 0.2 });
+    let l = lay(&p, &sh, 600.0, 200.0);
+    assert_eq!((l.font_scale, l.line_reduction), (0.625, 0.2));
+    // Text that has outgrown the saved scale is fitted again, smaller.
+    let text = (0..30).map(|i| format!("Line number {i}")).collect::<Vec<_>>().join("\n");
+    let (p, mut sh) = setup(&text, 600.0, 200.0);
+    sh.text.as_mut().unwrap().body.autofit = Some(AutoFit::Shrink { font_scale: 0.9, line_reduction: 0.0 });
+    let l = lay(&p, &sh, 600.0, 200.0);
+    assert!(l.font_scale < 0.9, "scale {}", l.font_scale);
+    // No saved shrink (100%): our own fit, as before.
+    let (p, mut sh) = setup("Short", 600.0, 200.0);
+    sh.text.as_mut().unwrap().body.autofit = Some(AutoFit::Shrink { font_scale: 1.0, line_reduction: 0.0 });
+    assert_eq!(lay(&p, &sh, 600.0, 200.0).font_scale, 1.0);
+}
+
+#[test]
 fn caret_and_hit_roundtrip() {
     let (p, sh) = setup("Hello world", 600.0, 100.0);
     let l = lay(&p, &sh, 600.0, 100.0);

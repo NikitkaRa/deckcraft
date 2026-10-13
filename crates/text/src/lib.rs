@@ -1538,6 +1538,19 @@ fn tab_advance(x: f64, stops: &[Tab], default_tab: f64, seg: (f64, f64)) -> f64 
 pub fn layout(ctx: &Ctx, shape: &Shape, body: &TextBody, opts: &Opts) -> TextLayout {
     let bp = resolve::body(ctx, shape);
     let autofit = bp.autofit.unwrap_or(AutoFit::None);
+    // A shrink PowerPoint computed and saved (`normAutofit fontScale`/`lnSpcReduction`) is used
+    // as saved, as PowerPoint does when it opens the file, while the text still fits at it; our
+    // own fit only takes over when it doesn't (the text grew since).
+    if let (AutoFit::Shrink { font_scale, line_reduction }, false) = (autofit, opts.no_shrink)
+        && font_scale.is_finite()
+        && line_reduction.is_finite()
+        && (font_scale < 1.0 || line_reduction > 0.0)
+    {
+        let saved = layout_scaled(ctx, shape, body, &bp, opts, font_scale.clamp(0.01, 1.0), line_reduction.clamp(0.0, 1.0));
+        if !saved.overflow {
+            return saved;
+        }
+    }
     let mut l = layout_scaled(ctx, shape, body, &bp, opts, 1.0, 0.0);
     if let (AutoFit::Shrink { .. }, false) = (autofit, opts.no_shrink)
         && l.overflow
