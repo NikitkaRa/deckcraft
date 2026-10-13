@@ -83,11 +83,27 @@ struct Style {
 struct Styles {
     named: HashMap<(String, String), Style>,
     defaults: HashMap<String, Style>,
+    /// `draw:gradient` definitions by name.
+    gradients: HashMap<String, El>,
+    /// `draw:fill-image` picture paths by name.
+    images: HashMap<String, String>,
 }
 
 impl Styles {
     fn add_from(&mut self, container: &El) {
         for st in container.elements() {
+            if let Some(n) = st.attr("name") {
+                if st.is("gradient") {
+                    self.gradients.insert(n.to_string(), st.clone());
+                    continue;
+                }
+                if st.is("fill-image") {
+                    if let Some(h) = st.attr("href") {
+                        self.images.insert(n.to_string(), h.trim_start_matches("./").to_string());
+                    }
+                    continue;
+                }
+            }
             let family = st.attr("family").unwrap_or("").to_string();
             let mut s = Style { parent: st.attr("parent-style-name").map(str::to_string), props: HashMap::new() };
             for p in st.elements().filter(|e| e.local().ends_with("-properties")) {
@@ -125,6 +141,8 @@ struct Ctx<'a> {
     styles: Styles,
     zip: zip::ZipArchive<std::io::Cursor<&'a [u8]>>,
     shapes: usize,
+    /// Fill images by name, added to the presentation's media.
+    images: HashMap<String, deckcraft_model::MediaId>,
 }
 
 /// Read an `.odp` package.
@@ -153,7 +171,18 @@ pub fn import(bytes: &[u8]) -> Result<Presentation, PptxError> {
     let mut p = defaults::blank_presentation(size, Default::default(), false);
     let layout = defaults::layout_of_kind(&p, LayoutType::Blank).or_else(|| p.masters.first().and_then(|m| m.layouts.first().map(|l| l.id)));
     let Some(layout) = layout else { return Err(PptxError::Unsupported("no layout".into())) };
-    let mut cx = Ctx { styles, zip, shapes: 0 };
+    let mut cx = Ctx { styles, zip, shapes: 0, images: HashMap::new() };
+    let named: Vec<(String, String)> = cx.styles.images.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+    for (name, path) in named.into_iter().take(MAX_MASTERS) {
+        if !path.contains("://")
+            && let Some(data) = entry(&mut cx.zip, &path, MAX_MEDIA)
+        {
+            let file = path.rsplit('/').next().unwrap_or(&path).to_string();
+            if let Some(media) = p.add_media(&file, crate::mime_for(&file), data) {
+                cx.images.insert(name, media);
+            }
+        }
+    }
     // Master pages use styles.xml's automatic styles, whose names content.xml may reuse: read
     // them before content's styles are added.
     let mut master_layouts: HashMap<String, deckcraft_model::LayoutId> = HashMap::new();
@@ -191,6 +220,7 @@ pub fn import(bytes: &[u8]) -> Result<Presentation, PptxError> {
         let Some(mut slide) = defaults::new_slide(&mut p, lay) else { break };
         slide.shapes.clear();
         slide.background = page_background(&cx, page.attr("style-name"));
+        slide.transition = page_transition(&cx, page.attr("style-name"));
         slide.name = page.attr("name").unwrap_or("").to_string();
         for el in page.elements() {
             if el.is("notes") {
@@ -215,14 +245,164 @@ pub fn import(bytes: &[u8]) -> Result<Presentation, PptxError> {
     Ok(p)
 }
 
-/// A page's or master page's solid background from its `drawing-page` style.
+/// A page's or master page's background from its `drawing-page` style.
 fn page_background(cx: &Ctx, style: Option<&str>) -> Option<deckcraft_model::Background> {
     style?;
+    let fill = fill_from(cx, &|k| cx.styles.get("drawing-page", style, k), false)?;
+    (!fill.is_none()).then_some(deckcraft_model::Background::Fill { fill })
+}
+
+/// A page's transition from its `drawing-page` style (`smil:type`, `smil:subtype`,
+/// `smil:direction`, `presentation:transition-speed`, automatic advance after
+/// `presentation:duration`).
+fn page_transition(cx: &Ctx, style: Option<&str>) -> Option<deckcraft_model::anim::Transition> {
+    style?;
     let g = |k: &str| cx.styles.get("drawing-page", style, k);
-    match g("fill").as_deref() {
-        Some("solid") => g("fill-color").and_then(|c| color(&c)).map(|c| deckcraft_model::Background::Fill { fill: Fill::solid(c) }),
-        _ => None,
+    let mut t = deckcraft_model::anim::Transition::default();
+    let sub = g("subtype").unwrap_or_default();
+    let reverse = g("direction").as_deref() == Some("reverse");
+    let dir = |fwd: &str, rev: &str| if reverse { rev.to_string() } else { fwd.to_string() };
+    let side = || match sub.as_str() {
+        "fromRight" | "rightToLeft" => "r",
+        "fromTop" | "topToBottom" => "u",
+        "fromBottom" | "bottomToTop" => "d",
+        _ => "l",
+    };
+    let (kind, option) = match g("type").as_deref() {
+        Some("fade") => ("fade", if sub == "fadeOverColor" { "throughBlack".into() } else { "smoothly".into() }),
+        Some("barWipe") => ("wipe", side().into()),
+        Some("pushWipe") => ("push", side().into()),
+        Some("slideWipe") => (if reverse { "uncover" } else { "cover" }, side().into()),
+        Some("barnDoorWipe") => ("split", if sub == "horizontal" { dir("horzOut", "horzIn") } else { dir("vertOut", "vertIn") }),
+        Some("irisWipe") => ("shape", if sub == "diamond" { "diamond".into() } else { dir("out", "in") }),
+        Some("ellipseWipe") => ("shape", "circle".into()),
+        Some("clockWipe") => ("clock", dir("clockwise", "counterClockwise")),
+        Some("fanWipe") | Some("pinWheelWipe") => ("clock", "wedge".into()),
+        Some("randomBarWipe") => ("randomBar", if sub == "horizontal" { "horz".into() } else { "vert".into() }),
+        Some("checkerBoardWipe") => ("checker", if sub == "down" { "vert".into() } else { "horz".into() }),
+        Some("blindsWipe") => ("blinds", if sub == "horizontal" { "horz".into() } else { "vert".into() }),
+        Some("dissolve") => ("dissolve", String::new()),
+        Some("zoom") => ("zoom", String::new()),
+        Some(_) => ("fade", "smoothly".into()),
+        None => ("none", String::new()),
+    };
+    let auto = g("transition-type").as_deref() == Some("automatic");
+    let after = g("duration").and_then(|d| iso_ms(&d));
+    if kind == "none" && !auto {
+        return None;
     }
+    t.kind = kind.into();
+    t.option = option;
+    t.duration_ms = match g("transition-speed").as_deref() {
+        Some("slow") => 1000,
+        Some("fast") => 500,
+        _ => g("dur")
+            .and_then(|d| d.trim_end_matches('s').parse::<f64>().ok())
+            .filter(|v| v.is_finite() && *v >= 0.0)
+            .map_or(750, |v| (v * 1000.0).min(60_000.0) as u32),
+    };
+    if auto {
+        t.advance_after_ms = Some(after.unwrap_or(0));
+    }
+    Some(t)
+}
+
+/// Milliseconds of an ISO 8601 duration such as `PT5S` or `PT00H01M02.5S`.
+fn iso_ms(d: &str) -> Option<u32> {
+    let t = d.trim().strip_prefix("PT")?;
+    let mut total = 0.0;
+    let mut num = String::new();
+    for ch in t.chars() {
+        match ch {
+            '0'..='9' | '.' => num.push(ch),
+            'H' | 'M' | 'S' => {
+                let v: f64 = num.parse().ok()?;
+                total += v * match ch {
+                    'H' => 3600.0,
+                    'M' => 60.0,
+                    _ => 1.0,
+                };
+                num.clear();
+            }
+            _ => return None,
+        }
+    }
+    (total.is_finite()).then(|| (total * 1000.0).min(86_400_000.0) as u32)
+}
+
+/// A fill from style properties read through `g`: solid, gradient, bitmap or none. `implicit`: a
+/// fill colour with no `draw:fill` counts as solid.
+fn fill_from(cx: &Ctx, g: &dyn Fn(&str) -> Option<String>, implicit: bool) -> Option<Fill> {
+    match g("fill").as_deref() {
+        Some("none") => Some(Fill::None),
+        None if !implicit => None,
+        Some("gradient") => {
+            g("fill-gradient-name").and_then(|n| gradient(cx, &n)).or_else(|| g("fill-color").and_then(|c| color(&c)).map(Fill::solid))
+        }
+        Some("bitmap") => g("fill-image-name")
+            .and_then(|n| cx.images.get(&n).copied())
+            .map(|media| {
+                let mut pf = deckcraft_model::style::PictureFill { media, ..Default::default() };
+                if g("repeat").as_deref() != Some("stretch") {
+                    pf.mode =
+                        deckcraft_model::style::PictureMode::Tile { tx: 0.0, ty: 0.0, sx: 1.0, sy: 1.0, flip: "none".into(), align: "tl".into() };
+                }
+                Fill::Picture(pf)
+            })
+            .or_else(|| g("fill-color").and_then(|c| color(&c)).map(Fill::solid)),
+        // Solid, and hatches by their background colour.
+        _ => g("fill-color").and_then(|c| color(&c)).map(Fill::solid),
+    }
+}
+
+/// A `draw:gradient`: linear and axial become linear stops, the rest path gradients centred on
+/// `draw:cx/cy`.
+fn gradient(cx: &Ctx, name: &str) -> Option<Fill> {
+    use deckcraft_model::style::{Gradient, GradientShape, GradientStop};
+    let el = cx.styles.gradients.get(name)?;
+    let start = el.attr("start-color").and_then(color)?;
+    let end = el.attr("end-color").and_then(color)?;
+    let pct = |k: &str| {
+        el.attr(k).and_then(|v| v.trim().trim_end_matches('%').parse::<f64>().ok()).filter(|v| v.is_finite()).map(|v| (v / 100.0).clamp(0.0, 1.0))
+    };
+    let border = pct("border").unwrap_or(0.0).min(0.99);
+    // `draw:angle`: tenths of a degree (ODF 1.2) or with a unit, counter-clockwise; 0 runs top to bottom.
+    let angle = el
+        .attr("angle")
+        .and_then(|a| {
+            let a = a.trim();
+            if let Some(d) = a.strip_suffix("deg") {
+                d.parse::<f64>().ok()
+            } else if let Some(r) = a.strip_suffix("rad") {
+                r.parse::<f64>().ok().map(f64::to_degrees)
+            } else {
+                a.parse::<f64>().ok().map(|t| t / 10.0)
+            }
+        })
+        .filter(|a| a.is_finite())
+        .unwrap_or(0.0);
+    let stop = |pos: f64, color: &ColorRef| GradientStop { pos, color: color.clone() };
+    let (stops, shape) = match el.attr("style").unwrap_or("linear") {
+        "linear" => (
+            vec![stop(0.0, &start), stop(border, &start), stop(1.0, &end)],
+            GradientShape::Linear { angle: (90.0 - angle).rem_euclid(360.0), scaled: false },
+        ),
+        // Axial: the start colour at both edges (widened by the border), the end colour in the middle.
+        "axial" => (
+            vec![stop(0.0, &start), stop(border / 2.0, &start), stop(0.5, &end), stop(1.0 - border / 2.0, &start), stop(1.0, &start)],
+            GradientShape::Linear { angle: (90.0 - angle).rem_euclid(360.0), scaled: false },
+        ),
+        kind => {
+            let (fx, fy) = (pct("cx").unwrap_or(0.5), pct("cy").unwrap_or(0.5));
+            let path = if matches!(kind, "square" | "rectangular") { "rect" } else { "circle" };
+            // ODF puts the end colour at the centre; DrawingML path stops run from the centre out.
+            (
+                vec![stop(0.0, &end), stop(1.0 - border, &start), stop(1.0, &start)],
+                GradientShape::Path { path: path.into(), focus: [fx, fy, 1.0 - fx, 1.0 - fy] },
+            )
+        }
+    };
+    Some(Fill::Gradient(Gradient { stops, shape, rotate_with_shape: true, tile: [0.0; 4] }))
 }
 
 /// The box of a drawing element: `svg:x/y/width/height`, turned by `draw:transform`.
@@ -260,13 +440,7 @@ fn xfrm_of(el: &El) -> Option<Xfrm> {
 /// default to a solid fill, text frames to none).
 fn graphic_fill(cx: &Ctx, style: Option<&str>, implicit: bool) -> Option<Fill> {
     let g = |k: &str| cx.styles.get("graphic", style, k).or_else(|| cx.styles.get("presentation", style, k));
-    match g("fill").as_deref() {
-        Some("none") => Some(Fill::None),
-        None if !implicit => None,
-        Some("solid") | None => g("fill-color").and_then(|c| color(&c)).map(Fill::solid),
-        // Gradients, hatches and bitmaps: their first colour for now.
-        Some(_) => g("fill-color").and_then(|c| color(&c)).map(Fill::solid),
-    }
+    fill_from(cx, &g, implicit)
 }
 
 fn graphic_line(cx: &Ctx, style: Option<&str>) -> Option<Line> {

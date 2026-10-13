@@ -12,16 +12,18 @@ const PNG: &[u8] = &[
     0x1f, 0x00, 0x05, 0x00, 0x01, 0xff, 0x89, 0x99, 0x3d, 0x1d, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
 ];
 
-const NS: &str = r##"xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" xmlns:style="urn:oasis:names:tc:opendocument:xmlns:style:1.0" xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0" xmlns:draw="urn:oasis:names:tc:opendocument:xmlns:drawing:1.0" xmlns:fo="urn:oasis:names:tc:opendocument:xmlns:xsl-fo-compatible:1.0" xmlns:svg="urn:oasis:names:tc:opendocument:xmlns:svg-compatible:1.0" xmlns:presentation="urn:oasis:names:tc:opendocument:xmlns:presentation:1.0" xmlns:xlink="http://www.w3.org/1999/xlink" xmlns:table="urn:oasis:names:tc:opendocument:xmlns:table:1.0""##;
+const NS: &str = r##"xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" xmlns:style="urn:oasis:names:tc:opendocument:xmlns:style:1.0" xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0" xmlns:draw="urn:oasis:names:tc:opendocument:xmlns:drawing:1.0" xmlns:fo="urn:oasis:names:tc:opendocument:xmlns:xsl-fo-compatible:1.0" xmlns:svg="urn:oasis:names:tc:opendocument:xmlns:svg-compatible:1.0" xmlns:presentation="urn:oasis:names:tc:opendocument:xmlns:presentation:1.0" xmlns:xlink="http://www.w3.org/1999/xlink" xmlns:smil="urn:oasis:names:tc:opendocument:xmlns:smil-compatible:1.0" xmlns:table="urn:oasis:names:tc:opendocument:xmlns:table:1.0""##;
 
 fn odp() -> Vec<u8> {
     let styles = format!(
-        r##"<?xml version="1.0"?><office:document-styles {NS}><office:automatic-styles><style:page-layout style:name="PM1"><style:page-layout-properties fo:page-width="28cm" fo:page-height="15.75cm"/></style:page-layout><style:style style:name="Mdp1" style:family="drawing-page"><style:drawing-page-properties draw:fill="solid" draw:fill-color="#003366"/></style:style><style:style style:name="gr1" style:family="graphic"><style:graphic-properties draw:fill="solid" draw:fill-color="#ffcc00"/></style:style></office:automatic-styles><office:master-styles><style:master-page style:name="Dark" style:display-name="Dark Blue" draw:style-name="Mdp1"><draw:rect draw:style-name="gr1" svg:x="0cm" svg:y="15cm" svg:width="28cm" svg:height="0.75cm"/><draw:frame presentation:class="title" presentation:placeholder="true" svg:x="1cm" svg:y="1cm" svg:width="20cm" svg:height="3cm"/></style:master-page></office:master-styles></office:document-styles>"##
+        r##"<?xml version="1.0"?><office:document-styles {NS}><office:styles><draw:gradient draw:name="G1" draw:style="linear" draw:start-color="#000000" draw:end-color="#ffffff" draw:angle="0" draw:border="0%"/><draw:gradient draw:name="G2" draw:style="radial" draw:cx="50%" draw:cy="50%" draw:start-color="#000000" draw:end-color="#ffffff" draw:border="0%"/><draw:fill-image draw:name="Img1" xlink:href="Pictures/a.png"/></office:styles><office:automatic-styles><style:page-layout style:name="PM1"><style:page-layout-properties fo:page-width="28cm" fo:page-height="15.75cm"/></style:page-layout><style:style style:name="Mdp1" style:family="drawing-page"><style:drawing-page-properties draw:fill="solid" draw:fill-color="#003366"/></style:style><style:style style:name="gr1" style:family="graphic"><style:graphic-properties draw:fill="solid" draw:fill-color="#ffcc00"/></style:style></office:automatic-styles><office:master-styles><style:master-page style:name="Dark" style:display-name="Dark Blue" draw:style-name="Mdp1"><draw:rect draw:style-name="gr1" svg:x="0cm" svg:y="15cm" svg:width="28cm" svg:height="0.75cm"/><draw:frame presentation:class="title" presentation:placeholder="true" svg:x="1cm" svg:y="1cm" svg:width="20cm" svg:height="3cm"/></style:master-page></office:master-styles></office:document-styles>"##
     );
     let content = format!(
         r##"<?xml version="1.0"?><office:document-content {NS}><office:automatic-styles>
 <style:style style:name="gr1" style:family="graphic"><style:graphic-properties draw:fill="solid" draw:fill-color="#ff0000" draw:stroke="none"/></style:style>
-<style:style style:name="dp2" style:family="drawing-page"><style:drawing-page-properties draw:fill="solid" draw:fill-color="#00ff00"/></style:style>
+<style:style style:name="dp2" style:family="drawing-page"><style:drawing-page-properties draw:fill="gradient" draw:fill-gradient-name="G1" presentation:transition-type="automatic" presentation:duration="PT3S" smil:type="pushWipe" smil:subtype="fromRight" presentation:transition-speed="slow"/></style:style>
+<style:style style:name="dp3" style:family="drawing-page"><style:drawing-page-properties draw:fill="bitmap" draw:fill-image-name="Img1" style:repeat="stretch" smil:type="fade" smil:subtype="crossfade"/></style:style>
+<style:style style:name="gr2" style:family="graphic"><style:graphic-properties draw:fill="gradient" draw:fill-gradient-name="G2"/></style:style>
 <style:style style:name="co1" style:family="table-column"><style:table-column-properties style:column-width="4cm"/></style:style>
 <style:style style:name="ce1" style:family="table-cell"><style:graphic-properties draw:fill="solid" draw:fill-color="#cccccc"/></style:style>
 <style:style style:name="T1" style:family="text"><style:text-properties fo:font-weight="bold"/></style:style>
@@ -33,7 +35,8 @@ fn odp() -> Vec<u8> {
 <draw:frame svg:x="10cm" svg:y="5cm" svg:width="2cm" svg:height="2cm"><draw:image xlink:href="Pictures/a.png"/></draw:frame>
 <presentation:notes><draw:frame presentation:class="notes" svg:x="1cm" svg:y="1cm" svg:width="10cm" svg:height="5cm"><draw:text-box><text:p>Speak up</text:p></draw:text-box></draw:frame></presentation:notes>
 </draw:page>
-<draw:page draw:name="Two" draw:style-name="dp2"/>
+<draw:page draw:name="Two" draw:style-name="dp2"><draw:rect draw:style-name="gr2" svg:x="1cm" svg:y="1cm" svg:width="4cm" svg:height="4cm"/></draw:page>
+<draw:page draw:name="Three" draw:style-name="dp3"/>
 </office:presentation></office:body></office:document-content>"##
     );
     let mut z = zip::ZipWriter::new(Cursor::new(Vec::new()));
@@ -56,7 +59,7 @@ fn imports_odp() {
     assert!(deckcraft_pptx::sniff_odp(&bytes));
     assert!(!deckcraft_pptx::sniff_odp(b"PK\x03\x04 not odp"));
     let p = deckcraft_pptx::import_odp(&bytes).expect("import");
-    assert_eq!(p.slides.len(), 2);
+    assert_eq!(p.slides.len(), 3);
     assert!((p.slide_size.width / p.slide_size.height - 28.0 / 15.75).abs() < 1e-3);
     let s = &p.slides[0];
     let title = s.shapes.iter().find_map(|sh| sh.text.as_ref()).expect("text");
@@ -93,8 +96,27 @@ fn imports_odp() {
     assert!(lay.background.is_some());
     assert_eq!(lay.shapes.len(), 1);
     assert!(s.background.is_none());
-    // A page's own background.
-    assert!(p.slides[1].background.is_some());
+    // A page's own background: a top-to-bottom gradient, and a stretched picture.
+    use deckcraft_model::Background;
+    use deckcraft_model::style::{GradientShape, PictureMode};
+    match &p.slides[1].background {
+        Some(Background::Fill { fill: Fill::Gradient(g) }) => {
+            assert!(matches!(g.shape, GradientShape::Linear { angle, .. } if (angle - 90.0).abs() < 1e-6));
+            assert_eq!(g.stops.first().map(|s| s.pos), Some(0.0));
+        }
+        b => panic!("background {b:?}"),
+    }
+    match &p.slides[2].background {
+        Some(Background::Fill { fill: Fill::Picture(pf) }) => assert!(matches!(pf.mode, PictureMode::Stretch { .. })),
+        b => panic!("background {b:?}"),
+    }
+    // A radial gradient shape fill.
+    assert!(p.slides[1].shapes.iter().any(|sh| matches!(&sh.fill, Some(Fill::Gradient(g)) if matches!(g.shape, GradientShape::Path { .. }))));
+    // Transitions: push from the right, slow, advancing after 3 s; a crossfade.
+    let t = p.slides[1].transition.as_ref().expect("transition");
+    assert_eq!((t.kind.as_str(), t.option.as_str(), t.duration_ms, t.advance_after_ms), ("push", "r", 1000, Some(3000)));
+    assert_eq!(p.slides[2].transition.as_ref().map(|t| t.kind.as_str()), Some("fade"));
+    assert!(p.slides[0].transition.is_none());
 
     // Saving as .pptx keeps the master's layout and the table.
     let back = deckcraft_pptx::import(&deckcraft_pptx::export(&p).expect("export")).expect("reimport");
