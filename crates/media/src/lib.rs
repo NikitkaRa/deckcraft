@@ -9,7 +9,9 @@
 //! - [`clip::ClipParams`]: trim, fade in/out and volume.
 //! - [`player::Player`]: the playback mixer and clock the UI host drives, over an
 //!   [`player::AudioOut`] it injects (cpal on desktop; none on the web or in tests, where the clock
-//!   runs on wall time); [`feed::VideoFeed`] decodes video ahead of that clock.
+//!   runs on wall time). Audio is pulled in bounded chunks (a byte cap per voice, a byte cap on the
+//!   clip cache, a cap on concurrent decodes) and a stopped voice cancels its decode.
+//!   [`feed::VideoFeed`] decodes video ahead of that clock.
 //!
 //! Layer L2: depends only on the codec crates, never on the model or the UI. Builds for
 //! `wasm32-unknown-unknown` (no threads there: decoding runs inline).

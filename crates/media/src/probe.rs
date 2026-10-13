@@ -70,8 +70,9 @@ pub fn probe(bytes: &Bytes) -> Result<MediaInfo> {
     }
     if info.duration_ms == 0 && info.audio.as_ref().is_some_and(|a| a.decodable) && info.video.is_none() {
         // No length in the header (raw MP3 / ADTS without an index): decode to measure.
-        if let Ok(pcm) = crate::audio::decode(bytes) {
-            info.duration_ms = ms(pcm.duration());
+        // Count frames and discard them. Measuring a file with no index must not keep the PCM.
+        if let Some(secs) = crate::audio::measure_duration(bytes) {
+            info.duration_ms = ms(secs);
         }
     }
     Ok(info)
