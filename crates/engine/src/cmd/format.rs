@@ -150,6 +150,15 @@ pub fn specs() -> Vec<CommandSpec> {
             direction
         ),
         cmd!("format.columns", "Columns", ["Home", "Paragraph"], None, "{count, spacing?: pt}", has_text_or_shapes, columns),
+        cmd!(
+            "format.warp",
+            "Transform",
+            ["Shape Format", "WordArt Styles", "Text Effects"],
+            None,
+            "{preset?: none|textArchUp|textWave1|… (see WARPS), adj?: [raw guide values] (angles in 60000ths of a degree, others in 100000ths)}",
+            has_text_or_shapes,
+            warp
+        ),
         cmd!("format.autofit", "Autofit", ["Format Shape", "Text Box"], None, "{mode: none|shrink|resize}", has_text_or_shapes, autofit),
         cmd!("format.wrap", "Wrap Text in Shape", ["Format Shape", "Text Box"], None, "{on: bool}", has_text_or_shapes, wrap),
         cmd!(
@@ -565,6 +574,91 @@ fn columns(s: &mut Session, p: &Value) -> Result<Value> {
     format_body(s, &move |b| {
         b.columns = Some(n);
         b.col_spacing = Some(sp);
+    })
+}
+/// Text Effects ▸ Transform presets in PowerPoint's gallery order: Follow Path, then Warp.
+pub const WARPS: &[&str] = &[
+    "textArchUp",
+    "textArchDown",
+    "textCircle",
+    "textButton",
+    "textWave1",
+    "textWave2",
+    "textDoubleWave1",
+    "textWave4",
+    "textInflate",
+    "textDeflate",
+    "textInflateBottom",
+    "textDeflateBottom",
+    "textInflateTop",
+    "textDeflateTop",
+    "textDeflateInflate",
+    "textDeflateInflateDeflate",
+    "textFadeRight",
+    "textFadeLeft",
+    "textFadeUp",
+    "textFadeDown",
+    "textSlantUp",
+    "textSlantDown",
+    "textCascadeUp",
+    "textCascadeDown",
+    "textTriangle",
+    "textTriangleInverted",
+    "textChevron",
+    "textChevronInverted",
+    "textRingInside",
+    "textRingOutside",
+    "textArchUpPour",
+    "textArchDownPour",
+    "textCirclePour",
+    "textButtonPour",
+    "textCurveUp",
+    "textCurveDown",
+    "textCanUp",
+    "textCanDown",
+    "textStop",
+    "textPlain",
+];
+
+/// Whether adjust `i` of warp `preset` is an angle (60000ths of a degree) rather than a fraction.
+pub fn warp_adj_is_angle(preset: &str, i: usize) -> bool {
+    i == 0 && ["textArch", "textCircle", "textButton"].iter().any(|p| preset.starts_with(p))
+}
+
+fn warp(s: &mut Session, p: &Value) -> Result<Value> {
+    let preset = match p.get("preset") {
+        None => None,
+        Some(Value::String(n)) if n == "none" || n == "textNoShape" => Some(None),
+        Some(Value::String(n)) if WARPS.contains(&n.as_str()) => Some(Some(n.clone())),
+        Some(_) => return Err(bad("format.warp", "`preset` is `none` or a transform such as `textArchUp`, `textWave1`")),
+    };
+    let adj: Option<Vec<Option<f64>>> =
+        p.get("adj").and_then(Value::as_array).map(|a| a.iter().take(8).map(|v| v.as_f64().filter(|x| x.is_finite())).collect());
+    if preset.is_none() && adj.is_none() {
+        return Err(bad("format.warp", "give `preset` or `adj`"));
+    }
+    format_body(s, &move |b| {
+        if let Some(pr) = &preset {
+            if pr != &b.warp {
+                b.warp_adj.clear();
+            }
+            b.warp.clone_from(pr);
+        }
+        let Some(name) = b.warp.clone() else {
+            b.warp_adj.clear();
+            return;
+        };
+        if let Some(adj) = &adj {
+            let defaults = deckcraft_geom::warp::adjust_defaults(&name);
+            if b.warp_adj.len() != defaults.len() {
+                b.warp_adj = defaults.to_vec();
+            }
+            for (i, (slot, v)) in b.warp_adj.iter_mut().zip(adj).enumerate() {
+                if let Some(v) = v {
+                    *slot = if warp_adj_is_angle(&name, i) { v.rem_euclid(21_600_000.0) } else { v.clamp(-100_000.0, 100_000.0) };
+                }
+            }
+        }
     })
 }
 fn autofit(s: &mut Session, p: &Value) -> Result<Value> {

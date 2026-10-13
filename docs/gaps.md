@@ -166,12 +166,13 @@ Detail in [animation-parity.md](animation-parity.md). 10–16 h; the pane is a *
 
 ### Edit points, text warp, 3-D
 - **Evidence:** checklist rows "Edit points" (P1 missing), "Text warp transforms" (partial: all 40
-  `prstTxWarp` presets render and their adjusts round-trip, but there is no Transform gallery or
-  command to apply one, no adjust handles, and arc/circle placement can differ from PowerPoint by
+  `prstTxWarp` presets render, their adjusts round-trip, and `format.warp` with the Format Shape ▸
+  Text Box Transform list applies one and sets its adjusts; there are no on-canvas adjust handles or
+  gallery thumbnails, and arc/circle placement can differ from PowerPoint by
   1–3 % of the path length), "Bevel and 3-D rotation" (partial: bevels, camera presets and rotations and face lighting
   render as approximations and `scene3d`/`sp3d` round-trip as raw XML; no extrusion or side faces,
   only the three-point rig, and no command or pane to apply 3-D).
-- **Estimate:** 4–6 h (edit points), 2–4 h (warp gallery, command and handles), 6–10 h (3-D extrusion,
+- **Estimate:** 4–6 h (edit points), 1–2 h (warp handles and gallery thumbnails), 6–10 h (3-D extrusion,
   rigs and materials, Format Shape page).
 
 ### Proofing: spelling, thesaurus, AutoCorrect
@@ -259,6 +260,7 @@ Detail in [localization-parity.md](localization-parity.md).
 | 2026-10-13 | minor | Shape, picture and table rendering checked against PowerPoint on ~150 synthetic edge-case slides; 3-D bevels, cameras and face lighting now render approximately (gap narrowed to extrusion, rigs and the 3-D pane) |
 | 2026-10-12 | minor | IME composition in slide text and notes, and CJK interface text with real glyphs (#101): the IME gap is now Korean on the web and table-cell underlines |
 | 2026-10-12 | minor | EMF/WMF text, pattern and hatch brushes drawn; legacy OLE and ActiveX previews shown; the SVG gap keeps only EMF clip regions |
+| 2026-10-13 | minor | Text warp: `format.warp` and a Transform list in Format Shape ▸ Text Box; left: on-canvas handles, gallery thumbnails |
 | 2026-10-12 | minor | Text warps render (all 40 presets, adjusts round-trip); the warp gap is now the gallery, command and handles |
 | 2026-10-10 | minor | Noted that no gap blocks alpha (core-workflow gate passes) |
 | 2026-10-10 | major | Created: every gap from the 2026-10-10 re-measure and the 16 open GitHub issues, ranked, with beta blockers marked |

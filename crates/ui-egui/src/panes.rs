@@ -198,6 +198,8 @@ fn format_shape(app: &mut SlideApp, ui: &mut Ui) {
                     }
                 }
             });
+            let body = sh.text.as_ref().map(|t| t.body.clone()).unwrap_or_default();
+            text_transform(app, ui, sh.id.0, body.warp.as_deref(), &body.warp_adj);
             let wrap = sh.text.as_ref().and_then(|t| t.body.wrap).unwrap_or(true);
             let mut w = wrap;
             if ui.checkbox(&mut w, "Wrap text in shape").changed() {
@@ -336,6 +338,59 @@ fn format_shape(app: &mut SlideApp, ui: &mut Ui) {
                 }
             });
         }
+    }
+}
+
+/// Text Effects ▸ Transform: the preset and its adjust values.
+fn text_transform(app: &mut SlideApp, ui: &mut Ui, id: u32, warp: Option<&str>, adj: &[f64]) {
+    use deckcraft_engine::cmd::format::{WARPS, warp_adj_is_angle};
+    // "textArchUpPour" → "Arch up pour".
+    let label = |n: &str| {
+        let mut out = String::new();
+        for (i, c) in n.strip_prefix("text").unwrap_or(n).chars().enumerate() {
+            if i > 0 && (c.is_uppercase() || (c.is_ascii_digit() && !out.ends_with(' '))) {
+                out.push(' ');
+            }
+            out.push_str(&if i == 0 { c.to_uppercase().collect::<String>() } else { c.to_lowercase().collect() });
+        }
+        out
+    };
+    ui.horizontal(|ui| {
+        ui.add_sized(vec2(90.0, 20.0), egui::Label::new("Transform"));
+        egui::ComboBox::from_id_salt(("warp", id)).selected_text(warp.map_or("None".into(), label)).width(170.0).show_ui(ui, |ui| {
+            if ui.selectable_label(warp.is_none(), "None").clicked() {
+                run(app, "format.warp", json!({"preset": "none"}));
+            }
+            for (i, w) in WARPS.iter().enumerate() {
+                if i == 0 {
+                    ui.label(egui::RichText::new("Follow Path").small());
+                } else if i == 4 {
+                    ui.label(egui::RichText::new("Warp").small());
+                }
+                if ui.selectable_label(warp == Some(*w), label(w)).clicked() {
+                    run(app, "format.warp", json!({"preset": w}));
+                }
+            }
+        });
+    });
+    let Some(name) = warp else { return };
+    let defaults = deckcraft_geom::warp::adjust_defaults(name);
+    for (i, d) in defaults.iter().enumerate() {
+        let raw = adj.get(i).copied().unwrap_or(*d);
+        let angle = warp_adj_is_angle(name, i);
+        let (shown, unit, k) = if angle { (raw / 60_000.0, "°", 60_000.0) } else { (raw / 1_000.0, "%", 1_000.0) };
+        ui.horizontal(|ui| {
+            ui.add_sized(vec2(90.0, 20.0), egui::Label::new(format!("   Adjust {}", i + 1)));
+            let mut v = shown;
+            let r = ui.add(egui::DragValue::new(&mut v).suffix(unit).max_decimals(1));
+            if r.drag_stopped() || r.lost_focus() || (r.changed() && !r.dragged()) {
+                let mut list: Vec<Value> = vec![Value::Null; defaults.len()];
+                if let Some(slot) = list.get_mut(i) {
+                    *slot = json!(v * k);
+                }
+                run(app, "format.warp", json!({"adj": list}));
+            }
+        });
     }
 }
 

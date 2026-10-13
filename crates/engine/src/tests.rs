@@ -835,3 +835,48 @@ fn slide_ranges_parse_like_powerpoints_print_box() {
     let opts = cmd::file::pdf_options(&json!({"slides": [0, 7, 1]}), 2).unwrap();
     assert_eq!(opts.slides, Some(vec![0, 1]), "indices past the end are dropped");
 }
+
+#[test]
+fn format_warp_applies_a_transform_and_round_trips() {
+    use crate::cmd::format::WARPS;
+    // Every gallery entry is one the renderer draws.
+    assert_eq!(WARPS.len(), 40);
+    assert!(WARPS.iter().all(|w| deckcraft_geom::warp::is_supported(w)));
+    let mut s = Session::with_new();
+    s.execute("slide.new", &json!({"layout": "blank"})).unwrap();
+    s.execute("shape.insert", &json!({"preset": "rect", "rect": [100, 100, 300, 100]})).unwrap();
+    let body = |s: &Session| s.doc().unwrap().selected_shapes()[0].text.clone().unwrap_or_default().body;
+    assert!(s.execute("format.warp", &json!({"preset": "textBogus"})).is_err());
+    assert!(s.execute("format.warp", &json!({})).is_err());
+    s.execute("format.warp", &json!({"preset": "textArchUpPour"})).unwrap();
+    assert_eq!((body(&s).warp.as_deref(), body(&s).warp_adj.len()), (Some("textArchUpPour"), 0));
+    // Adjusts: an angle wraps, a fraction is clamped, null keeps the default.
+    s.execute("format.warp", &json!({"adj": [-5_400_000.0, null]})).unwrap();
+    assert_eq!(body(&s).warp_adj, vec![16_200_000.0, 50_000.0]);
+    s.execute("format.warp", &json!({"adj": [null, 900_000.0]})).unwrap();
+    assert_eq!(body(&s).warp_adj, vec![16_200_000.0, 100_000.0]);
+    // A new preset starts from its own defaults.
+    s.execute("format.warp", &json!({"preset": "textWave1", "adj": [20_000]})).unwrap();
+    assert_eq!((body(&s).warp.as_deref(), body(&s).warp_adj.clone()), (Some("textWave1"), vec![20_000.0, 0.0]));
+    let bytes = cmd::file::save_bytes(&s.doc().unwrap().doc, "pptx").unwrap();
+    s.execute("file.openBytes", &json!({"name": "w.pptx", "data": cmd::base64_encode(&bytes)})).unwrap();
+    let back = s.doc().unwrap().doc.slides.iter().flat_map(|sl| sl.shapes.iter()).find_map(|sh| {
+        let b = &sh.text.as_ref()?.body;
+        b.warp.clone().map(|w| (w, b.warp_adj.clone()))
+    });
+    assert_eq!(back, Some(("textWave1".to_string(), vec![20_000.0, 0.0])));
+}
+
+#[test]
+fn format_warp_none_removes_the_transform() {
+    let mut s = Session::with_new();
+    s.execute("slide.new", &json!({"layout": "blank"})).unwrap();
+    s.execute("shape.insert", &json!({"preset": "rect", "rect": [100, 100, 300, 100]})).unwrap();
+    let body = |s: &Session| s.doc().unwrap().selected_shapes()[0].text.clone().unwrap_or_default().body;
+    s.execute("format.warp", &json!({"preset": "textInflate", "adj": [30_000]})).unwrap();
+    s.execute("format.warp", &json!({"preset": "none"})).unwrap();
+    assert_eq!((body(&s).warp, body(&s).warp_adj.len()), (None, 0));
+    // Adjusts with no transform do nothing.
+    s.execute("format.warp", &json!({"adj": [1]})).unwrap();
+    assert_eq!(body(&s).warp_adj.len(), 0);
+}
