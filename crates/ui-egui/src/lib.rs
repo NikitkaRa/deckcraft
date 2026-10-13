@@ -227,6 +227,9 @@ pub struct SlideApp {
     pub(crate) thumb_drag: Option<(usize, usize)>,
     /// Selection pane: folded groups, renaming, drag and drop.
     pub selpane: selpane::State,
+    /// Text a copy or cut asked to place on the system clipboard, sent on the next frame that
+    /// has a context.
+    clipboard_out: Option<String>,
 }
 
 impl SlideApp {
@@ -267,6 +270,7 @@ impl SlideApp {
             ui_fonts: uifonts::UiFonts::default(),
             thumb_drag: None,
             selpane: selpane::State::default(),
+            clipboard_out: None,
         }
     }
 
@@ -672,7 +676,19 @@ impl SlideApp {
                         self.media.request(&doc, &action, shape, ms, owner);
                     }
                 }
+                UiRequest::CopyText { text } => {
+                    if !text.is_empty() {
+                        self.clipboard_out = Some(text);
+                    }
+                }
             }
+        }
+    }
+
+    /// Hand a pending copy to the system clipboard.
+    fn flush_clipboard(&mut self, ctx: &egui::Context) {
+        if let Some(t) = self.clipboard_out.take() {
+            ctx.copy_text(t);
         }
     }
 
@@ -752,6 +768,7 @@ impl SlideApp {
         }
         self.collect_screenshots(ctx);
         self.issue_screenshots(ctx);
+        self.flush_clipboard(ctx);
         // Closing the window with unsaved changes asks first.
         if ctx.input(|i| i.viewport().close_requested()) && !self.quit_confirmed && self.session.documents().iter().any(|d| d.is_dirty()) {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
@@ -882,17 +899,13 @@ impl SlideApp {
                 }
                 egui::Event::Ime(ime) => self.ime_event(&ime),
                 egui::Event::Copy => {
-                    if let Ok(v) = self.session.execute("edit.copy", &json!({}))
-                        && let Some(t) = v.get("text").and_then(Value::as_str)
-                    {
-                        ctx.copy_text(t.to_string());
+                    if let Err(e) = self.session.execute("edit.copy", &json!({})) {
+                        self.set_status(e.to_string());
                     }
                 }
                 egui::Event::Cut => {
-                    if let Ok(v) = self.session.execute("edit.cut", &json!({}))
-                        && let Some(t) = v.get("text").and_then(Value::as_str)
-                    {
-                        ctx.copy_text(t.to_string());
+                    if let Err(e) = self.session.execute("edit.cut", &json!({})) {
+                        self.set_status(e.to_string());
                     }
                 }
                 egui::Event::Paste(text) => {
@@ -930,6 +943,7 @@ impl SlideApp {
         let ctx = ui.ctx().clone();
         if !self.fonts_ready {
             ctx.request_repaint();
+            self.flush_clipboard(&ctx);
             return;
         }
         let t0 = now_ms();
@@ -937,6 +951,8 @@ impl SlideApp {
         self.tick_media(&ctx);
         if self.show.is_some() {
             show::ui(self, ui);
+            self.drain_requests();
+            self.flush_clipboard(&ctx);
             self.perf.frame_ms = now_ms() - t0;
             return;
         }
@@ -986,6 +1002,7 @@ impl SlideApp {
             ctx.open_url(egui::OpenUrl::new_tab(url));
         }
         self.drain_requests();
+        self.flush_clipboard(&ctx);
         self.perf.frame_ms = now_ms() - t0;
     }
 
@@ -1297,6 +1314,79 @@ mod tests {
         harness.key_press_modifiers(ctrl, Key::OpenBracket);
         harness.run_steps(1);
         assert!(size(&mut harness).unwrap_or(f64::MAX) < after, "Ctrl+[ shrinks");
+    }
+
+    /// #431: the Copy button and Ctrl/Cmd+C put the copy on the system clipboard, and Ctrl/Cmd+V
+    /// of that text pastes the shape. A focused notes field does not take the shortcut until
+    /// the slide is clicked.
+    #[test]
+    fn copy_and_paste_publish_a_textless_shape() {
+        use egui_kittest::kittest::Queryable;
+        let mut harness = egui_kittest::Harness::builder().with_size(egui::vec2(1200.0, 800.0)).build_ui_state(
+            |ui, app: &mut SlideApp| {
+                app.logic(ui.ctx());
+                app.ui(ui);
+            },
+            SlideApp::new(Session::with_new(), Services::default()),
+        );
+        harness.run_steps(2);
+        let rect_id =
+            harness.state_mut().session.execute("shape.insert", &json!({"preset": "rect", "rect": [40.0, 40.0, 80.0, 50.0]})).unwrap()["id"]
+                .as_u64()
+                .unwrap();
+        let count = |h: &egui_kittest::Harness<'_, SlideApp>| h.state().session.doc().unwrap().current_slide().unwrap().shapes.len();
+        let before = count(&harness);
+
+        // Ribbon, context menu and Edit ▸ Copy all go through `run`, not the key event.
+        harness.state_mut().run("edit.copy", json!({})).unwrap();
+        harness.run_steps(1);
+        let published = harness.state().session.clipboard.published.clone();
+        assert_eq!(published, "\u{2060}");
+        let commands = harness.output().platform_output.commands.clone();
+        assert!(
+            commands.iter().any(|c| matches!(c, egui::OutputCommand::CopyText(t) if t == &published)),
+            "the copy button reaches the system clipboard, {commands:?}"
+        );
+
+        harness.event(egui::Event::Paste(published));
+        harness.run_steps(1);
+        assert_eq!(count(&harness), before + 1, "Ctrl+V of that clipboard pastes the rectangle");
+        let pasted = harness.state().session.doc().unwrap().current_slide().unwrap().shapes.last().unwrap().clone();
+        assert!(pasted.text.as_ref().is_none_or(|t| t.text().is_empty()));
+
+        // Notes have the keyboard: Ctrl+C must not replace the shape clipboard.
+        harness.get_by_role(egui::accesskit::Role::MultilineTextInput).click();
+        harness.run_steps(1);
+        harness.event(egui::Event::Copy);
+        harness.run_steps(1);
+        assert_eq!(harness.state().session.clipboard.published, "\u{2060}", "notes keep the shortcut while focused");
+
+        let slide = harness.state().slide_rect.expect("slide is on screen").center();
+        harness.event(egui::Event::PointerMoved(slide));
+        harness.run_steps(1);
+        harness.event(egui::Event::PointerButton {
+            pos: slide,
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            modifiers: egui::Modifiers::NONE,
+        });
+        harness.run_steps(1);
+        harness.event(egui::Event::PointerButton {
+            pos: slide,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: egui::Modifiers::NONE,
+        });
+        harness.run_steps(1);
+        // The click may land on a placeholder. Select the rectangle, then copy with the keyboard.
+        harness.state_mut().session.execute("edit.select", &json!({"ids": [rect_id]})).unwrap();
+        harness.event(egui::Event::Copy);
+        harness.run_steps(1);
+        assert_eq!(harness.state().session.clipboard.published, "\u{2060}");
+        assert!(
+            harness.output().platform_output.commands.iter().any(|c| matches!(c, egui::OutputCommand::CopyText(t) if t == "\u{2060}")),
+            "clicking the slide then Ctrl+C copies the shape"
+        );
     }
 
     #[test]

@@ -296,6 +296,12 @@ pub enum UiRequest {
         shape: ShapeId,
         ms: Option<u64>,
     },
+    /// Place `text` on the system clipboard. Copy and cut ask for this; the engine has no
+    /// clipboard of its own. Includes a word joiner when the copy has no plain text, so a
+    /// following Ctrl/Cmd+V still arrives (the host drops that shortcut on an empty clipboard).
+    CopyText {
+        text: String,
+    },
 }
 
 /// Playback state of a media shape as the UI host reports it (see [`Session::media_status`]).
@@ -319,6 +325,10 @@ pub struct Clipboard {
     pub media: Vec<deckcraft_model::MediaItem>,
     pub text: Option<deckcraft_model::TextBody>,
     pub plain: String,
+    /// The string last handed to the system clipboard for this copy. Paste treats incoming
+    /// text equal to this as the in-app clipboard. Empty when the copy had nothing to publish
+    /// (a caret, or nothing selected).
+    pub published: String,
     /// How many times the shapes were pasted (each paste offsets further).
     pub pastes: u32,
 }

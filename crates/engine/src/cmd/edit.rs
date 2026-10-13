@@ -12,8 +12,8 @@ pub fn specs() -> Vec<CommandSpec> {
     vec![
         cmd!(noundo "edit.undo", "Undo", ["Edit"], Some("Cmd+Z"), "{}", can_undo, undo),
         cmd!(noundo "edit.redo", "Redo", ["Edit"], Some("Cmd+Y"), "{}", can_redo, redo),
-        cmd!("edit.cut", "Cut", ["Home", "Clipboard"], Some("Cmd+X"), "{scope?: slides}", has_doc, cut),
-        cmd!(noundo "edit.copy", "Copy", ["Home", "Clipboard"], Some("Cmd+C"), "{scope?: slides} → {text}", has_doc, copy),
+        cmd!("edit.cut", "Cut", ["Home", "Clipboard"], Some("Cmd+X"), "{scope?: slides} → {text, publish?}", has_doc, cut),
+        cmd!(noundo "edit.copy", "Copy", ["Home", "Clipboard"], Some("Cmd+C"), "{scope?: slides} → {text, publish?}", has_doc, copy),
         cmd!("edit.paste", "Paste", ["Home", "Clipboard"], Some("Cmd+V"), "{text?: plain text to paste, scope?: slides}", has_doc, paste),
         cmd!("edit.pasteText", "Paste and Match Formatting", ["Edit"], Some("Cmd+Shift+V"), "{text?}", has_doc, paste_text),
         cmd!("edit.duplicate", "Duplicate", ["Edit"], Some("Cmd+D"), "{ids?}", has_selection, duplicate),
@@ -66,17 +66,37 @@ fn media_of_shapes(shapes: &[Shape], out: &mut Vec<MediaId>) {
     });
 }
 
+/// Invisible stand-in placed on the system clipboard when a copy has no plain text.
+/// egui-winit delivers Ctrl/Cmd+V only when that clipboard is non-empty, so a rectangle or
+/// picture would otherwise never paste from the keyboard (#431, #182). A paste into another
+/// application inserts this word joiner and nothing visible.
+pub(crate) const OBJECT_CLIP: &str = "\u{2060}";
+
+/// Remember `clip` and return the string the host should put on the system clipboard.
+/// Empty when there is nothing to publish (no text and no objects).
+fn store_clip(s: &mut Session, mut clip: crate::Clipboard) -> String {
+    let published = if !clip.plain.is_empty() {
+        clip.plain.clone()
+    } else if !clip.shapes.is_empty() || !clip.slides.is_empty() || clip.text.is_some() {
+        OBJECT_CLIP.to_string()
+    } else {
+        String::new()
+    };
+    clip.published = published.clone();
+    s.clipboard = clip;
+    published
+}
+
 fn copy_inner(s: &mut Session, p: &Value) -> Result<String> {
     let st = s.doc()?;
-    // Text selection.
+    // Text selection. A caret (no range) copies nothing and leaves the clipboard alone.
     if let Some(t) = &st.selection.text {
         if t.is_range() {
             let body = super::text::body_of(st, t).cloned().unwrap_or_default();
             let (a, b) = t.ordered();
             let plain = deckcraft_model::edit::text_range(&body, a, b);
             let sliced = deckcraft_model::edit::slice(&body, a, b);
-            s.clipboard = crate::Clipboard { text: Some(sliced), plain: plain.clone(), ..Default::default() };
-            return Ok(plain);
+            return Ok(store_clip(s, crate::Clipboard { text: Some(sliced), plain, ..Default::default() }));
         }
         return Ok(String::new());
     }
@@ -90,8 +110,7 @@ fn copy_inner(s: &mut Session, p: &Value) -> Result<String> {
         }
         let media = st.doc.media.iter().filter(|m| mids.contains(&m.id)).cloned().collect();
         let plain = slides.iter().map(|x| x.title()).collect::<Vec<_>>().join("\n");
-        s.clipboard = crate::Clipboard { slides, media, plain: plain.clone(), ..Default::default() };
-        return Ok(plain);
+        return Ok(store_clip(s, crate::Clipboard { slides, media, plain, ..Default::default() }));
     }
     let shapes: Vec<Shape> = st
         .selection
@@ -110,19 +129,26 @@ fn copy_inner(s: &mut Session, p: &Value) -> Result<String> {
     media_of_shapes(&shapes, &mut mids);
     let media = st.doc.media.iter().filter(|m| mids.contains(&m.id)).cloned().collect();
     let plain = shapes.iter().filter_map(|x| x.text.as_ref().map(|t| t.text())).collect::<Vec<_>>().join("\n");
-    s.clipboard = crate::Clipboard { shapes, media, plain: plain.clone(), ..Default::default() };
-    Ok(plain)
+    Ok(store_clip(s, crate::Clipboard { shapes, media, plain, ..Default::default() }))
+}
+
+fn finish_copy(s: &mut Session, published: String) -> Result<Value> {
+    if published.is_empty() {
+        return Ok(json!({"text": ""}));
+    }
+    s.ui_requests.push(crate::UiRequest::CopyText { text: published.clone() });
+    Ok(json!({"text": s.clipboard.plain, "publish": published}))
 }
 
 fn copy(s: &mut Session, p: &Value) -> Result<Value> {
-    let t = copy_inner(s, p)?;
-    Ok(json!({"text": t}))
+    let published = copy_inner(s, p)?;
+    finish_copy(s, published)
 }
 
 fn cut(s: &mut Session, p: &Value) -> Result<Value> {
-    let t = copy_inner(s, p)?;
+    let published = copy_inner(s, p)?;
     delete(s, p)?;
-    Ok(json!({"text": t}))
+    finish_copy(s, published)
 }
 
 /// Give pasted shapes fresh ids (groups included) and map connector ends.
@@ -155,10 +181,17 @@ fn bring_media(doc: &mut deckcraft_model::Presentation, media: &[deckcraft_model
     }
 }
 
+/// System-clipboard text that is not the copy we just published. Empty text and our own
+/// plain text or object mark paste the in-app clipboard instead.
+fn foreign_clipboard_text(s: &Session, t: &str) -> bool {
+    !t.is_empty() && t != s.clipboard.plain && t != s.clipboard.published
+}
+
 fn paste(s: &mut Session, p: &Value) -> Result<Value> {
-    // External plain text (from the system clipboard) wins when given and differs from ours.
+    // Text from another application wins. Text we published ourselves pastes the shapes,
+    // slides or formatted run we copied, including when that text is only the object mark.
     if let Some(t) = str_param(p, "text")
-        && t != s.clipboard.plain
+        && foreign_clipboard_text(s, t)
     {
         return paste_plain(s, t);
     }

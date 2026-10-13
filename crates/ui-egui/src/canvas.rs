@@ -373,6 +373,13 @@ fn pointer(app: &mut SlideApp, ui: &Ui, resp: &egui::Response, xf: Xf) {
     let p = xf.to_slide(pos);
     let ev = |kind| PointerEvent { kind, x: p.x, y: p.y, mods: m, tol };
     let primary = ui.input(|i| i.pointer.primary_pressed());
+    // A right-click on the slide takes the keyboard too, so Copy in the context menu is about
+    // the slide and the next Ctrl/Cmd+V is not swallowed by a notes field.
+    if resp.secondary_clicked()
+        && let Some(id) = ui.ctx().memory(|m| m.focused())
+    {
+        ui.ctx().memory_mut(|m| m.surrender_focus(id));
+    }
     if resp.hovered() && !app.session.tool.dragging() {
         let _ = app.session.pointer(ev(PointerKind::Move));
     }
@@ -381,6 +388,11 @@ fn pointer(app: &mut SlideApp, ui: &Ui, resp: &egui::Response, xf: Xf) {
     } else if resp.double_clicked() {
         app.session.pointer(ev(PointerKind::DoubleClick))
     } else if primary && resp.hovered() && !resp.secondary_clicked() && ui.input(|i| i.pointer.button_pressed(egui::PointerButton::Primary)) {
+        // Clicking the slide takes the keyboard. A focused notes field or ribbon box would
+        // otherwise keep Ctrl/Cmd+C/V for itself while the highlight on the slide still moves.
+        if let Some(id) = ui.ctx().memory(|m| m.focused()) {
+            ui.ctx().memory_mut(|m| m.surrender_focus(id));
+        }
         app.session.pointer(ev(PointerKind::Down))
     } else if resp.dragged_by(egui::PointerButton::Primary) || (app.session.tool.dragging() && ui.input(|i| i.pointer.primary_down())) {
         app.session.pointer(ev(PointerKind::Drag))

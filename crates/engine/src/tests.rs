@@ -93,6 +93,58 @@ fn clipboard_copy_paste_shapes_and_slides() {
     assert!(s.doc().unwrap().doc.validate().is_empty());
 }
 
+/// #431: a rectangle has no plain text. Copy still publishes a clipboard payload, and pasting
+/// that payload duplicates the shape. Text from another application stays plain text.
+#[test]
+fn copy_of_a_textless_shape_roundtrips_through_the_system_clipboard() {
+    let mut s = session();
+    let n0 = s.doc().unwrap().current_slide().unwrap().shapes.len();
+    let id = s.execute("shape.insert", &json!({"preset": "rect", "rect": [10.0, 20.0, 50.0, 40.0]})).unwrap()["id"].as_u64().unwrap();
+    let copied = s.execute("edit.copy", &json!({})).unwrap();
+    assert_eq!(copied["text"], "");
+    assert_eq!(copied["publish"], crate::cmd::edit::OBJECT_CLIP);
+    assert!(s.ui_requests.iter().any(|r| matches!(r, UiRequest::CopyText { text } if text == crate::cmd::edit::OBJECT_CLIP)));
+    s.execute("edit.paste", &json!({"text": copied["publish"].as_str().unwrap()})).unwrap();
+    let shapes = &s.doc().unwrap().current_slide().unwrap().shapes;
+    assert_eq!(shapes.len(), n0 + 2, "the published clipboard text pastes the rectangle");
+    let pasted = shapes.last().unwrap();
+    assert!(pasted.text.as_ref().is_none_or(|t| t.text().is_empty()), "not a text box of the object mark");
+    let box_x = s.execute("shape.inspect", &json!({"id": pasted.id.0})).unwrap()["box"]["x"].as_f64().unwrap();
+    let orig_x = s.execute("shape.inspect", &json!({"id": id})).unwrap()["box"]["x"].as_f64().unwrap();
+    assert!((box_x - (orig_x + s.prefs.duplicate_offset)).abs() < 1e-6, "same-slide paste is offset, {box_x} vs {orig_x}");
+
+    s.execute("edit.paste", &json!({"text": "from another app"})).unwrap();
+    let last = s.doc().unwrap().current_slide().unwrap().shapes.last().unwrap().text.as_ref().map(|t| t.text());
+    assert_eq!(last.as_deref(), Some("from another app"));
+}
+
+/// #431: copying a text box publishes its words, and pasting those words brings the box back.
+/// A caret copies nothing and does not throw away the previous copy.
+#[test]
+fn copy_publishes_shape_text_and_a_caret_leaves_the_clipboard() {
+    let mut s = session();
+    let id = s.execute("insert.textBox", &json!({"rect": [100.0, 80.0, 200.0, 40.0], "text": "Hello"})).unwrap()["id"].as_u64().unwrap();
+    let copied = s.execute("edit.copy", &json!({})).unwrap();
+    assert_eq!(copied["text"], "Hello");
+    assert_eq!(copied["publish"], "Hello");
+    s.execute("edit.deselect", &json!({})).unwrap();
+    s.execute("edit.paste", &json!({"text": "Hello"})).unwrap();
+    let pasted_id = s.doc().unwrap().selection.shapes[0];
+    let pasted_text = s.doc().unwrap().shape(pasted_id).and_then(|sh| sh.text.as_ref()).map(|t| t.text());
+    assert_eq!(pasted_text.as_deref(), Some("Hello"));
+    let pasted = s.execute("shape.inspect", &json!({"id": pasted_id.0})).unwrap();
+    let orig = s.execute("shape.inspect", &json!({"id": id})).unwrap();
+    assert!((pasted["box"]["x"].as_f64().unwrap() - (orig["box"]["x"].as_f64().unwrap() + s.prefs.duplicate_offset)).abs() < 1e-6);
+
+    s.ui_requests.clear();
+    let title = s.doc().unwrap().current_slide().unwrap().shapes[0].id.0;
+    s.execute("text.edit", &json!({"id": title})).unwrap();
+    let again = s.execute("edit.copy", &json!({})).unwrap();
+    assert_eq!(again, json!({"text": ""}));
+    assert!(s.ui_requests.is_empty(), "a caret does not clear the system clipboard");
+    assert_eq!(s.clipboard.published, "Hello");
+}
+
 #[test]
 fn group_ungroup_roundtrip_positions() {
     let mut s = session();
