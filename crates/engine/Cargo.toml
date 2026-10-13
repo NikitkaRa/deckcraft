@@ -21,6 +21,8 @@ deckcraft-pptx = { workspace = true }
 deckcraft-media = { workspace = true }
 deckcraft-h264 = { workspace = true }
 deckcraft-isobmff = { workspace = true }
+deckcraft-aac = { workspace = true }
+deckcraft-anim = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 i_overlay = { workspace = true }

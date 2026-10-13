@@ -138,14 +138,13 @@ Detail in [file-format-parity.md](file-format-parity.md).
 - **Impact:** handouts and speaker notes are printed in many workplaces.
 - **Estimate:** 5–8 h (print through the PDF path and each OS's print dialog). **Beta blocker.**
 
-### Video has no animations or audio; the animated GIF has no transitions or builds
-- **Evidence:** `file.export` writes MP4/MOV: each slide's transition, then the slide held for its
-  "advance after" time (else a default), at 480p–4K, encoded by DeckCraft's own H.264 encoder
-  (`crates/h264/src/encoder.rs`). Animations inside a slide show in their final state and the video
-  has no audio track (narration, media sound). The animated GIF (#171) has one frame per slide.
-- **Impact:** sharing a talk as a video is a common request; builds and narration are part of it.
-- **Estimate:** 4–8 h (animation timeline frames, an AAC track from the media and narration, an
-  Export dialog page).
+### Video clips are stills in exported video
+- **Evidence:** `file.export` writes MP4/MOV with each transition, the in-slide animations played on
+  the slide-show timeline (`secondsPerClick` pause before each click), and a sound track (embedded
+  audio, narration clips, transition sounds) as AAC (`crates/aac`, ported from FilmCraft) or 16-bit
+  PCM in .mov. Video clips show only their poster frame.
+- **Impact:** decks with embedded video lose that motion in the exported video.
+- **Estimate:** 3–5 h (decode clip frames into the render, an Export dialog page).
 
 ### Embedded MicroType Express font subsets aren't drawn
 - **Evidence:** `p:embeddedFontLst` is read and written. A raw TrueType/OpenType face, or one inside an Embedded OpenType wrapper, is loaded and used to draw. A MicroType Express subset (`application/x-fontdata` with neither form) is kept and written back, and the text still uses a stand-in.
