@@ -385,7 +385,12 @@ pub const UI_COMMANDS: &[(&str, &str, Option<&str>, &str)] = &[
     ("show.end", "End Show", None, "{}"),
     ("animation.preview", "Preview Animations", None, "{on?: bool}"),
     ("app.home", "Home", None, "{on?}"),
-    ("app.backstage", "File", Some("Alt+F"), "{page?: home|new|open|info|saveAs|print|export|account, on?: bool}"),
+    (
+        "app.backstage",
+        "File",
+        Some("Alt+F"),
+        "{page?: home|new|open|info|saveAs|print|export|account, task?: pdf|handouts|video|fileType (export), on?: bool}",
+    ),
     ("app.closePresentation", "Close", Some("Cmd+W"), "{}"),
     (
         "app.print",
@@ -1055,7 +1060,18 @@ impl SlideApp {
                 if page.needs_doc() && self.session.active().is_none() {
                     return Err(format!("File › {} needs an open presentation", page.label()));
                 }
+                // Export: which task is showing (pdf, handouts, video, fileType).
+                let task = match p.get("task").and_then(Value::as_str) {
+                    None => None,
+                    Some(t) if page == backstage::Page::Export => {
+                        Some(backstage::ExportTask::parse(t).ok_or_else(|| format!("unknown Export task `{t}`"))?)
+                    }
+                    Some(_) => return Err("`task` is for the Export page".into()),
+                };
                 self.open_backstage(page);
+                if let (Some(t), Some(b)) = (task, self.backstage.as_mut()) {
+                    b.export = t;
+                }
                 return Ok(json!({"page": page.id()}));
             }
             "app.closePresentation" => self.close_presentation(),

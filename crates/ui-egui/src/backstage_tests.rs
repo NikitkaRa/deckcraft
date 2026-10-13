@@ -634,3 +634,24 @@ fn a_video_export_shows_progress_and_can_be_cancelled() {
     assert!(!dir.join(format!("{title}.mp4")).exists(), "nothing written");
     assert_eq!(h.state_mut().run("app.cancelVideoExport", json!({})).unwrap(), json!({"cancelled": false}));
 }
+
+#[test]
+fn the_export_dialog_hands_video_to_the_create_a_video_page() {
+    let mut h = harness(new_app());
+    assert!(h.state_mut().run("app.backstage", json!({"page": "print", "task": "video"})).is_err());
+    assert!(h.state_mut().run("app.backstage", json!({"page": "export", "task": "gif"})).is_err());
+    h.state_mut().run("app.backstage", json!({"on": false})).unwrap();
+    h.state_mut().run("app.exportDialog", json!({})).unwrap();
+    h.run_steps(3);
+    h.get_by_label("Video (.mp4, .mov)…").click();
+    h.run_steps(3);
+    shot(&mut h, "export-dialog-video");
+    h.query_all_by_role_and_label(Role::Button, "Export").last().expect("the Export button").click();
+    h.run_steps(3);
+    assert_eq!(page(&h), Some(Page::Export));
+    assert_eq!(h.state().backstage.as_ref().map(|b| b.export), Some(ExportTask::Video));
+    assert!(h.state().dialog.is_none());
+    // And by command.
+    h.state_mut().run("app.backstage", json!({"page": "export", "task": "handouts"})).unwrap();
+    assert_eq!(h.state().backstage.as_ref().map(|b| b.export), Some(ExportTask::Handouts));
+}

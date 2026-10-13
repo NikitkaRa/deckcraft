@@ -149,6 +149,19 @@ pub enum ExportTask {
     FileType,
 }
 
+impl ExportTask {
+    /// The `task` param of `app.backstage`.
+    pub fn parse(id: &str) -> Option<ExportTask> {
+        match id {
+            "pdf" => Some(ExportTask::Pdf),
+            "handouts" => Some(ExportTask::Handouts),
+            "video" => Some(ExportTask::Video),
+            "fileType" => Some(ExportTask::FileType),
+            _ => None,
+        }
+    }
+}
+
 /// The File tab's state while it is open.
 #[derive(Clone, Debug)]
 pub struct Backstage {
