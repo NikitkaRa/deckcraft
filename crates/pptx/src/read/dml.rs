@@ -627,5 +627,13 @@ mod tests {
         assert_eq!(b.vert, Some(TextDir::Vertical270));
         assert_eq!(b.columns, Some(2));
         assert_eq!(b.autofit, Some(AutoFit::Shrink { font_scale: 0.625, line_reduction: 0.2 }));
+        // mongolianVert is its own direction (PowerPoint runs its lines left to right) and is
+        // written back as it was read.
+        let d = parse(br#"<a:bodyPr vert="mongolianVert"/>"#).unwrap();
+        let b = body_pr(&d.root);
+        assert_eq!(b.vert, Some(TextDir::MongolianVertical));
+        assert_eq!(b.vert.map(|v| v.xml()), Some("mongolianVert"));
+        let d = parse(br#"<a:bodyPr vert="wordArtVertRtl"/>"#).unwrap();
+        assert_eq!(body_pr(&d.root).vert.map(|v| v.xml()), Some("wordArtVertRtl"));
     }
 }

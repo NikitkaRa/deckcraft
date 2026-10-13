@@ -1400,7 +1400,7 @@ pub fn draw_layout_with(ctx: &mut RenderContext, l: &deckcraft_text::TextLayout,
         }
         ctx.set_transform(m * Affine::translate(ps.offset));
         ctx.set_paint(color(d.color, ps.opacity));
-        ctx.fill_rect(&d.rect);
+        fill_deco(ctx, d);
     };
     for d in l.decos.iter().filter(|d| d.behind) {
         deco(ctx, d);
@@ -1427,7 +1427,7 @@ pub fn draw_layout_with(ctx: &mut RenderContext, l: &deckcraft_text::TextLayout,
         // its bottom, from its first to its last character), as in PowerPoint.
         let mut grads: Vec<(usize, peniko::Gradient)> = Vec::new();
         for (gid, x, y) in &run.glyphs {
-            let at = m * Affine::translate((*x, *y));
+            let at = m * glyph_place(run, *gid, *x, *y);
             let Some(g) = run.gradient.as_ref().filter(|g| !g.stops.is_empty()) else {
                 draw_glyph(ctx, run, *gid, at, ps.opacity);
                 continue;
@@ -1445,6 +1445,37 @@ pub fn draw_layout_with(ctx: &mut RenderContext, l: &deckcraft_text::TextLayout,
     }
     for d in l.decos.iter().filter(|d| !d.behind) {
         deco(ctx, d);
+    }
+}
+
+/// Where glyph `gid` of `run` with its pen at (`x`, `y`) is drawn, in text space: there, turned a
+/// quarter turn back about its em box's centre when it stands upright in vertical text.
+pub(crate) fn glyph_place(run: &deckcraft_text::GlyphRun, gid: u32, x: f64, y: f64) -> Affine {
+    let at = Affine::translate((x, y));
+    match run.upright_centre(gid, x, y) {
+        Some((cx, cy)) => Affine::translate((cx, cy)) * Affine::rotate(-std::f64::consts::FRAC_PI_2) * Affine::translate((-cx, -cy)) * at,
+        None => at,
+    }
+}
+
+/// Fill an underline, strikethrough or highlight with the current paint and transform: its box,
+/// its dashes, or its zigzag stroked.
+pub(crate) fn fill_deco(ctx: &mut RenderContext, d: &deckcraft_text::Deco) {
+    if let Some((pts, w)) = d.wave() {
+        let mut path = BezPath::new();
+        for (i, p) in pts.iter().enumerate() {
+            if i == 0 {
+                path.move_to(*p);
+            } else {
+                path.line_to(*p);
+            }
+        }
+        ctx.set_stroke(kurbo::Stroke::new(w.max(0.01)));
+        ctx.stroke_path(&path);
+        return;
+    }
+    for r in d.pieces() {
+        ctx.fill_rect(&r);
     }
 }
 
@@ -1498,7 +1529,7 @@ fn text_effect(ctx: &mut RenderContext, run: &deckcraft_text::GlyphRun, which: T
             continue;
         }
         // The offset is in slide space: a shadow falls the same way whatever the text's rotation.
-        let at = pre_translate(m * Affine::translate((*x, *y)), offset * px) * skew * Affine::scale(k);
+        let at = pre_translate(m * glyph_place(run, *gid, *x, *y), offset * px) * skew * Affine::scale(k);
         ctx.set_transform(at);
         ctx.fill_path(&path);
         if grow > 0.0 {

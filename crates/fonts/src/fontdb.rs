@@ -134,6 +134,12 @@ pub struct FontFace {
     /// Windows ascent over the Windows ascent plus descent (OS/2 `usWinAscent`/`usWinDescent`),
     /// the split PowerPoint uses (computed by `line_split`).
     pub line_split: f64,
+    /// Underline position (top edge, below the baseline) and thickness in font units (`post`
+    /// table; 0.1 and 0.05 em when the font has none). PowerPoint draws single underlines there.
+    pub underline: (f64, f64),
+    /// Strikethrough position (top edge, above the baseline) and thickness in font units (OS/2;
+    /// 0.26 and 0.05 em when the font has none). PowerPoint draws single strikethroughs there.
+    pub strikeout: (f64, f64),
     pub shaper: harfrust::ShaperData,
     /// Variable fonts: the named instance's axis settings (user units; empty = default instance),
     /// the normalised location and the shaper's view of it.
@@ -586,6 +592,8 @@ fn make_face(bytes: FontBytes, index: u32, family: String, style: String, coords
         cap_height: m.cap_height.map(|v| v as f64).filter(|v| *v > 0.0).unwrap_or(m.ascent as f64 * 0.72),
         x_height: m.x_height.map(|v| v as f64).filter(|v| *v > 0.0).unwrap_or(m.ascent as f64 * 0.5),
         line_split: line_split(&f, m.ascent as f64, -(m.descent as f64), m.units_per_em.max(1) as f64),
+        underline: underline_metrics(m.underline, m.units_per_em.max(1) as f64),
+        strikeout: strikeout_metrics(m.strikeout, m.units_per_em.max(1) as f64),
         shaper,
         coords,
         location,
@@ -595,6 +603,30 @@ fn make_face(bytes: FontBytes, index: u32, family: String, style: String, coords
         bmp: std::sync::OnceLock::new(),
         color: std::sync::OnceLock::new(),
     })
+}
+
+/// The underline's top edge below the baseline and its thickness, font units, from the `post`
+/// table (its position is the top edge: Arial's -217/2048 is where PowerPoint's underline starts,
+/// 10 px below the baseline at 96 pt); fonts without a usable one get 0.1 em and 0.05 em.
+fn underline_metrics(d: Option<skrifa::metrics::Decoration>, upem: f64) -> (f64, f64) {
+    match d {
+        Some(d) if d.thickness > 0.0 && (d.thickness as f64) < upem * 0.3 && (d.offset as f64).abs() < upem * 0.5 => {
+            (-(d.offset as f64), d.thickness as f64)
+        }
+        _ => (upem * 0.1, upem * 0.05),
+    }
+}
+
+/// The strikethrough's top edge above the baseline and its thickness, font units, from OS/2 (its
+/// position is the top edge: Arial's 530/2048 is where PowerPoint's strikethrough starts, 25 px
+/// above the baseline at 96 pt); fonts without a usable one get 0.26 em and 0.05 em.
+fn strikeout_metrics(d: Option<skrifa::metrics::Decoration>, upem: f64) -> (f64, f64) {
+    match d {
+        Some(d) if d.thickness > 0.0 && (d.thickness as f64) < upem * 0.3 && d.offset > 0.0 && (d.offset as f64) < upem => {
+            (d.offset as f64, d.thickness as f64)
+        }
+        _ => (upem * 0.26, upem * 0.05),
+    }
 }
 
 /// The named style part of a style with axis settings (`Bold {wght:650}` → `Bold`).
@@ -1058,6 +1090,79 @@ impl FontDb {
         }
         let _ = key;
         None
+    }
+
+    /// A loaded plain (not colour) face drawing all of `cluster`, loading an installed plain font
+    /// that covers `key` if none is loaded yet. Misses are remembered.
+    pub(crate) fn plain_face_for(&self, key: char, cluster: &[char]) -> Option<Arc<FontFace>> {
+        // Symbol fonts first (PowerPoint draws ⚠ ♥ ⬆ from the system's symbol font), then the
+        // usual fallback families in order, then any other.
+        let rank = |f: &FontFace| {
+            if f.family.contains("Symbol") {
+                return 0;
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            if let Some(i) = SYSTEM_FALLBACKS.iter().position(|s| s.eq_ignore_ascii_case(&f.family)) {
+                return i + 1;
+            }
+            1000
+        };
+        let pick = |db: &FontDb| {
+            let faces = db.read_faces();
+            let mut v: Vec<&Arc<FontFace>> = faces.iter().filter(|f| !f.is_color() && crate::covers_cluster(f, cluster)).collect();
+            v.sort_by_key(|f| (rank(f), f.italic, (f.weight - 400.0).abs() as i32));
+            v.first().map(|f| (*f).clone())
+        };
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let cataloged: Vec<String> = self.read_catalog().iter().map(|e| e.family.clone()).collect();
+            for fam in SYSTEM_FALLBACKS.iter().filter(|f| f.contains("Symbol")) {
+                if !self.is_loaded(fam) && cataloged.iter().any(|f| f.eq_ignore_ascii_case(fam)) {
+                    self.load_cataloged(fam);
+                }
+            }
+        }
+        if let Some(f) = pick(self) {
+            return Some(f);
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        if self.system_plain_fallback(key) {
+            return pick(self);
+        }
+        let _ = key;
+        None
+    }
+
+    /// Load an installed font without colour tables covering `c`. True if one was loaded.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn system_plain_fallback(&self, c: char) -> bool {
+        static MISSES: Mutex<Option<std::collections::HashSet<char>>> = Mutex::new(None);
+        if c.is_control() || c.is_whitespace() {
+            return false;
+        }
+        if !self.sys.lock().unwrap_or_else(|e| e.into_inner()).enabled {
+            return false;
+        }
+        if MISSES.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(Default::default).contains(&c) {
+            return false;
+        }
+        let mut paths: Vec<std::path::PathBuf> = self.read_catalog().iter().map(|e| e.path.clone()).collect();
+        paths.sort();
+        paths.dedup();
+        for p in paths {
+            if std::fs::metadata(&p).map(|m| m.len() > 40 << 20).unwrap_or(true) {
+                continue;
+            }
+            let Ok(data) = std::fs::read(&p) else { continue };
+            let hit = enumerate_faces(&data).iter().any(|(i, _, _, _)| {
+                !has_color_tables(&data, *i) && skrifa::FontRef::from_index(&data, *i).is_ok_and(|f| f.charmap().map(c).is_some())
+            });
+            if hit && self.add_font(data) > 0 {
+                return true;
+            }
+        }
+        MISSES.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(Default::default).insert(c);
+        false
     }
 
     /// Load an installed colour font covering `c`. True if one was loaded.

@@ -219,7 +219,7 @@ pub(crate) fn draw(
         for d in &l.decos {
             ctx.set_transform(place);
             ctx.set_paint(color(d.color, alpha));
-            ctx.fill_rect(&d.rect);
+            crate::fill_deco(ctx, d);
         }
     }
 }

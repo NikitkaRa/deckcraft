@@ -140,10 +140,12 @@ pub(crate) fn draw(ctx: &mut RenderContext, l: &TextLayout, tr: Rect, m: Affine,
         }
         let y = (d.rect.y0 + d.rect.y1) / 2.0;
         let Some(li) = line_of(l, d.para, y) else { return };
-        let path = warp_path(&d.rect.to_path(0.1), tol, seg, &|p| mapper.map(li, p));
         ctx.set_transform(m * Affine::translate(ps.offset));
         ctx.set_paint(color(d.color, ps.opacity));
-        ctx.fill_path(&path);
+        for r in d.pieces() {
+            let path = warp_path(&r.to_path(0.1), tol, seg, &|p| mapper.map(li, p));
+            ctx.fill_path(&path);
+        }
     };
     for d in l.decos.iter().filter(|d| d.behind) {
         deco(ctx, d);
