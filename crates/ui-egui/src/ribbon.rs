@@ -501,9 +501,30 @@ fn font_group(app: &mut SlideApp, ui: &mut Ui, st: &Value) {
                     if let Some(Some(c)) = widgets::color_grid(ui, &sc, None) {
                         run(app, "format.color", json!({"color": cref_param(&c)}));
                     }
+                    text_transparency(app, ui, st.get("textTransparency").and_then(Value::as_f64).unwrap_or(0.0));
                 });
             });
         });
+    });
+}
+
+/// Transparency for the text colour (#32). The shape-fill slider changes the shape, not the letters.
+fn text_transparency(app: &mut SlideApp, ui: &mut Ui, current: f64) {
+    ui.separator();
+    let id = ui.id().with("text-transparency");
+    let mut pct: f32 = ui.data_mut(|d| d.get_temp(id).unwrap_or((current.clamp(0.0, 1.0) * 100.0) as f32));
+    ui.horizontal(|ui| {
+        ui.label("Transparency");
+        let r = ui.add(egui::Slider::new(&mut pct, 0.0..=100.0).suffix("%"));
+        let dirty = r.changed();
+        if dirty {
+            ui.data_mut(|d| d.insert_temp(id, pct));
+        }
+        // One commit when the drag ends, including a keyboard change that then leaves the slider.
+        if r.drag_stopped() || (r.lost_focus() && (dirty || ui.data(|d| d.get_temp::<f32>(id).is_some()))) {
+            ui.data_mut(|d| d.remove::<f32>(id));
+            run(app, "format.color", json!({"transparency": (f64::from(pct) / 100.0).clamp(0.0, 1.0)}));
+        }
     });
 }
 
@@ -1943,6 +1964,8 @@ fn shape_format(app: &mut SlideApp, ui: &mut Ui) {
                     if let Some(Some(c)) = widgets::color_grid(ui, &sc, None) {
                         run(app, "format.color", json!({"color": cref_param(&c)}));
                     }
+                    let cur = fmt_state(app).get("textTransparency").and_then(Value::as_f64).unwrap_or(0.0);
+                    text_transparency(app, ui, cur);
                 });
             }
             let (_, a) = small_button_ex(ui, Icon::TextOutline, "Text Outline", sel, false, true);

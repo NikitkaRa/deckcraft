@@ -1,10 +1,11 @@
 //! Home ▸ Font and Paragraph, Format menu: character, paragraph and text box formatting, and
 //! the Format Painter.
 
+use deckcraft_color::{ColorTransform, SchemeSlot};
 use deckcraft_model::edit as ed;
 use deckcraft_model::resolve;
 use deckcraft_model::text::{Align, Anchor, AutoFit, Bullet, Caps, ParaProps, RunProps, Spacing, Strike, TextDir};
-use deckcraft_model::{Effects, Fill, Line, Shape};
+use deckcraft_model::{ColorRef, Effects, Fill, Line, Shape};
 use serde_json::{Value, json};
 
 use super::text::{format_body, format_para, format_run};
@@ -44,7 +45,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Font Color",
             ["Home", "Font"],
             None,
-            "{color: #RRGGBB | accent1..6 | tx1… | {scheme, lumMod…}}",
+            "{color?: #RRGGBB | accent1..6 | tx1… | {scheme, lumMod…}, transparency?: 0..1}",
             has_text_or_shapes,
             color
         ),
@@ -290,8 +291,82 @@ fn shrink(s: &mut Session, _p: &Value) -> Result<Value> {
     grow_shrink(s, false)
 }
 fn color(s: &mut Session, p: &Value) -> Result<Value> {
-    let c = color_param(p, "color").ok_or_else(|| bad("format.color", "missing or invalid `color`"))?;
-    format_run(s, &move |r| r.fill = Some(Fill::solid(c.clone())))
+    let chosen = color_param(p, "color");
+    let transparency = f64_param(p, "transparency").map(|t| t.clamp(0.0, 1.0));
+    if chosen.is_none() && transparency.is_none() {
+        return Err(bad("format.color", "give `color` or `transparency`"));
+    }
+    // A run with no colour of its own takes the colour it is already drawn in.
+    let fallback = solid_of(&current_run(s).fill).unwrap_or_else(|| ColorRef::scheme(SchemeSlot::Tx1));
+    format_run(s, &move |r| {
+        if let Some(c) = chosen.clone() {
+            let mut c = c;
+            if !has_alpha(&c)
+                && let Some(a) = solid_of(&r.fill).as_ref().and_then(alpha_mod)
+            {
+                c.mods.push(a);
+            }
+            if let Some(t) = transparency {
+                set_alpha(&mut c, 1.0 - t);
+            }
+            r.fill = Some(Fill::solid(c));
+            return;
+        }
+        let Some(t) = transparency else { return };
+        let opacity = 1.0 - t;
+        match &r.fill {
+            Some(Fill::Solid { color }) => {
+                let mut c = color.clone();
+                set_alpha(&mut c, opacity);
+                r.fill = Some(Fill::solid(c));
+            }
+            Some(Fill::Gradient(g)) => {
+                let mut g = g.clone();
+                for stop in &mut g.stops {
+                    set_alpha(&mut stop.color, opacity);
+                }
+                r.fill = Some(Fill::Gradient(g));
+            }
+            _ => {
+                let mut c = fallback.clone();
+                set_alpha(&mut c, opacity);
+                r.fill = Some(Fill::solid(c));
+            }
+        }
+    })
+}
+
+fn solid_of(fill: &Option<Fill>) -> Option<ColorRef> {
+    match fill {
+        Some(Fill::Solid { color }) => Some(color.clone()),
+        _ => None,
+    }
+}
+
+fn has_alpha(c: &ColorRef) -> bool {
+    c.mods.iter().any(|m| matches!(m, ColorTransform::Alpha(_)))
+}
+
+fn alpha_mod(c: &ColorRef) -> Option<ColorTransform> {
+    c.mods.iter().copied().find(|m| matches!(m, ColorTransform::Alpha(_)))
+}
+
+/// `opacity` is 0–1 (1 = solid). A fully solid colour stores no alpha transform.
+fn set_alpha(c: &mut ColorRef, opacity: f64) {
+    c.mods.retain(|m| !matches!(m, ColorTransform::Alpha(_)));
+    let units = (opacity.clamp(0.0, 1.0) * 100_000.0).round();
+    let units = if units.is_finite() { units as i32 } else { 100_000 };
+    if units < 100_000 {
+        c.mods.push(ColorTransform::Alpha(units.clamp(0, 100_000)));
+    }
+}
+
+fn text_transparency_of(r: &RunProps) -> f64 {
+    match &r.fill {
+        Some(Fill::Solid { color }) => 1.0 - color.alpha(),
+        Some(Fill::Gradient(g)) => 1.0 - g.stops.first().map(|s| s.color.alpha()).unwrap_or(1.0),
+        _ => 0.0,
+    }
 }
 fn highlight(s: &mut Session, p: &Value) -> Result<Value> {
     let c = color_param(p, "color");
@@ -680,5 +755,61 @@ fn state(s: &mut Session, _p: &Value) -> Result<Value> {
         "numbering": matches!(pp.bullet, Some(Bullet::AutoNum { .. })),
         "lineSpacing": serde_json::to_value(pp.line_spacing).unwrap_or_default(),
         "painter": s.painter.is_some(),
+        "textTransparency": text_transparency_of(&r),
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Session;
+
+    fn text_box() -> (Session, u64) {
+        let mut s = Session::with_new();
+        let r = s.execute("shape.insert", &json!({"preset": "rect", "rect": [40.0, 40.0, 200.0, 80.0], "text": "Hello"})).unwrap();
+        let id = r["id"].as_u64().unwrap();
+        (s, id)
+    }
+
+    fn props(s: &mut Session, id: u64) -> Value {
+        s.execute("shape.inspect", &json!({"id": id})).unwrap()
+    }
+
+    #[test]
+    fn transparency_fades_the_text_and_leaves_the_shape_fill() {
+        let (mut s, id) = text_box();
+        s.execute("shape.fill", &json!({"color": "#00ff00"})).unwrap();
+        s.execute("format.color", &json!({"transparency": 0.6})).unwrap();
+        let v = props(&mut s, id);
+        let fill = &v["shape"]["fill"];
+        assert_eq!(fill["kind"], "solid");
+        assert_eq!(fill["color"]["base"]["rgb"]["g"], 255);
+        assert!(fill["color"]["mods"].as_array().is_none_or(|m| m.is_empty()));
+        let text = &v["shape"]["text"]["paragraphs"][0]["runs"][0]["props"]["fill"];
+        assert_eq!(text["kind"], "solid");
+        assert_eq!(text["color"]["mods"], json!([{"op": "alpha", "val": 40000}]));
+        let state = s.execute("format.state", &json!({})).unwrap();
+        assert!((state["textTransparency"].as_f64().unwrap_or(-1.0) - 0.6).abs() < 1e-9);
+
+        // A new colour keeps the transparency already set.
+        s.execute("format.color", &json!({"color": "#ff0000"})).unwrap();
+        let v = props(&mut s, id);
+        let text = &v["shape"]["text"]["paragraphs"][0]["runs"][0]["props"]["fill"];
+        assert_eq!(text["color"]["base"]["rgb"]["r"], 255);
+        assert_eq!(text["color"]["mods"], json!([{"op": "alpha", "val": 40000}]));
+        assert_eq!(v["shape"]["fill"]["color"]["base"]["rgb"]["g"], 255);
+
+        // Fully opaque stores no alpha transform.
+        s.execute("format.color", &json!({"transparency": 0.0})).unwrap();
+        let v = props(&mut s, id);
+        let mods = &v["shape"]["text"]["paragraphs"][0]["runs"][0]["props"]["fill"]["color"]["mods"];
+        assert!(mods.as_array().is_none_or(|m| m.is_empty()), "{mods}");
+    }
+
+    #[test]
+    fn color_without_transparency_or_color_is_refused() {
+        let (mut s, _) = text_box();
+        let err = s.execute("format.color", &json!({})).unwrap_err();
+        assert!(err.to_string().contains("color") || err.to_string().contains("transparency"), "{err}");
+    }
 }
