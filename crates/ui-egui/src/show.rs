@@ -41,8 +41,8 @@ pub struct Show {
     zoom: Option<Zoom>,
     thumbs: Vec<(usize, TextureHandle)>,
     pen: bool,
-    /// A dot that follows the pointer and leaves no ink (`Cmd/Ctrl+L`).
-    /// Laser pointer while recording. It leaves no ink; the points are kept with the slide.
+    /// A dot that follows the pointer and leaves no ink (`Cmd/Ctrl+L`, or hold Ctrl for the same
+    /// dot without leaving it on). Its points are kept only while recording.
     laser: bool,
     strokes: Vec<Vec<Pos2>>,
     /// Digits typed for Go to Slide, shown until Enter, Esc, or a short pause.
@@ -687,9 +687,11 @@ pub fn ui(app: &mut SlideApp, ui: &mut Ui) {
     show.expire_goto(now);
     // The clock of the triggered animations runs before anything reacts to the pointer.
     show.tick_triggers(&doc, now);
+    let ctrl = ctx.input(|i| i.modifiers.ctrl);
+    let laser_on = pointer_is_laser(show.laser, ctrl, show.blank.is_some());
     let on_slide = !show.grid
         && !show.pen
-        && !show.laser
+        && !laser_on
         && !show.ended
         && show.blank.is_none()
         && show.zoom.is_none()
@@ -736,7 +738,7 @@ pub fn ui(app: &mut SlideApp, ui: &mut Ui) {
         show.dismiss_zoom();
     } else if clicked
         && !show.pen
-        && !show.laser
+        && !laser_on
         && !show.reading_bar_hit(&ctx)
         && !show.record_bar_hit(&ctx)
         && !pointer_on_media_bar(&ctx, ui, &doc, &show)
@@ -756,7 +758,7 @@ pub fn ui(app: &mut SlideApp, ui: &mut Ui) {
             }
         }
     }
-    if secondary && !show.ended && !show.record_bar_hit(&ctx) && !show.grid && show.zoom.is_none() && !show.zoom_arm {
+    if secondary && !show.ended && !laser_on && !show.record_bar_hit(&ctx) && !show.grid && show.zoom.is_none() && !show.zoom_arm {
         actions.push(show.state.prev(&doc));
     }
     // A trackpad swipe (and the mouse wheel) turns the page. The pen is drawing, so a flick
@@ -1046,8 +1048,8 @@ pub fn ui(app: &mut SlideApp, ui: &mut Ui) {
         ctx.request_repaint_after(std::time::Duration::from_millis(200));
     }
     // Pen.
-    let resp = ui.interact(full, ui.id().with("show_pen"), if show.pen { Sense::drag() } else { Sense::hover() });
-    if show.pen {
+    let resp = ui.interact(full, ui.id().with("show_pen"), if show.pen && !laser_on { Sense::drag() } else { Sense::hover() });
+    if show.pen && !laser_on {
         if resp.drag_started() {
             show.strokes.push(vec![]);
         }
@@ -1060,7 +1062,7 @@ pub fn ui(app: &mut SlideApp, ui: &mut Ui) {
             s.push(pos2(nx, ny));
         }
         ctx.set_cursor_icon(egui::CursorIcon::Crosshair);
-    } else if show.laser {
+    } else if laser_on {
         ctx.set_cursor_icon(egui::CursorIcon::None);
     } else if show.zoom_arm || show.grid {
         ctx.set_cursor_icon(egui::CursorIcon::Crosshair);
@@ -1076,7 +1078,7 @@ pub fn ui(app: &mut SlideApp, ui: &mut Ui) {
         let pts: Vec<Pos2> = s.iter().map(|q| slide_to_screen(srect, uv, q.x, q.y)).collect();
         painter.add(egui::Shape::line(pts, Stroke::new(3.0, pen_col)));
     }
-    if show.laser
+    if laser_on
         && !show.ended
         && let Some(p) = ctx.input(|i| i.pointer.hover_pos())
     {
@@ -1093,11 +1095,11 @@ pub fn ui(app: &mut SlideApp, ui: &mut Ui) {
             Color32::WHITE,
         );
     }
-    if show.record && show.laser {
+    if show.record && laser_on {
         if let Some(p) = ctx.input(|i| i.pointer.hover_pos()) {
             let nx = (p.x - srect.min.x) / srect.width().max(1.0);
             let ny = (p.y - srect.min.y) / srect.height().max(1.0);
-            if (0.0..=1.0).contains(&nx) && (0.0..=1.0).contains(&ny) {
+            if show.record && (0.0..=1.0).contains(&nx) && (0.0..=1.0).contains(&ny) {
                 let ms = (now - show.slide_start).max(0.0) * 1000.0;
                 if ms.is_finite() {
                     show.note_laser(nx as f64 * doc.slide_size.width, ny as f64 * doc.slide_size.height, ms.min(3_600_000.0) as u32);
@@ -2150,6 +2152,12 @@ fn saved_status(narr: bool, ink: bool, laser: bool) -> &'static str {
 }
 
 /// The laser dot at `elapsed_ms`, held briefly after the last sample.
+/// The laser dot: the button (or L while recording) leaves it on, and holding Ctrl shows it
+/// in any show. A blank screen hides it. It never draws ink.
+fn pointer_is_laser(sticky: bool, ctrl: bool, blank: bool) -> bool {
+    !blank && (sticky || ctrl)
+}
+
 fn laser_pos(points: &[deckcraft_model::LaserSample], elapsed_ms: u32) -> Option<(f64, f64)> {
     let last = points.last()?;
     if elapsed_ms > last.t_ms.saturating_add(300) {
@@ -2551,6 +2559,14 @@ mod tests {
         assert!(!play_on_enter(&narr, true));
         let clip = deckcraft_model::MediaClip { autoplay: true, ..Default::default() };
         assert!(play_on_enter(&clip, true));
+    }
+
+    #[test]
+    fn ctrl_shows_the_laser_without_a_trace_and_the_button_can_leave_it_on() {
+        assert!(pointer_is_laser(false, true, false));
+        assert!(pointer_is_laser(true, false, false));
+        assert!(!pointer_is_laser(false, false, false));
+        assert!(!pointer_is_laser(true, true, true));
     }
 
     #[test]

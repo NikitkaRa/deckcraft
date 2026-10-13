@@ -2095,6 +2095,25 @@ fn slide_show(app: &mut SlideApp, ui: &mut Ui) {
             if ui.checkbox(&mut mc, "Show Media Controls").changed() {
                 run(app, "show.setup", json!({"showMediaControls": mc}));
             }
+            let clear = ui.button("Clear").on_hover_text("Clear Timing or Clear Narration");
+            egui::Popup::menu(&clear).show(|ui| {
+                if ui.button("Clear Timing on Current Slide").clicked() {
+                    run(app, "show.clearTiming", json!({}));
+                    ui.close();
+                }
+                if ui.button("Clear Timing on All Slides").clicked() {
+                    run(app, "show.clearTimingAll", json!({}));
+                    ui.close();
+                }
+                if ui.button("Clear Narration on Current Slide").clicked() {
+                    run(app, "show.clearNarration", json!({}));
+                    ui.close();
+                }
+                if ui.button("Clear Narration on All Slides").clicked() {
+                    run(app, "show.clearNarrationAll", json!({}));
+                    ui.close();
+                }
+            });
         });
     });
 }

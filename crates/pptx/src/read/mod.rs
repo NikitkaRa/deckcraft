@@ -1248,6 +1248,15 @@ fn read_show(sp: &El, shows: &HashMap<String, String>) -> ShowSettings {
     {
         s.pen_color = rgb;
     }
+    if let Some(c) = sp
+        .child("extLst")
+        .and_then(|e| e.children_named("ext").find(|x| x.attr("uri") == Some(crate::LASER_CLR_URI)))
+        .and_then(|e| e.child("laserClr"))
+        .and_then(dml::color)
+        && let deckcraft_model::ColorBase::Rgb { rgb } = c.base
+    {
+        s.laser_color = rgb;
+    }
     s
 }
 

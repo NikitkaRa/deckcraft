@@ -1204,6 +1204,13 @@ fn pres_props_xml(p: &Presentation) -> Vec<u8> {
     w.open0("p:penClr");
     w.val("a:srgbClr", s.pen_color.hex());
     w.close("p:penClr");
+    w.open0("p:extLst");
+    w.open("p:ext", A::new().a("uri", crate::LASER_CLR_URI));
+    w.open("p14:laserClr", A::new().a("xmlns:p14", NS_P14));
+    w.val("a:srgbClr", s.laser_color.hex());
+    w.close("p14:laserClr");
+    w.close("p:ext");
+    w.close("p:extLst");
     w.close("p:showPr");
     w.close("p:presentationPr");
     w.finish()

@@ -33,6 +33,9 @@ pub(crate) const COMMENTS_EXT_URI: &str = "{6950BFC3-D8DA-4A85-94F7-54DA5524770B
 /// does not know; DeckCraft reads it back.
 pub(crate) const LASER_EXT_URI: &str = "{D3C4A571-1A5E-4E01-9C11-DEC0A7710001}";
 
+/// PowerPoint 2010 laser-pointer colour (`p14:laserClr` on `showPr`). [MS-PPTX] 2.3.1.16.
+pub(crate) const LASER_CLR_URI: &str = "{EC167BDD-8182-4AB7-AECC-EB403E3ABB37}";
+
 #[derive(Debug, thiserror::Error)]
 pub enum PptxError {
     #[error("not a PPTX file: {0}")]

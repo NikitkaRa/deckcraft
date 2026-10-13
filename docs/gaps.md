@@ -410,6 +410,7 @@ Detail in [localization-parity.md](localization-parity.md).
 | 2026-10-13 | minor | WordArt adjust handles: a selected text warp shows one yellow handle per adjust, and dragging it sets that guide value (gallery and command still open) |
 | 2026-10-14 | minor | Pen pressure scales ink width when the pointer reports it; tilt, pinch-zoom and other trackpad gestures remain |
 | 2026-10-13 | trivial | Chart workbook round-trip (#335) noted under the charts gap; editing chart data is still open |
+| 2026-10-14 | minor | Laser pointer during a show (hold Ctrl, red/green/blue). Clear Timing and Clear Narration on the current slide or all slides |
 | 2026-10-14 | minor | Record Slide Show keeps narration audio and a laser trace. Screen capture and camera stay open |
 | 2026-10-14 | minor | Record Slide Show keeps timings and pen ink. Audio and screen capture stay open |
 | 2026-10-13 | minor | Shape, picture and table rendering checked against PowerPoint on ~150 synthetic edge-case slides; 3-D bevels, cameras and face lighting now render approximately (gap narrowed to extrusion, rigs and the 3-D pane) |

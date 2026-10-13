@@ -83,7 +83,7 @@ From the local execution plan (`plan/execution-plan.md`, gitignored). Status as 
 | M4 | Design | mostly | Notes/Handout masters, variants, Designer |
 | M5 | Pictures and media | mostly | SVG/EMF, remove background, compress, icons, WMA/WMV |
 | M6 | Transitions and animations | mostly | Animation Pane timeline, remaining effects, transition sounds |
-| M7 | Slide show | mostly | second-display placement, laser, record |
+| M7 | Slide show | mostly | second-display placement, highlighter, screen capture |
 | M8 | Tables and charts | partly | chart data grid, elements, chartex types, draw table |
 | M9 | SmartArt, equations, WordArt | partly | SmartArt layouts and PowerPoint-diagram fidelity, equations (PR #55); the text pane, warp gallery and warp handles are in |
 | M10 | Views | done | Arrange All (grid options and New Window are in) |
@@ -137,6 +137,7 @@ plan above.
 | 2026-10-13 | minor | M10: Grid Options dialog; New Window stays open |
 | 2026-10-13 | minor | M9: WordArt adjust handles drag; the Transform gallery and command stay open |
 | 2026-10-14 | trivial | After beta: pen pressure scales ink width; tilt and pinch zoom remain |
+| 2026-10-14 | trivial | Laser pointer during a show, and Clear Timing / Clear Narration on the current slide or all slides |
 | 2026-10-14 | trivial | Record Slide Show keeps narration and a laser trace; screen capture and camera stay after beta |
 | 2026-10-14 | trivial | Record Slide Show keeps timings and pen ink; narration audio and screen capture stay after beta |
 | 2026-10-10 | minor | Added the alpha gate (six core workflows): all pass, two with partial depth; stage stays alpha |
