@@ -100,9 +100,12 @@ pub fn show(app: &mut SlideApp, ui: &mut Ui) {
                 app.thumb_drag = None;
             }
         }
-        // Ctrl/⌘ + wheel zooms the sorter.
-        let (zd, cmd) = ui.input(|i| (i.zoom_delta(), i.modifiers.command));
-        if (zd - 1.0).abs() > 1e-3 || cmd {
+        // Pinch, or Ctrl/⌘ + wheel, changes how large the thumbnails are.
+        let (zd, over) = ui.input(|i| {
+            let over = i.pointer.hover_pos().is_some_and(|p| ui.clip_rect().contains(p));
+            (i.zoom_delta(), over)
+        });
+        if over && (zd - 1.0).abs() > 1e-3 {
             app.ui.sorter_zoom = (zoom * zd).clamp(0.5, 3.0);
         }
     });

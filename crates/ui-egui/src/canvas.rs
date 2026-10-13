@@ -66,18 +66,25 @@ pub fn show(app: &mut SlideApp, ui: &mut Ui) {
         }
         return;
     }
-    let (content_rect, scale) = layout(app, avail);
-    // Scroll when zoomed beyond the window.
+    // A trackpad pinch (egui's zoom delta, from the system's magnification gesture) scales
+    // around the pointer. A two-finger scroll pans once the slide is larger than the window,
+    // and otherwise pages through slides.
     let scroll_id = ui.id().with("canvas_scroll");
     let mut offset: egui::Vec2 = ui.data_mut(|d| d.get_temp(scroll_id).unwrap_or_default());
-    let overflow = vec2((content_rect.width() + 56.0 - avail.width()).max(0.0), (content_rect.height() + 56.0 - avail.height()).max(0.0));
     let resp = ui.allocate_rect(avail, Sense::click_and_drag());
     let (wheel, zoom_delta, pinch_pos) = ui.input(|i| (i.smooth_scroll_delta, i.zoom_delta(), i.pointer.hover_pos()));
+    let (mut content_rect, mut scale) = layout(app, avail);
+    let mut overflow = vec2((content_rect.width() + 56.0 - avail.width()).max(0.0), (content_rect.height() + 56.0 - avail.height()).max(0.0));
     if resp.hovered() {
         if (zoom_delta - 1.0).abs() > 1e-3 {
-            let cur = app.ui.zoom.unwrap_or(scale);
-            app.ui.zoom = Some((cur * zoom_delta).clamp(0.1, 4.0));
-            let _ = pinch_pos;
+            let shown = content_rect.translate(-offset);
+            let anchor = pinch_pos.filter(|p| avail.contains(*p)).unwrap_or(shown.center());
+            let local = (anchor - shown.min) / scale.max(0.05);
+            app.ui.zoom = Some((scale * zoom_delta).clamp(0.1, 4.0));
+            (content_rect, scale) = layout(app, avail);
+            overflow = vec2((content_rect.width() + 56.0 - avail.width()).max(0.0), (content_rect.height() + 56.0 - avail.height()).max(0.0));
+            // screen = content.min - offset + local * scale, solved for offset.
+            offset = content_rect.min.to_vec2() + local * scale - anchor.to_vec2();
         } else if overflow != egui::Vec2::ZERO {
             offset -= wheel;
         } else if wheel.y.abs() > 18.0 && app.session.tool.marquee.is_none() && !app.session.tool.dragging() {

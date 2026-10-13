@@ -1131,6 +1131,9 @@ fn js_now() -> f64 {
 mod ime_tests;
 
 #[cfg(test)]
+mod pinch_tests;
+
+#[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 

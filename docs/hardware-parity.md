@@ -1,6 +1,6 @@
 # Hardware parity with PowerPoint
 
-> **Last reviewed:** 2026-10-10 · **Last updated:** 2026-10-12 · **Change:** minor (IME input, #101; previous: major, created from the renderer, media and windowing code) · **Target:** Microsoft PowerPoint for Mac 16.113 (Microsoft 365); PowerPoint for Windows where noted
+> **Last reviewed:** 2026-10-10 · **Last updated:** 2026-10-14 · **Change:** minor (pinch zoom and two-finger pan; previous: IME input, #101) · **Target:** Microsoft PowerPoint for Mac 16.113 (Microsoft 365); PowerPoint for Windows where noted
 
 What hardware PowerPoint uses and what DeckCraft uses, per platform. Dimension score: **~40%
 ready** (estimated), **25–45 h** to parity. Performance (unmeasured, ~55%) is tracked here too
@@ -43,7 +43,7 @@ because it mostly follows from hardware use.
 |---|---|---|
 | Keyboard and presentation clickers (Page Up/Down, B, Esc) | yes | yes |
 | Mouse and trackpad scroll | yes | yes |
-| Pinch to zoom, two-finger gestures | yes | no |
+| Pinch to zoom, two-finger gestures | yes | yes: a pinch zooms Normal view around the pointer and resizes Slide Sorter thumbnails; a two-finger scroll pans a zoomed slide |
 | Pen pressure and tilt for ink (Apple Pencil via Sidecar, Windows Ink) | yes | no: ink strokes have constant width |
 | Touch screens (Windows) | yes | basic pointer only |
 | IME input methods for CJK text | yes | yes: composed in place, underlined, candidate window at the caret (#101) |
@@ -63,7 +63,7 @@ outlines every frame (#67, fix open), and the decoders run in software.
 | GPU slide rasterization (vello's GPU/hybrid path) | 12–20 |
 | Hardware video decode (copy FilmCraft's VideoToolbox / Media Foundation / VA-API paths) | 8–14 |
 | Windows GPU startup robustness: backend probing, software fallback (#40, #59) | 4–8 (counted under Stability) |
-| Pen pressure, pinch zoom | 3–6 |
+| Pen pressure and tilt | 2–4 |
 | Benchmark suite (`cargo xtask bench`) and a first performance pass | 6–12 (Performance dimension) |
 | **Hardware total** | **~26–45** |
 
@@ -71,5 +71,6 @@ outlines every frame (#67, fix open), and the decoders run in software.
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-10-14 | minor | Pinch zoom and two-finger pan in Normal view and the Slide Sorter. The ~40% estimate stays: rasterization, decode, the second display and pen pressure remain |
 | 2026-10-12 | minor | IME input methods (#101) |
 | 2026-10-10 | major | Created: rendering, media, displays, input and performance against PowerPoint 16.113 |
