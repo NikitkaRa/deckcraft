@@ -270,7 +270,16 @@ pub fn save_bytes(doc: &Presentation, format: &str) -> Result<Vec<u8>> {
                 let side = |k: usize| l.sides[k].or(l.border);
                 Some(deckcraft_pptx::odp_write::CellLook { fill: l.fill, text: l.text, bold: l.bold, borders: [side(0), side(1), side(2), side(3)] })
             };
-            deckcraft_pptx::odp_write::export_odp_with(doc, Some(&look)).map_err(|e| EngineError::Other(e.to_string()))
+            // Charts (and objects we only keep) are drawn as pictures.
+            let picture = |p: &Presentation, sl: &deckcraft_model::Slide, sh: &deckcraft_model::Shape| {
+                let mut one = sl.clone();
+                let mut s = sh.clone();
+                s.xfrm = Some(deckcraft_model::resolve::Ctx::for_slide(p, sl).map(|c| deckcraft_model::resolve::xfrm(&c, sh)).unwrap_or_default());
+                one.shapes = vec![s];
+                deckcraft_render::render_shape_tight(p, &one, sh.id, 2.0).map(|img| img.to_png())
+            };
+            let hooks = deckcraft_pptx::odp_write::Hooks { cell_look: Some(&look), picture: Some(&picture) };
+            deckcraft_pptx::odp_write::export_odp_with(doc, hooks).map_err(|e| EngineError::Other(e.to_string()))
         }
         "pdf" => deckcraft_pdf::export(doc, &Default::default()).map_err(|e| EngineError::Other(e.to_string())),
         "gif" => gif_bytes(doc, &Value::Null),

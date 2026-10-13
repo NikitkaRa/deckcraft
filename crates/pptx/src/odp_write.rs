@@ -4,8 +4,12 @@
 //!
 //! Everything is written with explicit formatting (automatic styles resolved through the
 //! placeholder and theme chain), so the file looks the same without our masters. Gradients keep
-//! their first and last colours; dashes map to ODF stroke dashes. Not written yet: charts,
-//! media, ink, patterns and picture fills of shapes, shadows and other effects, animations.
+//! their first and last colours; dashes map to ODF stroke dashes; line patterns become hatches
+//! and dotted patterns a blended colour; picture fills become bitmap fills. Charts (and objects
+//! we only keep) are written as pictures drawn by the caller's hook; audio and video are embedded
+//! as plugins; ink strokes become polylines; entrance, exit and motion-path animations become ODF
+//! animation nodes (other effects fall back to a fade or are left out). Not written yet: shadows
+//! and other effects, emphasis animations.
 
 use std::collections::HashMap;
 use std::fmt::Write as _;
@@ -25,7 +29,8 @@ use crate::xml::{A, W};
 
 pub const MIMETYPE: &str = "application/vnd.oasis.opendocument.presentation";
 
-const NS: [(&str, &str); 12] = [
+const NS: [(&str, &str); 13] = [
+    ("xmlns:anim", "urn:oasis:names:tc:opendocument:xmlns:animation:1.0"),
     ("xmlns:office", "urn:oasis:names:tc:opendocument:xmlns:office:1.0"),
     ("xmlns:style", "urn:oasis:names:tc:opendocument:xmlns:style:1.0"),
     ("xmlns:text", "urn:oasis:names:tc:opendocument:xmlns:text:1.0"),
@@ -105,6 +110,17 @@ pub struct CellLook {
 /// Supplies [`CellLook`]s: `(presentation, slide, table, row, column)`.
 pub type CellLookFn<'a> = &'a dyn Fn(&Presentation, &Slide, &Table, usize, usize) -> Option<CellLook>;
 
+/// Draws a shape ODF can't describe (charts, kept objects) as PNG bytes: `(presentation, slide,
+/// shape)`.
+pub type PictureFn<'a> = &'a dyn Fn(&Presentation, &Slide, &Shape) -> Option<Vec<u8>>;
+
+/// What the caller can supply that this crate can't compute itself.
+#[derive(Default, Clone, Copy)]
+pub struct Hooks<'a> {
+    pub cell_look: Option<CellLookFn<'a>>,
+    pub picture: Option<PictureFn<'a>>,
+}
+
 struct Out<'a> {
     pres: &'a Presentation,
     styles: Styles,
@@ -112,6 +128,12 @@ struct Out<'a> {
     named: String,
     named_seen: HashMap<String, String>,
     cell_look: Option<CellLookFn<'a>>,
+    picture_hook: Option<PictureFn<'a>>,
+    /// The slide being written, and its animated shapes (they get `draw:id`s).
+    slide: Option<&'a Slide>,
+    animated: Vec<deckcraft_model::ShapeId>,
+    /// Generated pictures: (package path, PNG bytes).
+    generated: Vec<(String, Vec<u8>)>,
     media: Vec<(MediaId, String)>,
     skipped: usize,
 }
@@ -142,9 +164,19 @@ impl Out<'_> {
             "image/webp" => "webp",
             "image/x-emf" | "image/emf" => "emf",
             "image/x-wmf" | "image/wmf" => "wmf",
+            "video/mp4" => "mp4",
+            "video/quicktime" => "mov",
+            "video/webm" => "webm",
+            "video/x-msvideo" => "avi",
+            "video/x-ms-wmv" => "wmv",
+            "audio/mpeg" => "mp3",
+            "audio/wav" | "audio/x-wav" => "wav",
+            "audio/ogg" => "ogg",
+            "audio/mp4" | "audio/x-m4a" => "m4a",
             _ => "bin",
         };
-        let name = format!("Pictures/media{}.{ext}", id.0);
+        let folder = if m.content_type.starts_with("image/") { "Pictures" } else { "Media" };
+        let name = format!("{folder}/media{}.{ext}", id.0);
         self.media.push((id, name.clone()));
         Some(name)
     }
@@ -306,9 +338,74 @@ fn fill_props(o: &mut Out, ctx: &Ctx, f: Option<&Fill>, ph: Option<Rgba>) -> Vec
             vec![("draw:fill", "gradient".into()), ("draw:fill-gradient-name", name)]
         }
         Some(Fill::Gradient(g)) => g.stops.first().map(|s| solid(ctx.color(&s.color, ph))).unwrap_or_else(|| vec![("draw:fill", "none".into())]),
-        Some(Fill::Pattern(pf)) => solid(ctx.color(&pf.bg, ph)),
+        Some(Fill::Pattern(pf)) => {
+            let (fg, bg) = (ctx.color(&pf.fg, ph), ctx.color(&pf.bg, ph));
+            match hatch(&pf.preset) {
+                Some((style, angle, dist)) => {
+                    let key = format!("{style}/{angle}/{dist}/{}", hex(fg));
+                    let name = o.named("Hatch_", key, |n| {
+                        format!(
+                            "<draw:hatch draw:name=\"{n}\" draw:style=\"{style}\" draw:color=\"{}\" draw:distance=\"{}\" draw:rotation=\"{}\"/>",
+                            hex(fg),
+                            cm(dist),
+                            angle * 10
+                        )
+                    });
+                    vec![
+                        ("draw:fill", "hatch".into()),
+                        ("draw:fill-hatch-name", name),
+                        ("draw:fill-hatch-solid", "true".into()),
+                        ("draw:fill-color", hex(bg)),
+                    ]
+                }
+                // Dotted and textured patterns: their average colour.
+                None => {
+                    let k = pattern_cover(&pf.preset);
+                    let mix = |a: u8, b: u8| (a as f64 * k + b as f64 * (1.0 - k)).round() as u8;
+                    solid(Rgba { r: mix(fg.r, bg.r), g: mix(fg.g, bg.g), b: mix(fg.b, bg.b), a: 255 })
+                }
+            }
+        }
+        Some(Fill::Picture(pf)) => {
+            match o.picture(pf.media) {
+                Some(href) => {
+                    let name = o.named("Bitmap_", format!("bmp:{href}"), |n| {
+                    format!("<draw:fill-image draw:name=\"{n}\" xlink:href=\"{}\" xlink:type=\"simple\" xlink:show=\"embed\" xlink:actuate=\"onLoad\"/>", crate::xml::esc_attr(&href))
+                });
+                    let repeat = if matches!(pf.mode, deckcraft_model::style::PictureMode::Tile { .. }) { "repeat" } else { "stretch" };
+                    vec![("draw:fill", "bitmap".into()), ("draw:fill-image-name", name), ("style:repeat", repeat.into())]
+                }
+                None => vec![("draw:fill", "none".into())],
+            }
+        }
         _ => vec![("draw:fill", "none".into())],
     }
+}
+
+/// A line pattern as an ODF hatch: (style, rotation in degrees, line distance in points).
+fn hatch(preset: &str) -> Option<(&'static str, i32, f64)> {
+    Some(match preset {
+        "horz" => ("single", 0, 6.0),
+        "ltHorz" | "narHorz" => ("single", 0, 3.0),
+        "dkHorz" | "wdHorz" => ("single", 0, 4.0),
+        "dashHorz" => ("single", 0, 6.0),
+        "vert" => ("single", 90, 6.0),
+        "ltVert" | "narVert" => ("single", 90, 3.0),
+        "dkVert" | "wdVert" | "dashVert" => ("single", 90, 4.0),
+        "upDiag" | "wdUpDiag" | "dashUpDiag" => ("single", 45, 5.0),
+        "ltUpDiag" | "dkUpDiag" => ("single", 45, 3.0),
+        "dnDiag" | "wdDnDiag" | "dashDnDiag" => ("single", 135, 5.0),
+        "ltDnDiag" | "dkDnDiag" => ("single", 135, 3.0),
+        "cross" | "lgGrid" => ("double", 0, 6.0),
+        "smGrid" => ("double", 0, 3.0),
+        "diagCross" | "openDmnd" => ("double", 45, 5.0),
+        _ => return None,
+    })
+}
+
+/// How much of a dotted pattern is foreground (`pct20` → 0.2).
+fn pattern_cover(preset: &str) -> f64 {
+    preset.strip_prefix("pct").and_then(|n| n.parse::<f64>().ok()).map(|v| v / 100.0).unwrap_or(0.5).clamp(0.0, 1.0)
 }
 
 /// A DrawingML dash as ODF `(dots1, dots1-length, dots2, dots2-length, distance)`, lengths as
@@ -609,7 +706,10 @@ fn shape(o: &mut Out, ctx: &Ctx, sh: &Shape, xf: Xfrm, w: &mut String) {
     if sh.hidden {
         return;
     }
-    let name = if sh.name.is_empty() { String::new() } else { format!(" draw:name=\"{}\"", crate::xml::esc_attr(&sh.name)) };
+    let mut name = if sh.name.is_empty() { String::new() } else { format!(" draw:name=\"{}\"", crate::xml::esc_attr(&sh.name)) };
+    if o.animated.contains(&sh.id) {
+        let _ = write!(name, " draw:id=\"shape{0}\" xml:id=\"shape{0}\"", sh.id.0);
+    }
     let title = |w: &mut String| {
         if !sh.title.is_empty() {
             let _ = write!(w, "<svg:title>{}</svg:title>", esc(&sh.title));
@@ -678,7 +778,87 @@ fn shape(o: &mut Out, ctx: &Ctx, sh: &Shape, xf: Xfrm, w: &mut String) {
             w.push_str("</draw:g>");
         }
         ShapeKind::Table(t) => table(o, ctx, sh, t, xf, &name, w),
-        _ => o.skipped += 1,
+        ShapeKind::Media(m) => {
+            let Some(href) = o.picture(m.media) else {
+                o.skipped += 1;
+                return;
+            };
+            let mime = o.pres.media(m.media).map(|x| x.content_type.clone()).unwrap_or_default();
+            let _ = write!(w, "<draw:frame{name}{}>", attrs(&place(&xf)));
+            let _ = write!(
+                w,
+                "<draw:plugin xlink:href=\"{}\" xlink:type=\"simple\" xlink:show=\"embed\" xlink:actuate=\"onLoad\" draw:mime-type=\"{}\"><draw:param draw:name=\"Loop\" draw:value=\"{}\"/><draw:param draw:name=\"Mute\" draw:value=\"{}\"/><draw:param draw:name=\"VolumeDB\" draw:value=\"{}\"/></draw:plugin>",
+                crate::xml::esc_attr(&href),
+                crate::xml::esc_attr(&mime),
+                m.loop_play,
+                m.volume <= 0.0,
+                if m.volume > 0.0 { (20.0 * m.volume.log10()).round() as i64 } else { 0 }
+            );
+            title(w);
+            w.push_str("</draw:frame>");
+        }
+        ShapeKind::Ink { strokes } => {
+            let _ = write!(w, "<draw:g{name}>");
+            for st in strokes.iter().filter(|s| s.points.len() >= 2) {
+                let (mut x0, mut y0, mut x1, mut y1) = (f64::MAX, f64::MAX, f64::MIN, f64::MIN);
+                for &(x, y, _) in &st.points {
+                    (x0, y0, x1, y1) = (x0.min(x), y0.min(y), x1.max(x), y1.max(y));
+                }
+                let (bw, bh) = ((x1 - x0).max(0.01), (y1 - y0).max(0.01));
+                let pts: Vec<String> =
+                    st.points.iter().map(|&(x, y, _)| format!("{},{}", ((x - x0) * 100.0).round(), ((y - y0) * 100.0).round())).collect();
+                let mut a = vec![
+                    ("draw:fill", "none".to_string()),
+                    ("draw:stroke", "solid".into()),
+                    ("svg:stroke-color", hex(st.color)),
+                    ("svg:stroke-width", cm(st.width)),
+                    ("svg:stroke-linecap", "round".into()),
+                    ("draw:stroke-linejoin", "round".into()),
+                ];
+                if st.highlighter || st.color.a < 255 {
+                    let op = if st.highlighter { 50.0 } else { st.color.a as f64 / 2.55 };
+                    a.push(("svg:stroke-opacity", format!("{op:.0}%")));
+                }
+                let gs = o.styles.get("gr", "graphic", format!("<style:graphic-properties{}/>", attrs(&a)));
+                let _ = write!(
+                    w,
+                    "<draw:polyline draw:style-name=\"{gs}\" svg:x=\"{}\" svg:y=\"{}\" svg:width=\"{}\" svg:height=\"{}\" svg:viewBox=\"0 0 {} {}\" draw:points=\"{}\"><text:p/></draw:polyline>",
+                    cm(x0),
+                    cm(y0),
+                    cm(bw),
+                    cm(bh),
+                    (bw * 100.0).round().max(1.0),
+                    (bh * 100.0).round().max(1.0),
+                    pts.join(" ")
+                );
+            }
+            w.push_str("</draw:g>");
+        }
+        ShapeKind::Chart(_) | ShapeKind::Opaque { .. } | ShapeKind::Model3d { .. } => {
+            let png = match (o.picture_hook, o.slide) {
+                (Some(f), Some(sl)) => f(o.pres, sl, sh),
+                _ => None,
+            };
+            let png = png.or_else(|| match &sh.kind {
+                ShapeKind::Opaque { preview: Some(id), .. } | ShapeKind::Model3d { poster: Some(id), .. } => {
+                    o.pres.media(*id).map(|m| m.data.as_ref().clone())
+                }
+                _ => None,
+            });
+            let Some(png) = png else {
+                o.skipped += 1;
+                return;
+            };
+            let href = format!("Pictures/object{}-{}.png", sh.id.0, o.generated.len() + 1);
+            o.generated.push((href.clone(), png));
+            let _ = write!(w, "<draw:frame{name}{}>", attrs(&place(&xf)));
+            let _ = write!(
+                w,
+                "<draw:image xlink:href=\"{href}\" xlink:type=\"simple\" xlink:show=\"embed\" xlink:actuate=\"onLoad\"><text:p/></draw:image>"
+            );
+            title(w);
+            w.push_str("</draw:frame>");
+        }
     }
 }
 
@@ -813,6 +993,132 @@ fn table(o: &mut Out, ctx: &Ctx, sh: &Shape, t: &Table, xf: Xfrm, name: &str, w:
     w.push_str("</table:table></draw:frame>");
 }
 
+/// What an animation becomes in ODF: (preset class, preset id, smil transition type/subtype).
+fn anim_kind(a: &deckcraft_model::anim::Animation) -> Option<(&'static str, String, Option<(&'static str, &'static str)>)> {
+    use deckcraft_model::anim::AnimClass;
+    let filter = match a.effect.as_str() {
+        "appear" | "disappear" => None,
+        "wipe" => Some(("barWipe", if matches!(a.option.as_str(), "u" | "d" | "fromTop" | "fromBottom") { "topToBottom" } else { "leftToRight" })),
+        "split" => Some(("barnDoorWipe", "vertical")),
+        "wheel" => Some(("pinWheelWipe", "oneBlade")),
+        "circle" | "shape" => Some(("ellipseWipe", "circle")),
+        "dissolve" | "dissolveIn" | "dissolveOut" => Some(("dissolve", "defaultSubtype")),
+        "checkerboard" => Some(("checkerBoardWipe", "across")),
+        "blinds" => Some(("blindsWipe", "vertical")),
+        "randomBars" => Some(("randomBarWipe", "vertical")),
+        _ => Some(("fade", "crossfade")),
+    };
+    match a.class {
+        AnimClass::Entrance => Some(("entrance", format!("ooo-entrance-{}", if filter.is_none() { "appear" } else { "fade-in" }), filter)),
+        AnimClass::Exit => Some(("exit", format!("ooo-exit-{}", if filter.is_none() { "disappear" } else { "fade-out" }), filter)),
+        AnimClass::Path => a.path.as_ref().map(|_| ("motion-path", "ooo-motionpath-custom".to_string(), None)),
+        _ => None,
+    }
+}
+
+fn secs(ms: u32) -> String {
+    format!("{}.{:03}s", ms / 1000, ms % 1000)
+}
+
+/// The slide's entrance, exit and motion-path effects as an ODF main sequence: one `par` per
+/// click, then the effects starting with it (with previous) or after it.
+fn animations(sl: &Slide, w: &mut String) {
+    use deckcraft_model::anim::AnimStart;
+    let list: Vec<_> = sl.animations.iter().filter(|a| a.trigger.is_none()).filter_map(|a| anim_kind(a).map(|k| (a, k))).collect();
+    if list.is_empty() {
+        return;
+    }
+    w.push_str("<anim:par presentation:node-type=\"timing-root\"><anim:seq presentation:node-type=\"main-sequence\">");
+    let mut open_click = false;
+    let mut open_group = false;
+    let mut group_start = 0u32;
+    let mut group_end = 0u32;
+    for (i, (a, (class, preset, filter))) in list.iter().enumerate() {
+        let new_click = i == 0 || a.start == AnimStart::OnClick;
+        if new_click {
+            if open_group {
+                w.push_str("</anim:par>");
+            }
+            if open_click {
+                w.push_str("</anim:par>");
+            }
+            let begin = if a.start == AnimStart::OnClick { "indefinite" } else { "0s" };
+            let _ = write!(w, "<anim:par smil:begin=\"{begin}\" smil:fill=\"hold\">");
+            open_click = true;
+            open_group = false;
+            group_end = 0;
+        }
+        if new_click || a.start == AnimStart::AfterPrevious {
+            if open_group {
+                w.push_str("</anim:par>");
+            }
+            group_start = if new_click { 0 } else { group_end };
+            let _ = write!(w, "<anim:par smil:begin=\"{}\" smil:fill=\"hold\">", secs(group_start));
+            open_group = true;
+        }
+        let node = match a.start {
+            AnimStart::OnClick => "on-click",
+            AnimStart::WithPrevious => "with-previous",
+            AnimStart::AfterPrevious => "after-previous",
+        };
+        let dur = a.duration_ms.max(1);
+        group_end = group_end.max(group_start + a.delay_ms + dur);
+        let target = format!("shape{}", a.shape.0);
+        let _ = write!(
+            w,
+            "<anim:par smil:begin=\"{}\" smil:fill=\"hold\" presentation:node-type=\"{node}\" presentation:preset-class=\"{class}\" presentation:preset-id=\"{preset}\">",
+            secs(a.delay_ms)
+        );
+        match *class {
+            "entrance" => {
+                let _ = write!(
+                    w,
+                    "<anim:set smil:begin=\"0s\" smil:dur=\"0.001s\" smil:fill=\"hold\" smil:targetElement=\"{target}\" smil:attributeName=\"visibility\" smil:to=\"visible\"/>"
+                );
+                if let Some((ty, sub)) = filter {
+                    let _ = write!(
+                        w,
+                        "<anim:transitionFilter smil:dur=\"{}\" smil:targetElement=\"{target}\" smil:type=\"{ty}\" smil:subtype=\"{sub}\"/>",
+                        secs(dur)
+                    );
+                }
+            }
+            "exit" => {
+                if let Some((ty, sub)) = filter {
+                    let _ = write!(
+                        w,
+                        "<anim:transitionFilter smil:dur=\"{}\" smil:targetElement=\"{target}\" smil:type=\"{ty}\" smil:subtype=\"{sub}\" smil:mode=\"out\"/>",
+                        secs(dur)
+                    );
+                }
+                let end = if filter.is_some() { dur } else { 0 };
+                let _ = write!(
+                    w,
+                    "<anim:set smil:begin=\"{}\" smil:dur=\"0.001s\" smil:fill=\"hold\" smil:targetElement=\"{target}\" smil:attributeName=\"visibility\" smil:to=\"hidden\"/>",
+                    secs(end)
+                );
+            }
+            _ => {
+                let path: String = a.path.as_deref().unwrap_or("").split_whitespace().filter(|t| *t != "E").collect::<Vec<_>>().join(" ");
+                let _ = write!(
+                    w,
+                    "<anim:animateMotion smil:dur=\"{}\" smil:fill=\"hold\" smil:targetElement=\"{target}\" svg:path=\"{}\"/>",
+                    secs(dur),
+                    crate::xml::esc_attr(&path)
+                );
+            }
+        }
+        w.push_str("</anim:par>");
+    }
+    if open_group {
+        w.push_str("</anim:par>");
+    }
+    if open_click {
+        w.push_str("</anim:par>");
+    }
+    w.push_str("</anim:seq></anim:par>");
+}
+
 fn package(files: Vec<(String, Vec<u8>, bool)>) -> Result<Vec<u8>, PptxError> {
     let err = |e: &dyn std::fmt::Display| PptxError::Write(e.to_string());
     let mut zw = zip::ZipWriter::new(Cursor::new(Vec::new()));
@@ -830,7 +1136,7 @@ fn package(files: Vec<(String, Vec<u8>, bool)>) -> Result<Vec<u8>, PptxError> {
 
 /// Write `p` as an OpenDocument presentation.
 pub fn export_odp(p: &Presentation) -> Result<Vec<u8>, PptxError> {
-    export_odp_with(p, None)
+    export_odp_with(p, Hooks::default())
 }
 
 /// ODF `smil:type`, `smil:subtype` and whether it runs in reverse, for a transition.
@@ -870,13 +1176,28 @@ fn smil(t: &deckcraft_model::anim::Transition) -> Option<(&'static str, &'static
     })
 }
 
-/// Write `p` as an OpenDocument presentation; `cell_look` gives table cells their table style's
-/// look (the engine passes the renderer's; without it only explicit cell formatting is written).
-pub fn export_odp_with(p: &Presentation, cell_look: Option<CellLookFn>) -> Result<Vec<u8>, PptxError> {
-    let mut o = Out { pres: p, styles: Styles::default(), named: String::new(), named_seen: HashMap::new(), cell_look, media: vec![], skipped: 0 };
+/// Write `p` as an OpenDocument presentation. `hooks.cell_look` gives table cells their table
+/// style's look and `hooks.picture` draws charts (the engine passes the renderer's); without
+/// them only explicit cell formatting is written and charts are left out.
+pub fn export_odp_with(p: &Presentation, hooks: Hooks) -> Result<Vec<u8>, PptxError> {
+    let mut o = Out {
+        pres: p,
+        styles: Styles::default(),
+        named: String::new(),
+        named_seen: HashMap::new(),
+        cell_look: hooks.cell_look,
+        picture_hook: hooks.picture,
+        slide: None,
+        animated: vec![],
+        generated: vec![],
+        media: vec![],
+        skipped: 0,
+    };
     let mut body = String::new();
     for (i, sl) in p.slides.iter().enumerate() {
         let Some(ctx) = Ctx::for_slide(p, sl) else { continue };
+        o.slide = Some(sl);
+        o.animated = sl.animations.iter().filter(|a| anim_kind(a).is_some()).map(|a| a.shape).collect();
         let (bg, ph) = resolve::background(&ctx, Some(sl));
         let mut a = fill_props(&mut o, &ctx, Some(&bg), ph);
         if let Some(t) = &sl.transition {
@@ -960,6 +1281,7 @@ pub fn export_odp_with(p: &Presentation, cell_look: Option<CellLookFn>) -> Resul
             }
             body.push_str("</draw:text-box></draw:frame></presentation:notes>");
         }
+        animations(sl, &mut body);
         body.push_str("</draw:page>");
     }
 
@@ -1011,6 +1333,10 @@ pub fn export_odp_with(p: &Presentation, cell_look: Option<CellLookFn>) -> Resul
         let Some(m) = p.media(*id) else { continue };
         manifest.empty("manifest:file-entry", A::new().a("manifest:full-path", name).a("manifest:media-type", &m.content_type));
         files.push((name.clone(), m.data.as_ref().clone(), false));
+    }
+    for (name, data) in &o.generated {
+        manifest.empty("manifest:file-entry", A::new().a("manifest:full-path", name).a("manifest:media-type", "image/png"));
+        files.push((name.clone(), data.clone(), false));
     }
     manifest.close("manifest:manifest");
     files.push(("META-INF/manifest.xml".into(), manifest.finish(), true));
@@ -1108,6 +1434,45 @@ mod tests {
         let sl = std::sync::Arc::make_mut(&mut p.slides[0]);
         sl.show_master_shapes = false;
         assert!(!read(&export_odp(&p).unwrap(), "content.xml").contains("Logo bar"));
+    }
+
+    #[test]
+    fn ink_media_and_picture_fills() {
+        use deckcraft_model::{InkStroke, MediaClip, ShapeId};
+        let mut p = deckcraft_model::defaults::new_presentation(None);
+        let png = p.add_media("dot.png", "image/png", crate::png::transparent_1x1()).unwrap();
+        let clip = p.add_media("clip.mp4", "video/mp4", vec![0; 8]).unwrap();
+        let sl = std::sync::Arc::make_mut(&mut p.slides[0]);
+        sl.shapes.push(Shape {
+            id: ShapeId(601),
+            xfrm: Some(Xfrm::new(10.0, 10.0, 100.0, 100.0)),
+            kind: ShapeKind::Ink {
+                strokes: vec![InkStroke { points: vec![(10.0, 10.0, 1.0), (60.0, 80.0, 1.0)], width: 3.0, highlighter: true, ..Default::default() }],
+            },
+            ..Default::default()
+        });
+        sl.shapes.push(Shape {
+            id: ShapeId(602),
+            xfrm: Some(Xfrm::new(200.0, 10.0, 160.0, 90.0)),
+            kind: ShapeKind::Media(MediaClip { media: clip, video: true, loop_play: true, volume: 0.5, ..Default::default() }),
+            ..Default::default()
+        });
+        sl.shapes.push(Shape {
+            id: ShapeId(603),
+            xfrm: Some(Xfrm::new(400.0, 10.0, 100.0, 100.0)),
+            fill: Some(deckcraft_model::style::Fill::Picture(deckcraft_model::style::PictureFill { media: png, ..Default::default() })),
+            ..Default::default()
+        });
+        let bytes = export_odp(&p).unwrap();
+        let content = read(&bytes, "content.xml");
+        let styles = read(&bytes, "styles.xml");
+        assert!(content.contains("<draw:polyline ") && content.contains("svg:stroke-opacity=\"50%\""), "{content}");
+        assert!(
+            content.contains("<draw:plugin ") && content.contains("Media/") && content.contains("draw:name=\"Loop\" draw:value=\"true\""),
+            "{content}"
+        );
+        assert!(styles.contains("<draw:fill-image ") && content.contains("draw:fill=\"bitmap\""), "{styles}");
+        assert!(read(&bytes, "META-INF/manifest.xml").contains("video/mp4"));
     }
 
     #[test]

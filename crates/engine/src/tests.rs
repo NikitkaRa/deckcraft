@@ -3611,6 +3611,10 @@ fn exports_odp_with_text_shapes_pictures_and_notes() {
     s.execute("shape.fill", &json!({"gradient": {"stops": [[0, "#ff0000"], [1, "#0000ff"]], "angle": 90}})).unwrap();
     s.execute("shape.line", &json!({"width": 3, "color": "#000000", "dash": "dash"})).unwrap();
     s.execute("insert.table", &json!({"rows": 3, "cols": 3, "rect": [40, 40, 400, 120]})).unwrap();
+    s.execute("insert.chart", &json!({"type": "bar", "rect": [480, 180, 220, 110]})).unwrap();
+    s.execute("shape.insert", &json!({"preset": "rect", "rect": [740, 380, 120, 80]})).unwrap();
+    s.execute("shape.fill", &json!({"pattern": {"preset": "dnDiag", "fg": "#000000", "bg": "#ffff00"}})).unwrap();
+    s.execute("animation.set", &json!({"effect": "fade", "class": "entrance"})).unwrap();
     let dir = std::env::temp_dir().join(format!("deckcraft-odp-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let path = std::env::var("ODP_OUT").map(std::path::PathBuf::from).unwrap_or_else(|_| dir.join("deck.odp"));
@@ -3631,5 +3635,8 @@ fn exports_odp_with_text_shapes_pictures_and_notes() {
     assert!(content.contains("smil:type=\"pushWipe\"") && content.contains("smil:subtype=\"fromRight\""));
     assert!(content.contains("fo:clip=\"rect(") && content.contains("draw:fill=\"gradient\"") && content.contains("draw:stroke=\"dash\""));
     assert!(styles.contains("<draw:gradient ") && styles.contains("draw:start-color=\"#ff0000\"") && styles.contains("<draw:stroke-dash "));
+    assert!(content.contains("Pictures/object"), "the chart is drawn as a picture");
+    assert!(styles.contains("<draw:hatch ") && content.contains("draw:fill=\"hatch\""));
+    assert!(content.contains("presentation:preset-id=\"ooo-entrance-fade-in\"") && content.contains("smil:targetElement=\"shape"));
     let _ = std::fs::remove_dir_all(&dir);
 }

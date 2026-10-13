@@ -2341,10 +2341,19 @@ pub fn render_shapes(pres: &Presentation, slide: &Slide, ids: &[ShapeId], scale:
 
 /// Render one shape alone onto a transparent canvas (drag previews, copy as picture).
 pub fn render_shape(pres: &Presentation, slide: &Slide, id: ShapeId, scale: f64) -> Option<Image> {
+    render_shape_margin(pres, slide, id, scale, 8.0)
+}
+
+/// [`render_shape`] cropped to the shape's own box (pictures that stand in for the shape).
+pub fn render_shape_tight(pres: &Presentation, slide: &Slide, id: ShapeId, scale: f64) -> Option<Image> {
+    render_shape_margin(pres, slide, id, scale, 0.0)
+}
+
+fn render_shape_margin(pres: &Presentation, slide: &Slide, id: ShapeId, scale: f64, margin: f64) -> Option<Image> {
     let rctx = Ctx::for_slide(pres, slide)?;
     let s = slide.shape(id)?;
     let x = resolve::xfrm(&rctx, s);
-    let b = x.bounds().inflate(8.0, 8.0);
+    let b = x.bounds().inflate(margin, margin);
     let w = (b.width() * scale).ceil().clamp(1.0, MAX_SIDE as f64) as u16;
     let h = (b.height() * scale).ceil().clamp(1.0, MAX_SIDE as f64) as u16;
     let mut ctx = RenderContext::new_with(w, h, vello_cpu::RenderSettings { num_threads: 0, ..Default::default() });
