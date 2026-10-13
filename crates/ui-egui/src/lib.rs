@@ -39,10 +39,31 @@ pub use control::{ControlRequest, ControlResponse};
 pub type ReadFn = Box<dyn Fn(&str) -> Result<Vec<u8>, String>>;
 pub type WriteFn = Box<dyn FnMut(&str, &[u8]) -> Result<(), String>>;
 pub type PickFn = Box<dyn FnMut(&str) -> Option<String>>;
-pub type OpenAsyncFn = Box<dyn FnMut(&str)>;
+/// Asynchronous open dialog for a purpose (`open`, `picture`, `audio`, `video`). The host hands the
+/// chosen file back through [`Inbox`] with the same ticket, so the app can apply it to the document
+/// and slide the request came from.
+pub type OpenAsyncFn = Box<dyn FnMut(&str, u64)>;
 pub type DownloadFn = Box<dyn FnMut(&str, &[u8])>;
-/// Files `(name, bytes)` delivered asynchronously by the host (web file picker, dropped files).
-pub type Inbox = std::sync::Arc<std::sync::Mutex<Vec<(String, Vec<u8>)>>>;
+/// A file delivered asynchronously by the host.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct InboxFile {
+    pub name: String,
+    pub bytes: Vec<u8>,
+    /// The ticket of the [`OpenAsyncFn`] request this file answers; `None` for a dropped file.
+    pub ticket: Option<u64>,
+}
+
+/// Files delivered asynchronously by the host (web file picker, dropped files).
+pub type Inbox = std::sync::Arc<std::sync::Mutex<Vec<InboxFile>>>;
+
+/// Where an asynchronous file request applies, captured when it starts.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PendingPick {
+    /// Command the chosen file runs (`file.openBytes`, `insert.picture`…).
+    pub cmd: &'static str,
+    /// Document and slide that were current when the request started (insertions only).
+    pub target: Option<(u64, deckcraft_model::SlideId)>,
+}
 
 /// Platform services injected by the host (desktop or web).
 #[derive(Default)]
@@ -227,6 +248,9 @@ pub struct SlideApp {
     pub(crate) thumb_drag: Option<(usize, usize)>,
     /// Selection pane: folded groups, renaming, drag and drop.
     pub selpane: selpane::State,
+    /// Asynchronous file requests still waiting for the host, by ticket.
+    pub(crate) pending_picks: std::collections::HashMap<u64, PendingPick>,
+    pub(crate) next_pick: u64,
 }
 
 impl SlideApp {
@@ -235,6 +259,8 @@ impl SlideApp {
         SlideApp {
             session,
             services,
+            pending_picks: std::collections::HashMap::new(),
+            next_pick: 0,
             ui: UiState::default(),
             textures: textures::Textures::default(),
             control_rx: None,
@@ -566,8 +592,8 @@ impl SlideApp {
             if let Some(path) = pick("open") {
                 let _ = self.open_path(&path);
             }
-        } else if let Some(f) = self.services.open_async.as_mut() {
-            f("open");
+        } else {
+            self.request_async("open", "file.openBytes", None);
         }
     }
 
@@ -580,7 +606,7 @@ impl SlideApp {
         Ok(())
     }
 
-    fn pick_and_insert(&mut self, purpose: &str, cmd: &str) {
+    fn pick_and_insert(&mut self, purpose: &str, cmd: &'static str) {
         if let Some(pick) = self.services.pick_open.as_mut() {
             if let Some(path) = pick(purpose) {
                 let r = match self.services.read.as_ref().map(|r| r(&path)) {
@@ -594,8 +620,62 @@ impl SlideApp {
                     self.set_status(e.to_string());
                 }
             }
-        } else if let Some(f) = self.services.open_async.as_mut() {
-            f(purpose);
+        } else {
+            let target = self.session.active().and_then(|d| d.current_slide().map(|s| (d.uid, s.id)));
+            self.request_async(purpose, cmd, target);
+        }
+    }
+
+    /// Start an asynchronous pick, remembering what the answer is for.
+    fn request_async(&mut self, purpose: &str, cmd: &'static str, target: Option<(u64, deckcraft_model::SlideId)>) {
+        let Some(f) = self.services.open_async.as_mut() else { return };
+        self.next_pick = self.next_pick.wrapping_add(1);
+        let ticket = self.next_pick;
+        self.pending_picks.insert(ticket, PendingPick { cmd, target });
+        f(purpose, ticket);
+    }
+
+    /// The answer to an asynchronous pick: run its command on the document and slide it was started
+    /// from, or say why it can't be, without touching whatever is current now.
+    fn apply_picked(&mut self, ticket: u64, name: &str, bytes: &[u8]) {
+        let Some(pick) = self.pending_picks.remove(&ticket) else { return };
+        let params = json!({"name": name, "data": deckcraft_engine::cmd::base64_encode(bytes)});
+        let Some((uid, slide)) = pick.target else {
+            if pick.cmd == "file.openBytes" {
+                if let Err(e) = self.session.execute(pick.cmd, &params) {
+                    self.set_status(e.to_string());
+                }
+            } else {
+                // Requested with no presentation open: the insert makes one, as a drop does.
+                self.open_or_insert_bytes(name, bytes);
+            }
+            return;
+        };
+        let Some(doc_index) = self.session.documents().iter().position(|d| d.uid == uid) else {
+            self.set_status(format!("{name} wasn't inserted: its presentation was closed"));
+            return;
+        };
+        let Some(slide_index) = self.session.documents().get(doc_index).and_then(|d| d.doc.slide_index(slide)) else {
+            self.set_status(format!("{name} wasn't inserted: its slide was deleted"));
+            return;
+        };
+        let before = self.session.active().map(|d| (d.uid, d.selection.slide));
+        self.session.set_active(doc_index);
+        let moved = self.session.active().is_some_and(|d| d.selection.slide != slide_index);
+        let r = if moved { self.session.execute("slide.go", &json!({"index": slide_index})) } else { Ok(Value::Null) };
+        let r = r.and_then(|_| self.session.execute(pick.cmd, &params));
+        if let Err(e) = r {
+            self.set_status(e.to_string());
+        }
+        // Put the user back where they are now: the file lands in its place, the view stays.
+        if let Some((cur_uid, cur_slide)) = before {
+            if cur_uid != uid {
+                if let Some(i) = self.session.documents().iter().position(|d| d.uid == cur_uid) {
+                    self.session.set_active(i);
+                }
+            } else if moved {
+                let _ = self.session.execute("slide.go", &json!({"index": cur_slide}));
+            }
         }
     }
 
@@ -678,9 +758,12 @@ impl SlideApp {
 
     fn drain_inbox(&mut self) {
         let Some(inbox) = self.services.inbox.clone() else { return };
-        let files: Vec<(String, Vec<u8>)> = inbox.lock().map(|mut v| std::mem::take(&mut *v)).unwrap_or_default();
-        for (name, bytes) in files {
-            self.open_or_insert_bytes(&name, &bytes);
+        let files: Vec<InboxFile> = inbox.lock().map(|mut v| std::mem::take(&mut *v)).unwrap_or_default();
+        for f in files {
+            match f.ticket {
+                Some(ticket) => self.apply_picked(ticket, &f.name, &f.bytes),
+                None => self.open_or_insert_bytes(&f.name, &f.bytes),
+            }
         }
     }
 
@@ -1129,6 +1212,8 @@ fn js_now() -> f64 {
 
 #[cfg(test)]
 mod ime_tests;
+#[cfg(test)]
+mod picker_tests;
 
 #[cfg(test)]
 mod tests {

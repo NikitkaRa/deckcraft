@@ -1,7 +1,7 @@
 //! The browser shell: web `Services`, drag-and-drop, and the eframe web runner.
 
 use deckcraft_engine::Session;
-use deckcraft_ui_egui::{Inbox, Services, SlideApp};
+use deckcraft_ui_egui::{Inbox, InboxFile, Services, SlideApp};
 use wasm_bindgen::JsCast as _;
 
 const PRESENTATION_EXTS: &[&str] = &["deckcraft", "pptx", "potx", "ppsx", "txt", "md"];
@@ -83,7 +83,7 @@ impl eframe::App for WebShell {
                 let name = f.path().file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| "dropped".into());
                 match f.bytes_async().await {
                     Ok(bytes) => {
-                        inbox.lock().unwrap_or_else(|e| e.into_inner()).push((name, bytes));
+                        inbox.lock().unwrap_or_else(|e| e.into_inner()).push(InboxFile { name, bytes, ticket: None });
                         ctx.request_repaint();
                     }
                     Err(e) => log::error!("couldn't read dropped file {name}: {e}"),
@@ -107,7 +107,7 @@ impl eframe::App for WebShell {
 fn services(inbox: Inbox, ctx: egui::Context) -> Services {
     let open_inbox = inbox.clone();
     Services {
-        open_async: Some(Box::new(move |purpose: &str| {
+        open_async: Some(Box::new(move |purpose: &str, ticket: u64| {
             let inbox = open_inbox.clone();
             let ctx = ctx.clone();
             let dialog = match purpose {
@@ -121,7 +121,7 @@ fn services(inbox: Inbox, ctx: egui::Context) -> Services {
                     return;
                 };
                 let bytes = file.read().await;
-                inbox.lock().unwrap_or_else(|e| e.into_inner()).push((file.file_name(), bytes));
+                inbox.lock().unwrap_or_else(|e| e.into_inner()).push(InboxFile { name: file.file_name(), bytes, ticket: Some(ticket) });
                 ctx.request_repaint();
             });
         })),
