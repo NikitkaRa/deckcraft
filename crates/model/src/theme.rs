@@ -108,6 +108,7 @@ fn ph() -> ColorRef {
 pub fn default_format() -> FormatScheme {
     let grad = |a: i32, b: i32| {
         Fill::Gradient(Gradient {
+            tile: [0.0; 4],
             stops: vec![
                 GradientStop { pos: 0.0, color: ph().with(ColorTransform::LumMod(a)).with(ColorTransform::SatMod(103000)) },
                 GradientStop { pos: 1.0, color: ph().with(ColorTransform::LumMod(b)) },

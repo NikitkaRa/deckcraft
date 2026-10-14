@@ -30,7 +30,32 @@ pub fn position(kind: &str, bounds: Rect, focus: [f64; 4], outline: &[Vec<Point>
     );
     let f = if f.x0 <= f.x1 && f.y0 <= f.y1 { f } else { Rect::from_center_size(f.center(), (0.0, 0.0)) };
     match kind {
-        "shape" if !outline.is_empty() => shape_position(outline, f.center(), p),
+        "shape" if !outline.is_empty() => {
+            // A focus rectangle (not a point) is the first colour throughout, as PowerPoint draws
+            // it; outside, the colour runs from the rectangle's edge to the outline along the ray
+            // from its centre.
+            if f.width() > 1e-9 && f.height() > 1e-9 {
+                if f.contains(p) {
+                    return 0.0;
+                }
+                let c = f.center();
+                let to_outline = shape_position(outline, c, p);
+                let d = (p - c).hypot();
+                if to_outline <= 0.0 || d <= 0.0 {
+                    return 1.0;
+                }
+                // Where the ray leaves the focus rectangle, as a share of the way to `p`.
+                let v = p - c;
+                let kx = if v.x.abs() > 1e-12 { (f.width() / 2.0) / v.x.abs() } else { f64::INFINITY };
+                let ky = if v.y.abs() > 1e-12 { (f.height() / 2.0) / v.y.abs() } else { f64::INFINITY };
+                let rect_share = kx.min(ky).min(1.0);
+                // p is `to_outline` of the way to the outline; the rectangle edge `rect_share` of
+                // the way to p.
+                let outline_share = 1.0 / to_outline; // outline distance in units of |p - c|
+                return ((1.0 - rect_share) / (outline_share - rect_share).max(1e-9)).clamp(0.0, 1.0);
+            }
+            shape_position(outline, f.center(), p)
+        }
         _ => {
             // Distance outside the focus rect along each axis, over the room to that side's edge.
             let axis = |v: f64, lo: f64, hi: f64, edge_lo: f64, edge_hi: f64| {
@@ -55,7 +80,9 @@ fn shape_position(outline: &[Vec<Point>], c: Point, p: Point) -> f64 {
     if len < 1e-9 {
         return 0.0;
     }
-    // Nearest crossing of the ray c + s·d (s > 0) with an edge.
+    // The outline scaled about `c` by t reaches `p` first (smallest t) where the ray's farthest
+    // crossing does: the only crossing for a focus inside a convex outline, and the one that
+    // still works for a focus off the shape (a corner of an ellipse's box).
     let mut best = f64::INFINITY;
     for poly in outline {
         for w in poly.windows(2) {
@@ -69,7 +96,7 @@ fn shape_position(outline: &[Vec<Point>], c: Point, p: Point) -> f64 {
             let s = ac.cross(e) / den;
             let u = ac.cross(d) / den;
             if s > 1e-9 && (-1e-9..=1.0 + 1e-9).contains(&u) {
-                best = best.min(s);
+                best = if best.is_finite() { best.max(s) } else { s };
             }
         }
     }
@@ -205,6 +232,24 @@ mod tests {
         tri.close_path();
         let polys = polygons(&tri);
         assert!((position("shape", b, CENTRE, &polys, Point::new(140.0, 50.0)) - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn shape_paths_from_off_the_shape_or_a_focus_box() {
+        let b = Rect::new(0.0, 0.0, 280.0, 200.0);
+        let ellipse = polygons(&kurbo::Ellipse::from_rect(b).to_path(0.01));
+        // Focus on the box's corner, outside the ellipse: contours are the ellipse shrunk towards
+        // the corner, so its far edge is the end and its middle part way (it was all the end
+        // colour).
+        let corner = [0.0, 0.0, 1.0, 1.0];
+        let mid = position("shape", b, corner, &ellipse, Point::new(140.0, 100.0));
+        assert!(mid > 0.3 && mid < 0.8, "{mid}");
+        assert!(position("shape", b, corner, &ellipse, Point::new(279.0, 100.0)) > 0.95);
+        // A focus rectangle is the first colour inside, and the colour runs from its edge out.
+        let boxed = [0.25, 0.25, 0.25, 0.25];
+        assert_eq!(position("shape", b, boxed, &ellipse, Point::new(150.0, 110.0)), 0.0);
+        let half = position("shape", b, boxed, &ellipse, Point::new(140.0 + 70.0 + 35.0, 100.0));
+        assert!((half - 0.5).abs() < 0.02, "{half}");
     }
 
     #[test]

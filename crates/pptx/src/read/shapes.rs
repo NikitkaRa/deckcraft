@@ -436,7 +436,9 @@ fn smartart(imp: &mut Imp, part: &Part, gd: &El, frame: &Shape, depth: usize) ->
 }
 
 fn table(imp: &mut Imp, part: &Part, tbl: &El) -> Table {
-    let mut t = Table { style: "none".into(), first_row: false, band_row: false, ..Default::default() };
+    // A table naming no style is drawn by PowerPoint with thin dark grid lines ("No Style, Table
+    // Grid"), not without lines.
+    let mut t = Table { style: "grid".into(), first_row: false, band_row: false, ..Default::default() };
     if let Some(pr) = tbl.child("tblPr") {
         t.background = pr.elements().find(|e| e.local().ends_with("Fill") && e.local() != "noFill").and_then(|f| dml::fill_el(imp, part, f));
         t.first_row = pr.bool("firstRow").unwrap_or(false);

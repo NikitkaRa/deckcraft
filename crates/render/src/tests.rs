@@ -565,6 +565,7 @@ fn a_linear_gradient_ramps_like_powerpoint() {
         id: ShapeId(700),
         xfrm: Some(Xfrm::new(0.0, 0.0, 800.0, 100.0)),
         fill: Some(Fill::Gradient(Gradient {
+            tile: [0.0; 4],
             stops: vec![stop(0.0, deckcraft_color::Rgba::rgb(0, 0, 0)), stop(1.0, deckcraft_color::Rgba::rgb(255, 255, 255))],
             shape: GradientShape::Linear { angle: 0.0, scaled: false },
             rotate_with_shape: true,
@@ -589,6 +590,7 @@ fn a_gradient_with_a_stop_off_the_end_stays_linear() {
         id: ShapeId(701),
         xfrm: Some(Xfrm::new(0.0, 0.0, 800.0, 100.0)),
         fill: Some(Fill::Gradient(Gradient {
+            tile: [0.0; 4],
             stops: vec![stop(0.2, deckcraft_color::Rgba::rgb(0, 0, 0)), stop(1.0, deckcraft_color::Rgba::rgb(255, 255, 255))],
             shape: GradientShape::Linear { angle: 0.0, scaled: false },
             rotate_with_shape: true,
@@ -629,6 +631,7 @@ fn a_shape_filled_with_the_background_shows_the_slide_background() {
     let stop = |pos, v| GradientStop { pos, color: ColorRef::rgb(deckcraft_color::Rgba::rgb(v, v, v)) };
     std::sync::Arc::make_mut(&mut p.slides[0]).background = Some(deckcraft_model::Background::Fill {
         fill: Fill::Gradient(Gradient {
+            tile: [0.0; 4],
             stops: vec![stop(0.0, 0), stop(0.5, 0), stop(1.0, 200)],
             shape: GradientShape::Linear { angle: 0.0, scaled: false },
             rotate_with_shape: true,
@@ -702,6 +705,7 @@ fn a_text_gradient_starts_over_on_every_line() {
         let props = &mut p.runs[0].props;
         props.size = Some(80.0);
         props.fill = Some(Fill::Gradient(Gradient {
+            tile: [0.0; 4],
             stops: vec![stop(0.0, 0), stop(1.0, 255)],
             shape: GradientShape::Linear { angle: 90.0, scaled: false },
             rotate_with_shape: true,
@@ -862,6 +866,7 @@ fn rect_path_gradients_draw_x_shaped_contours() {
         id: ShapeId(770),
         xfrm: Some(Xfrm::new(0.0, 0.0, 280.0, 200.0)),
         fill: Some(Fill::Gradient(Gradient {
+            tile: [0.0; 4],
             stops: vec![stop(0.0, 0), stop(0.5, 128), stop(1.0, 255)],
             shape: GradientShape::Path { path: "rect".into(), focus: [0.5, 0.5, 0.5, 0.5] },
             rotate_with_shape: true,

@@ -6,7 +6,7 @@
 //! geometry table. Adjust values use the file convention: ratios in 1/100 000 of the shorter side (or
 //! of the width/height), angles in 1/60 000 degree.
 
-use kurbo::{Arc, BezPath, Point, Rect, Shape as _, Vec2};
+use kurbo::{Arc, BezPath, Point, Rect, Vec2};
 use serde::{Deserialize, Serialize};
 
 mod extra;
@@ -339,6 +339,45 @@ pub fn info(name: &str) -> Option<&'static PresetInfo> {
     CATALOG.iter().find(|p| p.name == name)
 }
 
+/// Whether PowerPoint joins this preset's outline with sharp (miter) corners when the line names
+/// no join (it rounds them otherwise). Observed per preset on its export: the plus, the right,
+/// up and down block arrows (not the left one), chevrons, stars from five points up, the
+/// equation shapes, curved ribbons and the action buttons are mitred.
+pub fn mitred_by_default(name: &str) -> bool {
+    matches!(
+        name,
+        "plus"
+            | "rightArrow"
+            | "upArrow"
+            | "downArrow"
+            | "upDownArrow"
+            | "leftUpArrow"
+            | "bentUpArrow"
+            | "stripedRightArrow"
+            | "notchedRightArrow"
+            | "chevron"
+            | "leftArrowCallout"
+            | "leftRightArrowCallout"
+            | "upDownArrowCallout"
+            | "quadArrowCallout"
+            | "mathPlus"
+            | "mathMinus"
+            | "mathMultiply"
+            | "mathEqual"
+            | "mathNotEqual"
+            | "star5"
+            | "star6"
+            | "star8"
+            | "star10"
+            | "star12"
+            | "star16"
+            | "star24"
+            | "star32"
+            | "ellipseRibbon"
+            | "ellipseRibbon2"
+    ) || name.starts_with("actionButton")
+}
+
 pub fn is_line_like(name: &str) -> bool {
     matches!(name, "line" | "straightConnector1" | "bentConnector2" | "bentConnector3" | "curvedConnector3" | "arc")
         || name.starts_with("bentConnector")
@@ -387,6 +426,29 @@ impl Pb {
         });
         self.cur = Point::new(c.x + wr * e.cos(), c.y + hr * e.sin());
         self
+    }
+    /// A DrawingML `arcTo`: angles are where the ray from the ellipse's centre at that angle
+    /// meets it (not the ellipse's parameter), so elliptical arcs start and end where the
+    /// standard's shapes expect.
+    fn arc_spec(&mut self, wr: f64, hr: f64, st: f64, sw: f64) -> &mut Self {
+        let par = |a: f64| {
+            let a = a.to_radians();
+            (wr * a.sin()).atan2(hr * a.cos())
+        };
+        let t0 = par(st);
+        let mut d = par(st + sw) - t0;
+        let tau = std::f64::consts::TAU;
+        if sw.abs() >= 360.0 {
+            d = tau.copysign(sw);
+        } else {
+            while sw > 0.0 && d < 0.0 {
+                d += tau;
+            }
+            while sw < 0.0 && d > 0.0 {
+                d -= tau;
+            }
+        }
+        self.arc(wr, hr, t0.to_degrees(), d.to_degrees())
     }
     fn z(&mut self) -> &mut Self {
         self.p.close_path();
@@ -458,14 +520,25 @@ fn normalize(pts: &[(f64, f64)], w: f64, h: f64) -> Vec<(f64, f64)> {
     pts.iter().map(|(x, y)| ((x - x0) * sx, (y - y0) * sy)).collect()
 }
 
-fn star(n: usize, w: f64, h: f64, inner: f64, normalized: bool) -> Vec<(f64, f64)> {
+/// An n-pointed star as ECMA-376 draws it: points on an ellipse around (hc, vc · vf) with radii
+/// half the box stretched by the preset's `hf` / `vf` (so a five-pointed star fills its box and
+/// looks regular in a square), the inner corners `inner` of the way out.
+fn star(n: usize, w: f64, h: f64, inner: f64) -> Vec<(f64, f64)> {
+    let (hf, vf) = match n {
+        5 => (1.05146, 1.10557),
+        6 => (1.15470, 1.0),
+        7 => (1.02572, 1.05210),
+        10 => (1.05146, 1.0),
+        _ => (1.0, 1.0),
+    };
+    let (rx, ry, cy) = (w / 2.0 * hf, h / 2.0 * vf, h / 2.0 * vf);
     let mut pts = Vec::with_capacity(n * 2);
     for i in 0..n * 2 {
         let a = (-90.0 + 180.0 * i as f64 / n as f64).to_radians();
         let r = if i % 2 == 0 { 1.0 } else { inner };
-        pts.push((r * a.cos(), r * a.sin()));
+        pts.push((w / 2.0 + r * rx * a.cos(), cy + r * ry * a.sin()));
     }
-    if normalized { normalize(&pts, w, h) } else { pts.iter().map(|(x, y)| (w / 2.0 + x * w / 2.0, h / 2.0 + y * h / 2.0)).collect() }
+    pts
 }
 
 #[derive(Clone, Copy)]
@@ -603,6 +676,11 @@ fn double_arrow(vertical: bool, w: f64, h: f64, a1: f64, a2: f64) -> Geometry {
     let pts = orient(if vertical { Dir::Down } else { Dir::Right }, w, h, &pts);
     let r = if vertical { Rect::new(y1, dx, y2, h - dx) } else { Rect::new(dx, y1, w - dx, y2) };
     Geometry { paths: vec![fill(Pb::new().poly(&pts).take())], text_rect: r, handles: vec![], sites: mid_sites(w, h) }
+}
+
+/// Points given in 21600ths of the box (as ECMA-376 defines many fixed shapes), scaled to it.
+fn spec_pts(pts: &[(i32, i32)], w: f64, h: f64) -> Vec<(f64, f64)> {
+    pts.iter().map(|(x, y)| (w * *x as f64 / 21600.0, h * *y as f64 / 21600.0)).collect()
 }
 
 fn simple(path: BezPath, text: Rect, w: f64, h: f64) -> Geometry {
@@ -855,7 +933,8 @@ pub fn build(name: &str, w: f64, h: f64, adj: &[f64]) -> Option<Geometry> {
             g
         }
         "can" | "flowChartMagneticDisk" => {
-            let v = if name == "can" { a(0).clamp(0.0, 50000.0 * h / ss.max(1e-9)) } else { 33333.0 * h / ss.max(1e-9) / 2.0 };
+            // The disk's ends are a third of its height (ECMA-376: ellipses of radius h/6).
+            let v = if name == "can" { a(0).clamp(0.0, 50000.0 * h / ss.max(1e-9)) } else { 100000.0 / 3.0 * h / ss.max(1e-9) };
             let eh = ss * v / 100000.0;
             let r = eh / 2.0;
             let body = Pb::new().m(0.0, r).l(0.0, h - r).arc(w / 2.0, r, 180.0, -180.0).l(w, r).arc(w / 2.0, r, 0.0, -180.0).z().take();
@@ -872,7 +951,8 @@ pub fn build(name: &str, w: f64, h: f64, adj: &[f64]) -> Option<Geometry> {
             g
         }
         "flowChartMagneticDrum" => {
-            let r = w / 6.0 / 2.0;
+            // ECMA-376: end ellipses of radius w/6 across.
+            let r = w / 6.0;
             let body = Pb::new().m(r, 0.0).l(w - r, 0.0).arc(r, h / 2.0, 270.0, 180.0).l(r, h).arc(r, h / 2.0, 90.0, 180.0).z().take();
             let side = Pb::new().m(w - r, 0.0).arc(r, h / 2.0, 270.0, -180.0).take();
             Geometry {
@@ -1048,45 +1128,94 @@ pub fn build(name: &str, w: f64, h: f64, adj: &[f64]) -> Option<Geometry> {
             }
         }
         "heart" => {
-            b.m(w / 2.0, h * 0.25);
-            b.c(w * 0.62, h * -0.02, w, h * 0.0, w, h * 0.32);
-            b.c(w, h * 0.6, w * 0.62, h * 0.78, w / 2.0, h);
-            b.c(w * 0.38, h * 0.78, 0.0, h * 0.6, 0.0, h * 0.32);
-            b.c(0.0, h * 0.0, w * 0.38, h * -0.02, w / 2.0, h * 0.25);
-            b.z();
+            // ECMA-376 heart: two cubic curves from the notch at the top to the point.
+            let (dx1, dx2) = (w * 49.0 / 48.0, w * 10.0 / 48.0);
+            let y1 = -h / 3.0;
+            b.m(w / 2.0, h / 4.0)
+                .c(w / 2.0 + dx2, y1, w / 2.0 + dx1, h / 4.0, w / 2.0, h)
+                .c(w / 2.0 - dx1, h / 4.0, w / 2.0 - dx2, y1, w / 2.0, h / 4.0)
+                .z();
             simple(b.take(), Rect::new(w * 0.2, h * 0.25, w * 0.8, h * 0.7), w, h)
         }
         "lightningBolt" => {
-            let pts = normalize(&[(0.36, 0.0), (0.68, 0.0), (0.53, 0.34), (0.79, 0.34), (0.24, 1.0), (0.39, 0.53), (0.15, 0.53)], w, h);
-            simple(b.poly(&pts).take(), Rect::new(w * 0.3, h * 0.35, w * 0.65, h * 0.6), w, h)
+            // ECMA-376 lightningBolt, in 21600ths of the box.
+            let pts = spec_pts(
+                &[
+                    (8472, 0),
+                    (12860, 6080),
+                    (11050, 6797),
+                    (16577, 12007),
+                    (14767, 12877),
+                    (21600, 21600),
+                    (10012, 14915),
+                    (12222, 13987),
+                    (5022, 9705),
+                    (7602, 8382),
+                    (0, 3890),
+                ],
+                w,
+                h,
+            );
+            simple(b.poly(&pts).take(), Rect::new(w * 8757.0 / 21600.0, h * 7637.0 / 21600.0, w * 13917.0 / 21600.0, h * 12963.0 / 21600.0), w, h)
         }
         "sun" => {
-            let k = a(0).clamp(12500.0, 46875.0) / 100000.0;
-            let (cx, cy) = (w / 2.0, h / 2.0);
-            let cr = 0.5 - k;
-            let core = Pb::new().ellipse(cx, cy, w * cr * 0.72, h * cr * 0.72).take();
-            let mut rays = Pb::new();
-            for i in 0..8 {
-                let ang = (i as f64 * 45.0).to_radians();
-                let half = 9f64.to_radians();
-                let rb = cr * 0.72 + 0.06;
-                let tip = (cx + w * 0.5 * ang.cos(), cy + h * 0.5 * ang.sin());
-                let b1 = (cx + w * rb * (ang - half).cos(), cy + h * rb * (ang - half).sin());
-                let b2 = (cx + w * rb * (ang + half).cos(), cy + h * rb * (ang + half).sin());
-                rays.poly(&[tip, b1, b2]);
-            }
-            Geometry {
-                paths: vec![fill(rays.take()), fill(core)],
-                text_rect: Rect::new(w * 0.3, h * 0.3, w * 0.7, h * 0.7),
-                handles: vec![],
-                sites: mid_sites(w, h),
-            }
+            // ECMA-376 sun: eight triangular rays (their bases at fixed fractions of the core's
+            // margin) around a circle of radius 50% - adj.
+            let a = a(0).clamp(12500.0, 46875.0);
+            let g0 = 50000.0 - a;
+            let (g1, g2) = (g0 * 30274.0 / 32768.0, g0 * 12540.0 / 32768.0);
+            let (g10, g11) = ((50000.0 - g1) * 0.75, (50000.0 - g2) * 0.75);
+            let (g12, g13, g14) = (g10 + 3662.0, g11 + 3662.0, g11 + 12500.0);
+            let (g15, g16, g17, g18) = (100000.0 - g10, 100000.0 - g12, 100000.0 - g13, 100000.0 - g14);
+            let x = |g: f64| w * g / 100000.0;
+            let y = |g: f64| h * g / 100000.0;
+            let (ox1, oy1, ox2, oy2) = (w * 18436.0 / 21600.0, h * 3163.0 / 21600.0, w * 3163.0 / 21600.0, h * 18436.0 / 21600.0);
+            let (hc, vc) = (w / 2.0, h / 2.0);
+            b.poly(&[(w, vc), (x(g15), y(g18)), (x(g15), y(g14))]);
+            b.poly(&[(ox1, oy1), (x(g16), y(g13)), (x(g17), y(g12))]);
+            b.poly(&[(hc, 0.0), (x(g18), y(g10)), (x(g14), y(g10))]);
+            b.poly(&[(ox2, oy1), (x(g13), y(g12)), (x(g12), y(g13))]);
+            b.poly(&[(0.0, vc), (x(g10), y(g14)), (x(g10), y(g18))]);
+            b.poly(&[(ox2, oy2), (x(g12), y(g17)), (x(g13), y(g16))]);
+            b.poly(&[(hc, h), (x(g14), y(g15)), (x(g18), y(g15))]);
+            b.poly(&[(ox1, oy2), (x(g17), y(g16)), (x(g16), y(g17))]);
+            b.ellipse(hc, vc, x(g0), y(g0));
+            let g7 = g0 * 23170.0 / 32768.0;
+            let mut g = simple(b.take(), Rect::new(x(50000.0 - g7), y(50000.0 - g7), x(50000.0 + g7), y(50000.0 + g7)), w, h);
+            g.handles.push(Handle::new(0, Point::new(0.0, vc), Vec2::new(w / 100000.0, 0.0), a, 12500.0, 46875.0));
+            g
         }
         "moon" => {
+            // ECMA-376 moon: the outer edge is the left half of an ellipse w × h/2 centred on the
+            // right edge; the inner edge an arc through the corners and (adj · w, middle) of a
+            // larger ellipse (rx = g18, ry = dy1) whose centre lies right of that point.
             let k = a(0).clamp(0.0, 87500.0) / 100000.0;
-            let g0 = w * k;
-            b.m(w, 0.0).arc(w, h / 2.0, 270.0, -180.0).arc((w - g0).max(0.0), h / 2.0, 90.0, 180.0).z();
-            simple(b.take(), Rect::new(w * 0.1, h * 0.25, w * (1.0 - k).max(0.2) * 0.8, h * 0.75), w, h)
+            let ssf = ss.max(1e-9);
+            let g0 = ss * k;
+            let g1 = (ss - g0).max(1e-9);
+            let g2 = g0 * g0 / g1;
+            let g3 = ss * ss / g1;
+            let g5 = 2.0 * g3 - g2;
+            let g6 = g5 - g0;
+            let dy1 = (g5 / 2.0 - g0) * (h / 2.0) / ssf;
+            let (g0w, g6w) = (g0 * w / ssf, g6 * w / ssf);
+            let rx = (g6w - g0w) / 2.0;
+            let cx = g0w + rx;
+            b.m(w, 0.0).arc(w, h / 2.0, 270.0, -180.0);
+            if rx > 1e-9 && dy1 > 1e-9 {
+                // From the bottom-right corner back up to the top-right through (g0w, h/2).
+                let t0 = ((h / 2.0) / dy1).clamp(-1.0, 1.0).atan2((w - cx) / rx);
+                let t1 = (-(h / 2.0) / dy1).clamp(-1.0, 1.0).atan2((w - cx) / rx) + std::f64::consts::TAU;
+                let arc = Arc::new(Point::new(cx, h / 2.0), Vec2::new(rx, dy1), t0, t1 - t0, 0.0);
+                arc.to_cubic_beziers(0.05, |p1, p2, p| {
+                    b.p.curve_to(p1, p2, p);
+                });
+            }
+            b.z();
+            let g12 = g0 * 9598.0 / 32768.0;
+            let g13 = ss - g12;
+            let dy4 = (ss * ss - g13 * g13).max(0.0).sqrt() * (h / 2.0) / ssf;
+            simple(b.take(), Rect::new(g12 * w / ssf, h / 2.0 - dy4, g0w, h / 2.0 + dy4), w, h)
         }
         "cloud" | "cloudCallout" => cloud(name, w, h, a(0), a(1)),
         "bracketPair" => {
@@ -1124,7 +1253,10 @@ pub fn build(name: &str, w: f64, h: f64, adj: &[f64]) -> Option<Geometry> {
             if name == "rightBracket" {
                 path.apply_affine(kurbo::Affine::new([-1.0, 0.0, 0.0, 1.0, w, 0.0]));
             }
-            Geometry { paths: vec![stroke_only(path)], text_rect: full, handles: vec![], sites: mid_sites(w, h) }
+            // Filled (when the shape has a fill) out to the straight side, as PowerPoint does.
+            let mut area = path.clone();
+            area.close_path();
+            Geometry { paths: vec![fill_only(area), stroke_only(path)], text_rect: full, handles: vec![], sites: mid_sites(w, h) }
         }
         "leftBrace" | "rightBrace" => {
             let r = (ss * a(0).clamp(0.0, 25000.0 * h / ss.max(1e-9)) / 1e5).min(h / 4.0);
@@ -1136,7 +1268,10 @@ pub fn build(name: &str, w: f64, h: f64, adj: &[f64]) -> Option<Geometry> {
             if name == "rightBrace" {
                 path.apply_affine(kurbo::Affine::new([-1.0, 0.0, 0.0, 1.0, w, 0.0]));
             }
-            Geometry { paths: vec![stroke_only(path)], text_rect: full, handles: vec![], sites: mid_sites(w, h) }
+            // Filled (when the shape has a fill) out to the straight side, as PowerPoint does.
+            let mut area = path.clone();
+            area.close_path();
+            Geometry { paths: vec![fill_only(area), stroke_only(path)], text_rect: full, handles: vec![], sites: mid_sites(w, h) }
         }
         "rightArrow" => arrow(Dir::Right, w, h, a(0), a(1)),
         "leftArrow" => arrow(Dir::Left, w, h, a(0), a(1)),
@@ -1372,18 +1507,45 @@ pub fn build(name: &str, w: f64, h: f64, adj: &[f64]) -> Option<Geometry> {
             }
         }
         "flowChartDocument" => {
-            b.m(0.0, 0.0).l(w, 0.0).l(w, h * 0.8).c(w * 0.7, h * 0.62, w * 0.35, h * 1.08, 0.0, h * 0.88).z();
-            simple(b.take(), Rect::new(0.0, 0.0, w, h * 0.78), w, h)
+            let u = |x: f64, y: f64| (w * x / 21600.0, h * y / 21600.0);
+            let (p1, p2, p3, p4) = (u(21600.0, 17322.0), u(10800.0, 17322.0), u(10800.0, 23922.0), u(0.0, 20172.0));
+            b.m(0.0, 0.0).l(w, 0.0).l(p1.0, p1.1).c(p2.0, p2.1, p3.0, p3.1, p4.0, p4.1).z();
+            simple(b.take(), Rect::new(0.0, 0.0, w, h * 17322.0 / 21600.0), w, h)
         }
         "flowChartMultidocument" => {
-            let (dx, dy) = (w * 0.1, h * 0.1);
-            let mut back = Pb::new();
-            back.poly(&[(2.0 * dx, 0.0), (w, 0.0), (w, h * 0.7), (w - dx * 0.5, h * 0.7), (w - dx * 0.5, dy * 0.5), (2.0 * dx, dy * 0.5)]);
-            back.poly(&[(dx, dy * 0.5), (w - dx * 0.5, dy * 0.5), (w - dx * 0.5, h * 0.78), (w - dx, h * 0.78), (w - dx, dy), (dx, dy)]);
-            let front = Pb::new().m(0.0, dy).l(w - dx, dy).l(w - dx, h * 0.84).c(w * 0.62, h * 0.7, w * 0.32, h * 1.08, 0.0, h * 0.9).z().take();
+            // ECMA-376 multidocument (21600ths): two back pages peeking out above and right of
+            // the front one; the back pages' edges are outlined only where they show.
+            let x = |v: f64| w * v / 21600.0;
+            let y = |v: f64| h * v / 21600.0;
+            let front = |b: &mut Pb| {
+                b.m(0.0, y(20782.0))
+                    .c(x(9298.0), y(23542.0), x(9298.0), y(18022.0), x(18595.0), y(18022.0))
+                    .l(x(18595.0), y(3675.0))
+                    .l(0.0, y(3675.0))
+                    .z();
+            };
+            let mid = |b: &mut Pb| {
+                b.m(x(1532.0), y(3675.0)).l(x(1532.0), y(1815.0)).l(x(20000.0), y(1815.0)).l(x(20000.0), y(16252.0));
+                b.c(x(19298.0), y(16252.0), x(18595.0), y(16352.0), x(18595.0), y(16352.0));
+            };
+            let back = |b: &mut Pb| {
+                b.m(x(2972.0), y(1815.0)).l(x(2972.0), 0.0).l(w, 0.0).l(w, y(14392.0));
+                b.c(x(20800.0), y(14392.0), x(20000.0), y(14467.0), x(20000.0), y(14467.0));
+            };
+            let mut area = Pb::new();
+            front(&mut area);
+            mid(&mut area);
+            area.l(x(18595.0), y(3675.0)).z();
+            back(&mut area);
+            area.l(x(20000.0), y(1815.0)).z();
+            let mut outline = Pb::new();
+            outline.m(0.0, y(3675.0)).l(x(18595.0), y(3675.0)).l(x(18595.0), y(18022.0));
+            outline.c(x(9298.0), y(18022.0), x(9298.0), y(23542.0), 0.0, y(20782.0)).z();
+            mid(&mut outline);
+            back(&mut outline);
             Geometry {
-                paths: vec![fill(back.take()), fill(front)],
-                text_rect: Rect::new(0.0, dy, w - dx, h * 0.8),
+                paths: vec![fill_only(area.take()), stroke_only(outline.take())],
+                text_rect: Rect::new(0.0, y(3675.0), x(18595.0), y(17322.0)),
                 handles: vec![],
                 sites: mid_sites(w, h),
             }
@@ -1401,10 +1563,11 @@ pub fn build(name: &str, w: f64, h: f64, adj: &[f64]) -> Option<Geometry> {
             simple(b.poly(&[(w * 0.2, 0.0), (w, 0.0), (w, h), (0.0, h), (0.0, h * 0.2)]).take(), Rect::new(0.0, h * 0.2, w, h), w, h)
         }
         "flowChartPunchedTape" => {
-            let a1 = h * 0.1;
-            b.m(0.0, a1).c(w * 0.25, a1 * 3.0, w * 0.25, -a1, w / 2.0, a1).c(w * 0.75, a1 * 3.0, w * 0.75, -a1, w, a1).l(w, h - a1);
-            b.c(w * 0.75, h - 3.0 * a1, w * 0.75, h + a1, w / 2.0, h - a1).c(w * 0.25, h - 3.0 * a1, w * 0.25, h + a1, 0.0, h - a1).z();
-            simple(b.take(), Rect::new(0.0, h * 0.2, w, h * 0.8), w, h)
+            // ECMA-376: each long edge is two half-ellipses a quarter of the width wide and a
+            // tenth of the height deep, one bulging in and one out.
+            let (rx, ry) = (w / 4.0, h / 10.0);
+            b.m(0.0, ry).arc(rx, ry, 180.0, -180.0).arc(rx, ry, 180.0, 180.0).l(w, h - ry).arc(rx, ry, 0.0, -180.0).arc(rx, ry, 0.0, 180.0).z();
+            simple(b.take(), Rect::new(0.0, h / 5.0, w, h * 0.8), w, h)
         }
         "flowChartSummingJunction" | "flowChartOr" => {
             let e = Pb::new().ellipse(w / 2.0, h / 2.0, w / 2.0, h / 2.0).take();
@@ -1452,84 +1615,115 @@ pub fn build(name: &str, w: f64, h: f64, adj: &[f64]) -> Option<Geometry> {
             let n: usize = name.trim_start_matches("star").parse().unwrap_or(5);
             let v = a(0).clamp(0.0, 50000.0);
             let inner = v / 50000.0;
-            let normalized = matches!(n, 5 | 7);
-            let mut g = simple(b.poly(&star(n, w, h, inner, normalized)).take(), full.inset(-ss * (0.5 - inner * 0.5) * 0.5), w, h);
+            let mut g = simple(b.poly(&star(n, w, h, inner)).take(), full.inset(-ss * (0.5 - inner * 0.5) * 0.5), w, h);
             g.handles.push(Handle::new(0, Point::new(w / 2.0, h / 2.0), Vec2::new(0.0, -h / 2.0 / 50000.0), v, 0.0, 50000.0));
             g
         }
-        "irregularSeal1" | "irregularSeal2" => {
-            let pts: &[(f64, f64)] = if name == "irregularSeal1" {
+        "irregularSeal1" => {
+            // ECMA-376 irregularSeal1 ("Explosion: 8 Points"), in 21600ths of the box.
+            let pts = spec_pts(
                 &[
-                    (0.48, 0.18),
-                    (0.62, 0.0),
-                    (0.64, 0.2),
-                    (0.86, 0.1),
-                    (0.78, 0.3),
-                    (1.0, 0.36),
-                    (0.82, 0.5),
-                    (0.94, 0.72),
-                    (0.7, 0.66),
-                    (0.68, 0.9),
-                    (0.54, 0.72),
-                    (0.42, 1.0),
-                    (0.36, 0.74),
-                    (0.14, 0.86),
-                    (0.22, 0.62),
-                    (0.0, 0.6),
-                    (0.18, 0.44),
-                    (0.04, 0.24),
-                    (0.3, 0.3),
-                    (0.26, 0.06),
-                ]
-            } else {
+                    (10800, 5800),
+                    (14522, 0),
+                    (14155, 5325),
+                    (18380, 4457),
+                    (16702, 7315),
+                    (21097, 8137),
+                    (17607, 10475),
+                    (21600, 13290),
+                    (16837, 12942),
+                    (18145, 18095),
+                    (14020, 14457),
+                    (13247, 19737),
+                    (10532, 14935),
+                    (8485, 21600),
+                    (7715, 15627),
+                    (4762, 17617),
+                    (5667, 13937),
+                    (135, 14587),
+                    (3722, 11775),
+                    (0, 8615),
+                    (4627, 7617),
+                    (370, 2295),
+                    (7312, 6320),
+                    (8352, 2295),
+                ],
+                w,
+                h,
+            );
+            simple(b.poly(&pts).take(), Rect::new(w * 4627.0 / 21600.0, h * 6320.0 / 21600.0, w * 16702.0 / 21600.0, h * 13937.0 / 21600.0), w, h)
+        }
+        "irregularSeal2" => {
+            // ECMA-376 irregularSeal2 ("Explosion: 14 Points"), in 21600ths of the box.
+            let pts = spec_pts(
                 &[
-                    (0.5, 0.16),
-                    (0.58, 0.0),
-                    (0.63, 0.18),
-                    (0.78, 0.06),
-                    (0.76, 0.24),
-                    (0.96, 0.2),
-                    (0.86, 0.38),
-                    (1.0, 0.5),
-                    (0.84, 0.58),
-                    (0.92, 0.76),
-                    (0.74, 0.72),
-                    (0.76, 0.94),
-                    (0.6, 0.8),
-                    (0.5, 1.0),
-                    (0.44, 0.8),
-                    (0.28, 0.94),
-                    (0.28, 0.74),
-                    (0.08, 0.82),
-                    (0.16, 0.62),
-                    (0.0, 0.54),
-                    (0.14, 0.44),
-                    (0.02, 0.28),
-                    (0.22, 0.3),
-                    (0.2, 0.1),
-                    (0.36, 0.22),
-                    (0.4, 0.04),
-                ]
-            };
-            let pts: Vec<(f64, f64)> = pts.iter().map(|(x, y)| (x * w, y * h)).collect();
-            simple(b.poly(&pts).take(), Rect::new(w * 0.25, h * 0.3, w * 0.75, h * 0.7), w, h)
+                    (11462, 4342),
+                    (14790, 0),
+                    (14525, 5777),
+                    (18007, 3172),
+                    (16380, 6532),
+                    (21600, 6645),
+                    (16985, 9402),
+                    (18270, 11290),
+                    (16380, 12310),
+                    (18877, 15632),
+                    (14640, 14350),
+                    (14942, 17370),
+                    (12180, 15935),
+                    (11612, 18842),
+                    (9872, 17370),
+                    (8700, 19712),
+                    (7527, 18125),
+                    (4917, 21600),
+                    (4805, 18240),
+                    (1285, 17825),
+                    (3330, 15370),
+                    (0, 12877),
+                    (3935, 11592),
+                    (1172, 8270),
+                    (5372, 7817),
+                    (4502, 3625),
+                    (8550, 6382),
+                    (9722, 1887),
+                ],
+                w,
+                h,
+            );
+            simple(b.poly(&pts).take(), Rect::new(w * 5372.0 / 21600.0, h * 6382.0 / 21600.0, w * 14640.0 / 21600.0, h * 15935.0 / 21600.0), w, h)
         }
         "ribbon" | "ribbon2" => ribbon(name == "ribbon2", w, h, a(0), a(1)),
         "verticalScroll" | "horizontalScroll" => scroll(name == "verticalScroll", w, h, a(0)),
         "wave" | "doubleWave" => {
-            let amp = h * a(0).clamp(0.0, 20000.0) / 1e5;
-            let shift = w * a(1).clamp(-10000.0, 10000.0) / 1e5;
+            // ECMA-376 wave / doubleWave: the top and bottom edges are cubic waves (one or two
+            // periods) of amplitude adj1, shifted sideways by adj2.
+            let a1 = a(0).clamp(0.0, if name == "wave" { 20000.0 } else { 12500.0 });
+            let a2 = a(1).clamp(-10000.0, 10000.0);
+            let y1 = h * a1 / 100000.0;
+            let dy2 = y1 * 10.0 / 3.0;
+            let (y2, y3, y4) = (y1 - dy2, y1 + dy2, h - y1);
+            let (y5, y6) = (y4 - dy2, y4 + dy2);
+            let of2 = w * a2 / 50000.0;
+            let dx2 = of2.min(0.0);
+            let dxr = of2.max(0.0);
+            let (x2, xr, xl, x10) = (-dx2, w - dxr, dxr, w + dx2);
+            let text_y = h * a1 / 50000.0;
             if name == "wave" {
-                b.m(shift.max(0.0), amp).c(w / 3.0, -amp, 2.0 * w / 3.0, 3.0 * amp, w + shift.min(0.0), amp);
-                b.l(w - shift.max(0.0), h - amp).c(2.0 * w / 3.0, h - 3.0 * amp, w / 3.0, h + amp, -shift.min(0.0), h - amp).z();
+                let dx3 = (dx2 + xr) / 3.0;
+                let (x3, x7) = (x2 + dx3, xl + dx3);
+                let (x4, x8) = ((x3 + xr) / 2.0, (x7 + x10) / 2.0);
+                b.m(x2, y1).c(x3, y2, x4, y3, xr, y1).l(x10, y4).c(x8, y6, x7, y5, xl, y4).z();
             } else {
-                b.m(0.0, amp).c(w / 6.0, -amp, w / 3.0, 3.0 * amp, w / 2.0, amp).c(2.0 * w / 3.0, -amp, 5.0 * w / 6.0, 3.0 * amp, w, amp);
-                b.l(w, h - amp)
-                    .c(5.0 * w / 6.0, h - 3.0 * amp, 2.0 * w / 3.0, h + amp, w / 2.0, h - amp)
-                    .c(w / 3.0, h - 3.0 * amp, w / 6.0, h + amp, 0.0, h - amp)
-                    .z();
+                let (dx3, dx4) = ((dx2 + xr) / 6.0, (dx2 + xr) / 3.0);
+                let (x3, x4, x5) = (x2 + dx3, x2 + dx4, (x2 + xr) / 2.0);
+                let x6 = x5 + dx3;
+                let x7 = (x6 + xr) / 2.0;
+                let (x10b, x11, x12) = (xl + dx3, xl + dx4, (xl + x10) / 2.0);
+                let x13 = x12 + dx3;
+                let x14 = (x13 + x10) / 2.0;
+                b.m(x2, y1).c(x3, y2, x4, y3, x5, y1).c(x6, y2, x7, y3, xr, y1).l(x10, y4);
+                b.c(x14, y6, x13, y5, x12, y4).c(x11, y6, x10b, y5, xl, y4).z();
             }
-            simple(b.take(), Rect::new(0.0, amp * 2.0, w, h - amp * 2.0), w, h)
+            simple(b.take(), Rect::new(x2.max(xl), text_y, xr.min(x10), h - text_y), w, h)
         }
         "wedgeRectCallout" | "wedgeRoundRectCallout" => {
             let r = if name == "wedgeRoundRectCallout" { ss * a(2).clamp(0.0, 50000.0) / 1e5 } else { 0.0 };
@@ -1646,36 +1840,61 @@ fn wedge_rect(w: f64, h: f64, a0: f64, a1: f64, r: f64) -> Geometry {
     g
 }
 
+/// ECMA-376 cloud outline arcs (radii in 43200ths of the box, angles in 60000ths of a degree,
+/// as DrawingML `arcTo` takes them), from the start point (3900, 14370).
+const CLOUD_ARCS: [(f64, f64, f64, f64); 11] = [
+    (6753.0, 9190.0, -11429249.0, 7426832.0),
+    (5333.0, 7267.0, -8646143.0, 5396714.0),
+    (4365.0, 5945.0, -8748475.0, 5983381.0),
+    (4857.0, 6595.0, -7859164.0, 7034504.0),
+    (5333.0, 7273.0, -4722533.0, 6541615.0),
+    (6775.0, 9220.0, -2776035.0, 7816140.0),
+    (5785.0, 7867.0, 37501.0, 6842000.0),
+    (6752.0, 9215.0, 1347096.0, 6910353.0),
+    (7720.0, 10543.0, 3974558.0, 4542661.0),
+    (4360.0, 5918.0, -16496525.0, 8804134.0),
+    (4345.0, 5945.0, -14809710.0, 9151131.0),
+];
+
+/// The cloud's creases: short arcs inside the outline, each from its own start point.
+const CLOUD_CREASES: [(f64, f64, f64, f64, f64, f64); 11] = [
+    (4693.0, 26177.0, 4345.0, 5945.0, 5204520.0, 1585770.0),
+    (6928.0, 34899.0, 4360.0, 5918.0, 4416628.0, 686848.0),
+    (16478.0, 39090.0, 6752.0, 9215.0, 8257449.0, 844866.0),
+    (28827.0, 34751.0, 6752.0, 9215.0, 387196.0, 959901.0),
+    (34129.0, 22954.0, 5785.0, 7867.0, -4217541.0, 4255042.0),
+    (41798.0, 15354.0, 5333.0, 7273.0, 1819082.0, 1665090.0),
+    (38324.0, 5426.0, 4857.0, 6595.0, -824660.0, 891534.0),
+    (29078.0, 3952.0, 4857.0, 6595.0, -8950887.0, 1091722.0),
+    (22141.0, 4720.0, 4365.0, 5945.0, -9809656.0, 1061181.0),
+    (14000.0, 5192.0, 6753.0, 9190.0, -4002417.0, 739161.0),
+    (4127.0, 15789.0, 6753.0, 9190.0, 9459261.0, 711490.0),
+];
+
 fn cloud(name: &str, w: f64, h: f64, a0: f64, a1: f64) -> Geometry {
-    let n = 10;
-    let pts: Vec<Point> = (0..n)
-        .map(|i| {
-            let t = (i as f64 / n as f64 * 360.0 - 90.0).to_radians();
-            let wob = if i % 2 == 0 { 1.0 } else { 0.92 };
-            Point::new(0.5 + 0.40 * wob * t.cos(), 0.5 + 0.36 * wob * t.sin())
-        })
-        .collect();
+    // Drawn in the path's own 43200-unit square, then stretched to the box (as DrawingML lays out
+    // a path with its own w and h), so the arcs keep their shape's proportions at any aspect.
+    let to_box = kurbo::Affine::scale_non_uniform(w / 43200.0, h / 43200.0);
+    let deg = |v: f64| v / 60000.0;
     let mut b = Pb::new();
-    let first = pts.first().copied().unwrap_or(Point::ZERO);
-    b.m(first.x, first.y);
-    for i in 0..n {
-        let p = pts.get(i).copied().unwrap_or(Point::ZERO);
-        let q = pts.get((i + 1) % n).copied().unwrap_or(Point::ZERO);
-        let mid = p.midpoint(q);
-        let out = (mid - Point::new(0.5, 0.5)).normalize();
-        let bulge = (q - p).hypot() * 0.75;
-        let c1 = p + (mid - p) * 0.2 + out * bulge;
-        let c2 = q + (mid - q) * 0.2 + out * bulge;
-        b.c(c1.x, c1.y, c2.x, c2.y, q.x, q.y);
+    b.m(3900.0, 14370.0);
+    for (wr, hr, st, sw) in CLOUD_ARCS {
+        b.arc_spec(wr, hr, deg(st), deg(sw));
     }
     b.z();
-    let mut path = b.take();
-    let bb = path.bounding_box();
-    let sx = if bb.width() > 0.0 { w / bb.width() } else { 1.0 };
-    let sy = if bb.height() > 0.0 { h / bb.height() } else { 1.0 };
-    path.apply_affine(kurbo::Affine::scale_non_uniform(sx, sy) * kurbo::Affine::translate(-bb.origin().to_vec2()));
-    let mut paths = vec![fill(path)];
-    let text_rect = Rect::new(w * 0.2, h * 0.22, w * 0.8, h * 0.78);
+    let mut creases = Pb::new();
+    for (x, y, wr, hr, st, sw) in CLOUD_CREASES {
+        creases.m(x, y).arc_spec(wr, hr, deg(st), deg(sw));
+    }
+    let mut outline = b.take();
+    outline.apply_affine(to_box);
+    let mut paths = vec![fill(outline)];
+    if name == "cloud" {
+        let mut c = creases.take();
+        c.apply_affine(to_box);
+        paths.push(stroke_only(c));
+    }
+    let text_rect = Rect::new(w * 2977.0 / 21600.0, h * 3262.0 / 21600.0, w * 17087.0 / 21600.0, h * 17337.0 / 21600.0);
     let mut handles = vec![];
     if name == "cloudCallout" {
         let tip = Point::new(w / 2.0 + w * a0 / 1e5, h / 2.0 + h * a1 / 1e5);
@@ -1693,71 +1912,119 @@ fn cloud(name: &str, w: f64, h: f64, a0: f64, a1: f64) -> Geometry {
     Geometry { paths, text_rect, handles, sites: mid_sites(w, h) }
 }
 
+/// The equation shapes, by ECMA-376's formulas (checked against PowerPoint's outlines at several
+/// sizes and adjust values). Their bars span 73.49% of the width; the plus and multiply bars are
+/// `adj1` of the shorter side thick, the others' `adj1` of the height.
 fn math(name: &str, w: f64, h: f64, a0: f64, a1: f64, a2: f64) -> Geometry {
+    let pin = |lo: f64, v: f64, hi: f64| v.max(lo).min(hi.max(lo));
     let ss = w.min(h);
-    let t = ss * a0.clamp(0.0, 50000.0) / 1e5;
-    let (cx, cy) = (w / 2.0, h / 2.0);
-    let mx = w * 0.0735;
-    let my = h * 0.0735;
+    let (hc, vc) = (w / 2.0, h / 2.0);
+    let dx1 = w * 73490.0 / 200000.0;
+    let (x1, x2) = (hc - dx1, hc + dx1);
     let mut b = Pb::new();
-    match name {
+    let text = match name {
         "mathPlus" => {
-            let (hx, hy) = (cx - mx, cy - my);
-            b.poly(&[
-                (cx - t / 2.0, cy - hy),
-                (cx + t / 2.0, cy - hy),
-                (cx + t / 2.0, cy - t / 2.0),
-                (cx + hx, cy - t / 2.0),
-                (cx + hx, cy + t / 2.0),
-                (cx + t / 2.0, cy + t / 2.0),
-                (cx + t / 2.0, cy + hy),
-                (cx - t / 2.0, cy + hy),
-                (cx - t / 2.0, cy + t / 2.0),
-                (cx - hx, cy + t / 2.0),
-                (cx - hx, cy - t / 2.0),
-                (cx - t / 2.0, cy - t / 2.0),
-            ]);
+            let a = pin(0.0, a0, 73490.0);
+            let dy1 = h * 73490.0 / 200000.0;
+            let dx2 = ss * a / 200000.0;
+            let (y1, y2, y3, y4) = (vc - dy1, vc - dx2, vc + dx2, vc + dy1);
+            let (xa, xb) = (hc - dx2, hc + dx2);
+            b.poly(&[(x1, y2), (xa, y2), (xa, y1), (xb, y1), (xb, y2), (x2, y2), (x2, y3), (xb, y3), (xb, y4), (xa, y4), (xa, y3), (x1, y3)]);
+            Rect::new(x1, y2, x2, y3)
         }
         "mathMinus" => {
-            b.poly(&[(mx, cy - t / 2.0), (w - mx, cy - t / 2.0), (w - mx, cy + t / 2.0), (mx, cy + t / 2.0)]);
+            let dy1 = h * pin(0.0, a0, 100000.0) / 200000.0;
+            b.poly(&[(x1, vc - dy1), (x2, vc - dy1), (x2, vc + dy1), (x1, vc + dy1)]);
+            Rect::new(x1, vc - dy1, x2, vc + dy1)
         }
         "mathEqual" => {
-            let gap = h * a1.clamp(0.0, 100000.0) / 1e5;
-            b.poly(&[(mx, cy - gap / 2.0 - t), (w - mx, cy - gap / 2.0 - t), (w - mx, cy - gap / 2.0), (mx, cy - gap / 2.0)]);
-            b.poly(&[(mx, cy + gap / 2.0), (w - mx, cy + gap / 2.0), (w - mx, cy + gap / 2.0 + t), (mx, cy + gap / 2.0 + t)]);
+            let a = pin(0.0, a0, 36745.0);
+            let g = pin(0.0, a1, 100000.0 - 2.0 * a);
+            let (dy1, dy2) = (h * a / 100000.0, h * g / 200000.0);
+            let (y2, y3) = (vc - dy2, vc + dy2);
+            let (y1, y4) = (y2 - dy1, y3 + dy1);
+            b.poly(&[(x1, y1), (x2, y1), (x2, y2), (x1, y2)]);
+            b.poly(&[(x1, y3), (x2, y3), (x2, y4), (x1, y4)]);
+            Rect::new(x1, y1, x2, y4)
         }
         "mathNotEqual" => {
-            let gap = h * a2.clamp(0.0, 100000.0) / 1e5;
-            b.poly(&[(mx, cy - gap / 2.0 - t), (w - mx, cy - gap / 2.0 - t), (w - mx, cy - gap / 2.0), (mx, cy - gap / 2.0)]);
-            b.poly(&[(mx, cy + gap / 2.0), (w - mx, cy + gap / 2.0), (w - mx, cy + gap / 2.0 + t), (mx, cy + gap / 2.0 + t)]);
-            let ang = (a1 / 60000.0).to_radians();
-            let dir = Vec2::new(ang.cos(), ang.sin());
-            let len = (h / 2.0 - my) / ang.sin().abs().max(0.2);
-            let perp = Vec2::new(-dir.y, dir.x) * (t / 2.0);
-            let c = Point::new(cx, cy);
-            let p = [c - dir * len - perp, c + dir * len - perp, c + dir * len + perp, c - dir * len + perp];
-            b.poly(&p.map(|q| (q.x, q.y)));
+            let a = pin(0.0, a0, 50000.0);
+            let cr_ang = pin(4200000.0, a1, 6600000.0);
+            let g = pin(0.0, a2, 100000.0 - 2.0 * a);
+            let (dy1, dy2) = (h * a / 100000.0, h * g / 200000.0);
+            let hd2 = (h / 2.0).max(1e-9);
+            let (y2, y3) = (vc - dy2, vc + dy2);
+            let (y1, y4) = (y2 - dy1, y3 + dy1);
+            let cadj2 = cr_ang - 5400000.0;
+            let xadj2 = hd2 * (cadj2 / 60000.0).to_radians().tan();
+            let len = xadj2.hypot(hd2);
+            let bhw = len * dy1 / hd2;
+            let x7 = hc + xadj2 - bhw / 2.0;
+            let at = |y: f64| x7 - xadj2 * y / hd2;
+            let (x6, x5, x4, x3) = (at(y1), at(y2), at(y3), at(y4));
+            let rx7 = x7 + bhw;
+            let dx7 = dy1 * hd2 / len;
+            let dy3 = dy1 * xadj2 / len;
+            let (rx, lx, ry, ly) = if cadj2 > 0.0 { (x7 + dx7, x7, dy3, 0.0) } else { (rx7, rx7 - dx7, 0.0, -dy3) };
+            b.poly(&[
+                (x1, y1),
+                (x6, y1),
+                (lx, ly),
+                (rx, ry),
+                (x6 + bhw, y1),
+                (x2, y1),
+                (x2, y2),
+                (x5 + bhw, y2),
+                (x4 + bhw, y3),
+                (x2, y3),
+                (x2, y4),
+                (x3 + bhw, y4),
+                (w - lx, h - ly),
+                (w - rx, h - ry),
+                (x3, y4),
+                (x1, y4),
+                (x1, y3),
+                (x4, y3),
+                (x5, y2),
+                (x1, y2),
+            ]);
+            Rect::new(x1, y1, x2, y4)
         }
         "mathDivide" => {
-            let gap = h * a1.clamp(0.0, 100000.0) / 1e5;
-            let r = ss * a2.clamp(0.0, 50000.0) / 1e5 / 2.0;
-            b.poly(&[(mx, cy - t / 2.0), (w - mx, cy - t / 2.0), (w - mx, cy + t / 2.0), (mx, cy + t / 2.0)]);
-            b.ellipse(cx, cy - t / 2.0 - gap - r, r, r);
-            b.ellipse(cx, cy + t / 2.0 + gap + r, r, r);
+            let a = pin(1000.0, a0, 36745.0);
+            let max3 = ((73490.0 - a) / 4.0).min(36745.0 * w / h.max(1e-9));
+            let r3 = pin(1000.0, a2, max3);
+            let g = pin(0.0, a1, 73490.0 - 4.0 * r3 - a);
+            let dy1 = h * a / 200000.0;
+            let yg = h * g / 100000.0;
+            let rad = h * r3 / 100000.0;
+            let (y3, y4) = (vc - dy1, vc + dy1);
+            let y2 = y3 - (yg + rad);
+            let y1 = y2 - rad;
+            b.ellipse(hc, y1 + rad, rad, rad);
+            b.ellipse(hc, h - y1 - rad, rad, rad);
+            b.poly(&[(x1, y3), (x2, y3), (x2, y4), (x1, y4)]);
+            Rect::new(x1, y3, x2, y4)
         }
         _ => {
-            // mathMultiply: two bars crossing at the centre along the diagonals.
-            let len = ((cx - mx).powi(2) + (cy - my).powi(2)).sqrt();
-            let c = Point::new(cx, cy);
-            for d in [Vec2::new(cx - mx, cy - my), Vec2::new(cx - mx, -(cy - my))] {
-                let dir = d / d.hypot().max(1e-9);
-                let perp = Vec2::new(-dir.y, dir.x) * (t / 2.0);
-                let p = [c - dir * len - perp, c + dir * len - perp, c + dir * len + perp, c - dir * len + perp];
-                b.poly(&p.map(|q| (q.x, q.y)));
-            }
+            // mathMultiply: an X whose arms run along the box's diagonals.
+            let th = ss * pin(0.0, a0, 51965.0) / 100000.0;
+            let ang = h.atan2(w);
+            let (sa, ca, ta) = (ang.sin(), ang.cos(), ang.tan().max(1e-9));
+            let lm = w.hypot(h) * (1.0 - 51965.0 / 100000.0);
+            let (xm, ym) = (ca * lm / 2.0, sa * lm / 2.0);
+            let (dxam, dyam) = (sa * th / 2.0, ca * th / 2.0);
+            let (xa, ya, xb, yb) = (xm - dxam, ym + dyam, xm + dxam, ym - dyam);
+            let yc = (hc - xb) * ta + yb;
+            let (xd, xe) = (w - xb, w - xa);
+            let xfe = (vc - ya) / ta;
+            let (xf, xl) = (xe - xfe, xa + xfe);
+            let (yg, yh, yi) = (h - ya, h - yb, h - yc);
+            b.poly(&[(xa, ya), (xb, yb), (hc, yc), (xd, yb), (xe, ya), (xf, vc), (xe, yg), (xd, yh), (hc, yi), (xb, yh), (xa, yg), (xl, vc)]);
+            Rect::new(xa, yb, xe, yh)
         }
-    }
-    Geometry { paths: vec![fill(b.take())], text_rect: Rect::new(mx, cy - t / 2.0, w - mx, cy + t / 2.0), handles: vec![], sites: mid_sites(w, h) }
+    };
+    Geometry { paths: vec![fill(b.take())], text_rect: text, handles: vec![], sites: mid_sites(w, h) }
 }
 
 fn ribbon(up: bool, w: f64, h: f64, a0: f64, a1: f64) -> Geometry {
@@ -1967,5 +2234,159 @@ mod tests {
     fn lines_are_open() {
         assert!(build("line", 10.0, 10.0, &[]).unwrap().is_open());
         assert!(!build("rect", 10.0, 10.0, &[]).unwrap().is_open());
+    }
+
+    fn on_path(g: &Geometry, p: Point, tol: f64) -> bool {
+        use kurbo::ParamCurveNearest;
+        g.paths.iter().any(|sp| sp.path.segments().any(|seg| seg.nearest(p, 1e-6).distance_sq <= tol * tol))
+    }
+
+    #[test]
+    fn fixed_shapes_follow_the_standards_coordinates() {
+        // Points of ECMA-376's definitions (in 21600ths), checked on a 216 × 108 box.
+        let (w, h) = (216.0, 108.0);
+        let at = |x: f64, y: f64| Point::new(w * x / 21600.0, h * y / 21600.0);
+        let g = build("lightningBolt", w, h, &[]).unwrap();
+        for (x, y) in [(8472.0, 0.0), (16577.0, 12007.0), (21600.0, 21600.0), (0.0, 3890.0)] {
+            assert!(on_path(&g, at(x, y), 1e-6), "lightningBolt ({x}, {y})");
+        }
+        let g = build("irregularSeal1", w, h, &[]).unwrap();
+        assert!(on_path(&g, at(14522.0, 0.0), 1e-6) && on_path(&g, at(8485.0, 21600.0), 1e-6));
+        let g = build("irregularSeal2", w, h, &[]).unwrap();
+        assert!(on_path(&g, at(14790.0, 0.0), 1e-6) && on_path(&g, at(4917.0, 21600.0), 1e-6));
+        // The heart's point is the middle of the bottom edge, its notch a quarter down.
+        let g = build("heart", w, h, &[]).unwrap();
+        assert!(on_path(&g, Point::new(w / 2.0, h), 1e-6) && on_path(&g, Point::new(w / 2.0, h / 4.0), 1e-6));
+        let g = build("flowChartDocument", w, h, &[]).unwrap();
+        assert!(on_path(&g, at(21600.0, 17322.0), 1e-6) && on_path(&g, at(0.0, 20172.0), 1e-6));
+        // Punched tape: the top edge dips to a fifth of the height a quarter of the way along.
+        let g = build("flowChartPunchedTape", w, h, &[]).unwrap();
+        assert!(on_path(&g, Point::new(w / 4.0, h / 5.0), 1e-3) && on_path(&g, Point::new(w * 0.75, 0.0), 1e-3));
+        let g = build("flowChartMultidocument", w, h, &[]).unwrap();
+        assert!(on_path(&g, at(2972.0, 0.0), 1e-6) && on_path(&g, at(18595.0, 18022.0), 1e-6));
+    }
+
+    #[test]
+    fn equation_shapes_match_powerpoints_outlines() {
+        // Corners read off PowerPoint's own outlines of the presets at their default adjusts.
+        let g = build("mathMultiply", 216.0, 216.0, &[]).unwrap();
+        for (x, y) in [(0.32333, 0.15702), (0.5, 0.33369), (0.84298, 0.32333), (0.66631, 0.5), (0.33369, 0.5)] {
+            assert!(on_path(&g, Point::new(216.0 * x, 216.0 * y), 0.01), "multiply ({x}, {y})");
+        }
+        let g = build("mathEqual", 300.0, 120.0, &[]).unwrap();
+        for (x, y) in [(0.13255, 0.5588), (0.86745, 0.794), (0.13255, 0.206), (0.86745, 0.4412)] {
+            assert!(on_path(&g, Point::new(300.0 * x, 120.0 * y), 0.01), "equal ({x}, {y})");
+        }
+        let g = build("mathPlus", 216.0, 216.0, &[]).unwrap();
+        assert!(on_path(&g, Point::new(216.0 * 0.3824, 216.0 * 0.13255), 0.01) && on_path(&g, Point::new(216.0 * 0.86745, 216.0 * 0.6176), 0.01));
+        // A tall "not equal": its slash, leaning at the default 110° from top to bottom, reaches
+        // past the box's sides exactly as far as PowerPoint's (-22.242 to 122.242).
+        let g = build("mathNotEqual", 100.0, 260.0, &[]).unwrap();
+        use kurbo::Shape as _;
+        let bb = g.paths[0].path.bounding_box();
+        assert!((bb.x0 + 22.242).abs() < 0.01 && (bb.x1 - 122.242).abs() < 0.01 && bb.y0.abs() < 1e-6 && (bb.y1 - 260.0).abs() < 1e-6, "{bb:?}");
+    }
+
+    #[test]
+    fn sun_and_waves_match_powerpoints_outlines() {
+        // Points read off PowerPoint's outlines of the presets (216 pt square, default adjusts).
+        let k = 216.0;
+        let g = build("sun", k, k, &[]).unwrap();
+        for (x, y) in [(0.85352, 0.14644), (0.76161, 0.33987), (0.66013, 0.23839), (0.42825, 0.79823), (0.20177, 0.57175), (0.75, 0.5), (0.5, 0.25)] {
+            assert!(on_path(&g, Point::new(k * x, k * y), 0.02), "sun ({x}, {y})");
+        }
+        let g = build("wave", k, k, &[]).unwrap();
+        for (x, y) in [(0.21875, 0.00484), (1.0, 0.125), (1.0, 0.875), (0.0, 0.875)] {
+            assert!(on_path(&g, Point::new(k * x, k * y), 0.05), "wave ({x}, {y})");
+        }
+        // Shifted: a wave of 300 × 120 with adj (20000, 8000) starts 0.16 of the width in.
+        let g = build("wave", 300.0, 120.0, &[20000.0, 8000.0]).unwrap();
+        for (x, y) in [(0.18375, 0.00774), (0.84, 0.2), (1.0, 0.8), (0.16, 0.8)] {
+            assert!(on_path(&g, Point::new(300.0 * x, 120.0 * y), 0.05), "shifted wave ({x}, {y})");
+        }
+    }
+
+    #[test]
+    fn stars_are_stretched_like_the_standards() {
+        // star5 in a 216 pt square: top point at the top middle, side points at 18 degrees on an
+        // ellipse 5.146% wider and 10.557% taller, centred 10.557% below the middle; its bottom
+        // points reach the box's bottom edge.
+        let k = 216.0;
+        let g = build("star5", k, k, &[]).unwrap();
+        let (rx, ry, cy) = (k / 2.0 * 1.05146, k / 2.0 * 1.10557, k / 2.0 * 1.10557);
+        let a = 18f64.to_radians();
+        assert!(on_path(&g, Point::new(k / 2.0, 0.0), 1e-6));
+        assert!(on_path(&g, Point::new(k / 2.0 + rx * a.cos(), cy - ry * a.sin()), 1e-6));
+        use kurbo::Shape as _;
+        let bb = g.paths[0].path.bounding_box();
+        assert!((bb.x0).abs() < 0.5 && (bb.x1 - k).abs() < 0.5 && (bb.y1 - k).abs() < 0.5, "{bb:?}");
+        // star6 is 15.47% wider than its box's half-width allows (its points touch the sides).
+        let g = build("star6", k, k, &[]).unwrap();
+        let bb = g.paths[0].path.bounding_box();
+        assert!((bb.x0).abs() < 0.5 && (bb.x1 - k).abs() < 0.5, "{bb:?}");
+    }
+
+    #[test]
+    fn moon_disk_and_drum_match_powerpoints_outlines() {
+        let k = 216.0;
+        // Moon, default: the inner edge runs through (0.5, 0.5) and (0.625, 0.2266) of the box.
+        let g = build("moon", k, k, &[]).unwrap();
+        for (x, y) in [(0.5, 0.5), (0.626, 0.2266), (0.0, 0.5), (1.0, 0.0)] {
+            assert!(on_path(&g, Point::new(k * x, k * y), 0.5), "moon ({x}, {y})");
+        }
+        // 300 × 120 at 30%: its inner edge reaches 30% of the width in.
+        let g = build("moon", 300.0, 120.0, &[30000.0]).unwrap();
+        assert!(on_path(&g, Point::new(90.0, 60.0), 0.5));
+        // Magnetic disk ends are ellipses h/6 high, drum ends w/6 across.
+        let g = build("flowChartMagneticDisk", k, k, &[]).unwrap();
+        assert!(on_path(&g, Point::new(k, k / 6.0), 0.01) && on_path(&g, Point::new(k / 2.0, k / 3.0), 0.5));
+        let g = build("flowChartMagneticDrum", k, k, &[]).unwrap();
+        assert!(on_path(&g, Point::new(k / 6.0, 0.0), 0.01) && on_path(&g, Point::new(0.0, k / 2.0), 0.01));
+    }
+
+    #[test]
+    fn the_cloud_fills_its_box_at_any_aspect_and_has_creases() {
+        use kurbo::Shape as _;
+        for (w, h) in [(200.0, 200.0), (300.0, 100.0), (60.0, 180.0)] {
+            let g = build("cloud", w, h, &[]).unwrap();
+            let bb = g.paths[0].path.bounding_box();
+            assert!(bb.x0.abs() < w * 0.02 && (bb.x1 - w).abs() < w * 0.02, "{w}×{h}: {bb:?}");
+            assert!(bb.y0.abs() < h * 0.02 && (bb.y1 - h).abs() < h * 0.02, "{w}×{h}: {bb:?}");
+            assert_eq!(g.paths.len(), 2, "outline and creases");
+            assert!(g.paths[1].stroke && g.paths[1].fill == FillMode::None);
+        }
+    }
+
+    #[test]
+    fn spec_arcs_take_angles_as_directions_from_the_centre() {
+        // A DrawingML arc of a 2:1 ellipse from 45° to 90°: 45° is the direction (1, 1) from the
+        // centre, which on that ellipse is the point (r/√5)·(2, 1)… scaled so it lies on it.
+        let mut b = Pb::new();
+        b.m(0.0, 0.0).arc_spec(200.0, 100.0, 45.0, 45.0);
+        let p = b.take();
+        let end = p.elements().last().and_then(|e| match e {
+            kurbo::PathEl::CurveTo(_, _, q) => Some(*q),
+            _ => None,
+        });
+        // Centre: the start sits at direction 45°, i.e. at (k, k) from it with (k/200)² + (k/100)² = 1.
+        let k = 1.0 / (1.0f64 / 40000.0 + 1.0 / 10000.0).sqrt();
+        let c = Point::new(-k, -k);
+        let q = end.unwrap();
+        assert!((q.x - c.x).abs() < 1e-6 && (q.y - (c.y + 100.0)).abs() < 1e-6, "{q:?} vs centre {c:?}");
+    }
+
+    #[test]
+    fn brackets_and_braces_fill_out_to_their_straight_side() {
+        // PowerPoint fills a bracket or brace (when it has a fill) between its curve and the
+        // straight side it opens to; only the curve is outlined.
+        for name in ["leftBracket", "rightBracket", "leftBrace", "rightBrace"] {
+            let g = build(name, 40.0, 100.0, &[]).unwrap();
+            let filled: Vec<_> = g.paths.iter().filter(|p| p.fill != FillMode::None).collect();
+            assert_eq!(filled.len(), 1, "{name}");
+            assert!(!filled[0].stroke, "{name}: the filled area is not outlined");
+            let area = filled[0].path.area().abs();
+            assert!(area > 40.0 * 100.0 * 0.4 && area < 40.0 * 100.0, "{name}: {area}");
+            assert!(g.paths.iter().any(|p| p.stroke && p.fill == FillMode::None), "{name}: the curve is outlined");
+        }
     }
 }

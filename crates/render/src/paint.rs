@@ -35,6 +35,22 @@ pub fn fill_path(
             if g.stops.is_empty() {
                 return;
             }
+            // `rotWithShape="0"`: the gradient keeps to the slide's axes when the shape is
+            // rotated or flipped, laid out over the box the shape covers on the slide.
+            let c = m.as_coeffs();
+            let turned = c[1].abs() > 1e-9 || c[2].abs() > 1e-9 || c[0] < 0.0 || c[3] < 0.0;
+            let path_kind = matches!(&g.shape, GradientShape::Path { path: k, .. } if matches!(k.as_str(), "rect" | "shape"));
+            if !g.rotate_with_shape && turned && !path_kind && m.determinant().abs() > 1e-12 {
+                let on_slide = m.transform_rect_bbox(bounds);
+                let upright = deckcraft_model::style::Gradient { rotate_with_shape: true, ..g.clone() };
+                let paint_path = m * path.clone();
+                fill_path(ctx, rctx, &Fill::Gradient(upright), ph, &paint_path, on_slide, Affine::IDENTITY, mode, alpha, pres);
+                return;
+            }
+            // A linear gradient spans its tile rectangle (the shape's box unless `tileRect` moves
+            // its edges); a radial one ends on the circle around it, from a focus placed in the
+            // shape's own box (PowerPoint's "from corner" presets centre the tile on the corner).
+            let tile = tile_box(bounds, g.tile);
             let stops: Vec<(f64, Rgba)> = g.stops.iter().map(|s| (s.pos, shade(rctx.color(&s.color, ph), mode))).collect();
             ctx.set_paint(gradient(&g.shape, stops, bounds, alpha));
 
@@ -55,26 +71,30 @@ pub fn fill_path(
                     // Angle measured clockwise from left→right; span the bounds along that direction.
                     let a = angle.to_radians();
                     let (dx, dy) = (a.cos(), a.sin());
-                    let c = bounds.center();
-                    let half = (bounds.width() * dx.abs() + bounds.height() * dy.abs()) / 2.0;
+                    let c = tile.center();
+                    let half = (tile.width() * dx.abs() + tile.height() * dy.abs()) / 2.0;
                     peniko::Gradient::new_linear(Point::new(c.x - dx * half, c.y - dy * half), Point::new(c.x + dx * half, c.y + dy * half))
                         .with_stops(stops.as_slice())
                 }
-                GradientShape::Path { focus, .. } => {
-                    let fx = bounds.x0 + bounds.width() * (focus[0] + (1.0 - focus[2])) / 2.0;
-                    let fy = bounds.y0 + bounds.height() * (focus[1] + (1.0 - focus[3])) / 2.0;
-                    // Reach the farthest corner, so a gradient from a corner covers the whole box.
-                    let r = [(bounds.x0, bounds.y0), (bounds.x1, bounds.y0), (bounds.x0, bounds.y1), (bounds.x1, bounds.y1)]
-                        .iter()
-                        .map(|(x, y)| ((x - fx).powi(2) + (y - fy).powi(2)).sqrt())
-                        .fold(1e-6, f64::max);
-                    peniko::Gradient::new_radial(Point::new(fx, fy), r as f32).with_stops(stops.as_slice())
-                }
+                GradientShape::Path { focus, .. } => circle_gradient(*focus, bounds, tile).with_stops(stops.as_slice()),
             };
             ctx.set_paint(grad);
             ctx.fill_path(path);
         }
         Fill::Picture(pf) => {
+            // `rotWithShape="0"`: upright on the slide, stretched over the box the turned shape
+            // covers, clipped to it.
+            let c = m.as_coeffs();
+            let turned = c[1].abs() > 1e-9 || c[2].abs() > 1e-9 || c[0] < 0.0 || c[3] < 0.0;
+            if pf.upright && turned && m.determinant().abs() > 1e-12 {
+                let on_slide = m.transform_rect_bbox(bounds);
+                let on_path = m * path.clone();
+                ctx.set_transform(Affine::IDENTITY);
+                ctx.push_clip_layer(&on_path);
+                picture(ctx, pres, &resolved(rctx, pf, ph), on_slide, Affine::IDENTITY, None);
+                ctx.pop_layer();
+                return;
+            }
             ctx.push_clip_layer(path);
             picture(ctx, pres, &resolved(rctx, pf, ph), bounds, m, None);
             ctx.pop_layer();
@@ -97,6 +117,22 @@ pub fn resolved<'a>(rctx: &Ctx, pf: &'a PictureFill, ph: Option<Rgba>) -> std::b
     std::borrow::Cow::Owned(out)
 }
 
+/// `bounds` with its edges moved in by `tile` (left, top, right, bottom insets as fractions of its
+/// size; negative moves them out), as `a:tileRect` and `a:fillRect` lay out a fill.
+pub fn tile_box(bounds: Rect, tile: [f64; 4]) -> Rect {
+    if tile.iter().all(|v| *v == 0.0) || tile.iter().any(|v| !v.is_finite()) {
+        return bounds;
+    }
+    let (w, h) = (bounds.width(), bounds.height());
+    let [l, t, r, b] = tile;
+    let x0 = bounds.x0 + l * w;
+    let x1 = bounds.x1 - r * w;
+    let y0 = bounds.y0 + t * h;
+    let y1 = bounds.y1 - b * h;
+    // An inverted tile (insets past each other) lays out nothing sensible: keep the box.
+    if x1 - x0 <= 1e-9 || y1 - y0 <= 1e-9 { bounds } else { Rect::new(x0, y0, x1, y1) }
+}
+
 /// The paint of a gradient of `shape` with `stops` (position, colour) spanning `bounds`, faded
 /// by `alpha`, ramping between stops as PowerPoint does (see `ramp`).
 pub fn gradient(shape: &GradientShape, mut stops: Vec<(f64, Rgba)>, bounds: Rect, alpha: f64) -> peniko::Gradient {
@@ -116,17 +152,32 @@ pub fn gradient(shape: &GradientShape, mut stops: Vec<(f64, Rgba)>, bounds: Rect
             peniko::Gradient::new_linear(Point::new(c.x - dx * half, c.y - dy * half), Point::new(c.x + dx * half, c.y + dy * half))
                 .with_stops(stops.as_slice())
         }
-        GradientShape::Path { focus, .. } => {
-            let fx = bounds.x0 + bounds.width() * (focus[0] + (1.0 - focus[2])) / 2.0;
-            let fy = bounds.y0 + bounds.height() * (focus[1] + (1.0 - focus[3])) / 2.0;
-            // Reach the farthest corner, so a gradient from a corner covers the whole box.
-            let r = [(bounds.x0, bounds.y0), (bounds.x1, bounds.y0), (bounds.x0, bounds.y1), (bounds.x1, bounds.y1)]
-                .iter()
-                .map(|(x, y)| ((x - fx).powi(2) + (y - fy).powi(2)).sqrt())
-                .fold(1e-6, f64::max);
-            peniko::Gradient::new_radial(Point::new(fx, fy), r as f32).with_stops(stops.as_slice())
-        }
+        GradientShape::Path { focus, .. } => circle_gradient(*focus, bounds, bounds).with_stops(stops.as_slice()),
     }
+}
+
+/// A `circle` path gradient over `bounds` with focus rectangle `focus` (`fillToRect` insets, as
+/// fractions). As PowerPoint draws it (fitted to its exports): the first stop is a point at the
+/// focus (the middle of the focus rectangle) and the last is the circle around the whole box (its
+/// centre, half its diagonal), with circles in between moving from one to the other. A focus off
+/// the centre so bunches the colours on its near side; a gradient "from a corner" reaches its
+/// last colour at that corner too, not only at the far one.
+///
+/// With a tile rectangle (`tile`, otherwise `bounds` itself) the end circle is the one around
+/// the tile, while the focus stays placed in `bounds`.
+pub fn circle_gradient(focus: [f64; 4], bounds: Rect, tile: Rect) -> peniko::Gradient {
+    let fx = bounds.x0 + bounds.width() * (focus[0] + (1.0 - focus[2])) / 2.0;
+    let fy = bounds.y0 + bounds.height() * (focus[1] + (1.0 - focus[3])) / 2.0;
+    let c = tile.center();
+    let r = (tile.width().hypot(tile.height()) / 2.0).max(1e-6);
+    let f = Point::new(fx, fy);
+    if !(f.is_finite() && c.is_finite() && r.is_finite()) {
+        return peniko::Gradient::new_radial(c, r as f32);
+    }
+    // A focus on or outside the end circle has no circle through it: keep it just inside.
+    let d = f - c;
+    let f = if d.hypot() > r * 0.999 { c + d * (r * 0.999 / d.hypot()) } else { f };
+    peniko::Gradient::new_two_point_radial(f, 0.0, c, r as f32)
 }
 
 /// Draw a picture fill into `bounds` (shape-local) honouring crop and stretch/tile modes; an animated
@@ -165,22 +216,65 @@ pub fn picture(ctx: &mut RenderContext, pres: &Presentation, pf: &PictureFill, b
         image: vello_cpu::ImageSource::Pixmap(pm.clone()),
         sampler: peniko::ImageSampler { quality: peniko::ImageQuality::High, ..Default::default() },
     };
-    if let PictureMode::Tile { sx, sy, tx, ty, .. } = &pf.mode {
-        let (sx, sy) = (if *sx > 0.0 { *sx } else { 1.0 }, if *sy > 0.0 { *sy } else { 1.0 });
-        let tile_w = iw * 0.75 * sx;
-        let tile_h = ih * 0.75 * sy;
-        let nx = ((bounds.width() / tile_w.max(1.0)).ceil() as i64).clamp(0, 200);
-        let ny = ((bounds.height() / tile_h.max(1.0)).ceil() as i64).clamp(0, 200);
-        for j in -1..=ny {
-            for i in -1..=nx {
-                let r = Rect::new(bounds.x0 + tx + i as f64 * tile_w, bounds.y0 + ty + j as f64 * tile_h, 0.0, 0.0);
-                let r = Rect::new(r.x0, r.y0, r.x0 + tile_w, r.y0 + tile_h);
-                draw_image(ctx, &image, iw, ih, r, m, alpha);
-            }
+    if let PictureMode::Tile { sx, sy, tx, ty, flip, align } = &pf.mode {
+        // The tile's size: the picture's own size (96 dpi) scaled. A scale of zero or less draws
+        // nothing, as in PowerPoint.
+        if !(*sx > 0.0 && *sy > 0.0 && sx.is_finite() && sy.is_finite()) {
+            return;
+        }
+        let (nw, nh) = images::natural_size(&item.data).unwrap_or((iw, ih));
+        // PowerPoint draws the tile at a whole number of output pixels.
+        let k = px_scale.max(1e-9);
+        let snap = |v: f64| (v * k).round().max(1.0) / k;
+        let (tile_w, tile_h) = (snap(nw * 0.75 * sx), snap(nh * 0.75 * sy));
+        if !(tile_w > 1e-6 && tile_h > 1e-6 && tile_w.is_finite() && tile_h.is_finite()) {
+            return;
+        }
+        let o = tile_origin(bounds, align, (tile_w, tile_h), (*tx, *ty));
+        // Every other tile is mirrored across the flip axes: a reflected repeat.
+        let ext = |mirror: bool| if mirror { peniko::Extend::Reflect } else { peniko::Extend::Repeat };
+        let tiled = vello_cpu::Image {
+            image: vello_cpu::ImageSource::Pixmap(pm.clone()),
+            sampler: peniko::ImageSampler {
+                x_extend: ext(matches!(flip.as_str(), "x" | "xy")),
+                y_extend: ext(matches!(flip.as_str(), "y" | "xy")),
+                quality: peniko::ImageQuality::High,
+                alpha: 1.0,
+            },
+        };
+        ctx.set_transform(m);
+        if alpha < 0.999 {
+            ctx.push_layer(None, None, Some(alpha as f32), None, None);
+        }
+        ctx.set_paint(tiled);
+        ctx.set_paint_transform(Affine::translate(o.to_vec2()) * Affine::scale_non_uniform(tile_w / iw, tile_h / ih));
+        ctx.fill_rect(&bounds);
+        ctx.reset_paint_transform();
+        if alpha < 0.999 {
+            ctx.pop_layer();
         }
         return;
     }
     draw_image(ctx, &image, iw, ih, dest, m, alpha);
+}
+
+/// Where the first tile of a tiled picture fill goes in `bounds`: its corner, edge middle or
+/// centre named by `align` (`tl`, `t`, `tr`, `l`, `ctr`, `r`, `bl`, `b`, `br`) on the same point
+/// of the box, then moved by the offset (points).
+pub fn tile_origin(bounds: Rect, align: &str, tile: (f64, f64), offset: (f64, f64)) -> Point {
+    let (ax, ay) = match align {
+        "t" => (0.5, 0.0),
+        "tr" => (1.0, 0.0),
+        "l" => (0.0, 0.5),
+        "ctr" => (0.5, 0.5),
+        "r" => (1.0, 0.5),
+        "bl" => (0.0, 1.0),
+        "b" => (0.5, 1.0),
+        "br" => (1.0, 1.0),
+        _ => (0.0, 0.0),
+    };
+    let (ox, oy) = (if offset.0.is_finite() { offset.0 } else { 0.0 }, if offset.1.is_finite() { offset.1 } else { 0.0 });
+    Point::new(bounds.x0 + ax * (bounds.width() - tile.0) + ox, bounds.y0 + ay * (bounds.height() - tile.1) + oy)
 }
 
 fn draw_image(ctx: &mut RenderContext, image: &vello_cpu::Image, iw: f64, ih: f64, dest: Rect, m: Affine, alpha: f64) {

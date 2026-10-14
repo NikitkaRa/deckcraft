@@ -105,6 +105,7 @@ pub fn rich_deck() -> Presentation {
     let mut a = shape(&mut p, "Gradient Star", 100.0, 120.0, 150.0, 150.0);
     a.geom = Geom::Preset { name: "star5".into(), adj: vec![20000.0] };
     a.fill = Some(Fill::Gradient(Gradient {
+        tile: [0.0; 4],
         stops: vec![
             GradientStop { pos: 0.0, color: ColorRef::scheme(SchemeSlot::Accent1) },
             GradientStop { pos: 1.0, color: ColorRef::scheme(SchemeSlot::Accent2).with(ColorTransform::LumMod(75000)) },
@@ -230,6 +231,7 @@ pub fn rich_deck() -> Presentation {
             mode: PictureMode::Stretch { fill_rect: [0.0; 4] },
             alpha: Some(0.5),
             adjust: PictureAdjust { brightness: 0.2, contrast: -0.1, grayscale: true, ..Default::default() },
+            upright: false,
         },
     };
     let mut tiled = shape(&mut p, "Tiled", 350.0, 120.0, 200.0, 150.0);

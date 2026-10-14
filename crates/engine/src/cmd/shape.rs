@@ -261,7 +261,7 @@ pub(crate) fn gradient_param(v: &Value) -> Option<Gradient> {
             scaled: false,
         },
     };
-    Some(Gradient { stops, shape, rotate_with_shape: v.get("rotateWithShape").and_then(Value::as_bool).unwrap_or(true) })
+    Some(Gradient { tile: [0.0; 4], stops, shape, rotate_with_shape: v.get("rotateWithShape").and_then(Value::as_bool).unwrap_or(true) })
 }
 
 fn fill(s: &mut Session, p: &Value) -> Result<Value> {
