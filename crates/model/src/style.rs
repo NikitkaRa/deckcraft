@@ -92,6 +92,15 @@ pub struct Gradient {
     pub shape: GradientShape,
     #[serde(default = "crate::yes")]
     pub rotate_with_shape: bool,
+    /// `a:tileRect`: the box the gradient is laid out in, as insets from the shape's box
+    /// (fractions; negative reaches outside it). PowerPoint's "from corner" radial presets use it
+    /// to centre the gradient on the corner.
+    #[serde(default, skip_serializing_if = "is_zero4")]
+    pub tile: [f64; 4],
+}
+
+fn is_zero4(v: &[f64; 4]) -> bool {
+    v.iter().all(|x| *x == 0.0)
 }
 
 /// How a picture fills its box: stretched into a (fractional) inset rect, or tiled.
@@ -130,6 +139,10 @@ pub struct PictureFill {
     /// 0–1 opacity of the picture.
     pub alpha: Option<f64>,
     pub adjust: PictureAdjust,
+    /// `rotWithShape="0"`: the picture keeps to the slide's axes when its shape is rotated or
+    /// flipped.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub upright: bool,
 }
 
 /// Picture corrections and colour (Picture Format ▸ Corrections / Color / Transparency).
@@ -148,6 +161,12 @@ pub struct PictureAdjust {
     /// Make a colour transparent (Set Transparent Color).
     pub clear_color: Option<Rgba>,
     pub sharpen: f64,
+    /// `a:biLevel`: black and white, split at this luminance (0–1).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bilevel: Option<f64>,
+    /// `a:alphaInv`: opacity inverted.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub alpha_inv: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

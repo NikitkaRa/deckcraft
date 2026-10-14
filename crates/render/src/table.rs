@@ -348,6 +348,17 @@ pub fn draw(
             },
         }
     }
+    // Diagonal borders, under the edges: drawn like any line (dashes, compound, caps).
+    for (r, c, rect) in &rects {
+        let Some(cell) = t.cell(*r, *c) else { continue };
+        for (line, a, b) in [(&cell.diag_down, (rect.x0, rect.y0), (rect.x1, rect.y1)), (&cell.diag_up, (rect.x0, rect.y1), (rect.x1, rect.y0))] {
+            let Some(l) = line.as_ref().filter(|l| l.fill.as_ref().is_some_and(|f| !f.is_none())) else { continue };
+            let mut p = BezPath::new();
+            p.move_to(a);
+            p.line_to(b);
+            crate::stroke(ctx, rctx, l, None, &p, None, m, l.width.unwrap_or(1.0).max(0.0), 1.0);
+        }
+    }
     // Borders: explicit cell borders, else the style's grid.
     for (r, c, rect) in &rects {
         let Some(cell) = t.cell(*r, *c) else { continue };
@@ -361,11 +372,16 @@ pub fn draw(
         for (i, e) in edges.iter().enumerate() {
             let line = cell.borders.get(i).and_then(|b| b.as_ref());
             let (col, wd) = match line {
-                Some(l) => match &l.fill {
-                    Some(Fill::Solid { color: cc }) => (rctx.color(cc, None), l.width.unwrap_or(1.0)),
-                    Some(Fill::None) => continue,
-                    _ => continue,
-                },
+                // An explicit border is drawn like any line: dashed, compound, gradient.
+                Some(l) => {
+                    if l.fill.as_ref().is_some_and(|f| !f.is_none()) {
+                        let mut p = BezPath::new();
+                        p.move_to((e.0, e.1));
+                        p.line_to((e.2, e.3));
+                        crate::stroke(ctx, rctx, l, None, &p, None, m, l.width.unwrap_or(1.0).max(0.25), 1.0);
+                    }
+                    continue;
+                }
                 None => match lk.sides.get(i).copied().flatten().or(lk.border) {
                     Some(b) if b.0.a > 0 && b.1 > 0.0 => b,
                     _ => continue,

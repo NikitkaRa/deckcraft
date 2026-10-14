@@ -66,15 +66,17 @@ fn with<R>(f: impl FnOnce(&mut Cache) -> R) -> R {
 }
 
 fn adjust_key(a: &PictureAdjust) -> u64 {
-    let mut h: u64 = 1469598103934665603;
-    let mut mix = |v: u64| {
-        h ^= v;
-        h = h.wrapping_mul(1099511628211);
-    };
+    use std::hash::Hasher;
+    // A real hash: an FNV-style xor-multiply mix let (b, c) and (-b, -c) collide (the sign bits
+    // cancel), so a picture brightened and contrasted showed the darkened copy's pixels.
+    let mut hs = std::hash::DefaultHasher::new();
+    let mut mix = |v: u64| hs.write_u64(v);
     mix(a.brightness.to_bits());
     mix(a.contrast.to_bits());
     mix(a.saturation.unwrap_or(1.0).to_bits());
     mix(a.grayscale as u64);
+    mix(a.bilevel.map_or(u64::MAX, f64::to_bits));
+    mix(a.alpha_inv as u64);
     mix(a.sharpen.to_bits());
     if let Some(c) = a.clear_color {
         mix(((c.r as u64) << 16) | ((c.g as u64) << 8) | c.b as u64 | 1 << 40);
@@ -84,7 +86,7 @@ fn adjust_key(a: &PictureAdjust) -> u64 {
             mix(((c.r as u64) << 24) | ((c.g as u64) << 16) | ((c.b as u64) << 8) | c.a as u64 | 1 << 41);
         }
     }
-    h
+    hs.finish()
 }
 
 /// The duotone's dark and light colours. The painter resolves them to plain RGB first (see
@@ -119,6 +121,56 @@ fn decode_at(bytes: &[u8], side: u32) -> Option<image::RgbaImage> {
         return None;
     }
     Some(img.to_rgba8())
+}
+
+/// A raster picture's own size in 96-dpi pixels (so 0.75 pt each), read from its header: its
+/// pixel size, scaled by the resolution it records (PNG `pHYs`, JPEG JFIF density) when that
+/// isn't 96 dpi, as PowerPoint sizes pictures. `None` for metafiles and anything unreadable.
+pub fn natural_size(bytes: &[u8]) -> Option<(f64, f64)> {
+    if crate::metafile::is_metafile(bytes) {
+        return None;
+    }
+    let (w, h) = image::ImageReader::new(std::io::Cursor::new(bytes)).with_guessed_format().ok()?.into_dimensions().ok()?;
+    if w == 0 || h == 0 {
+        return None;
+    }
+    let (dx, dy) = dpi(bytes).unwrap_or((96.0, 96.0));
+    Some((w as f64 * 96.0 / dx, h as f64 * 96.0 / dy))
+}
+
+/// The resolution (whole dots per inch across and down) a PNG or JPEG records, when it records
+/// one in a plausible range.
+pub fn dpi(bytes: &[u8]) -> Option<(f64, f64)> {
+    // Whole dots per inch: PNGs store dots per metre, so 96 dpi reads as 95.9866.
+    let ok = |d: f64| (d.is_finite() && (10.0..=10000.0).contains(&d)).then_some(d.round());
+    let be32 = |b: &[u8], i: usize| b.get(i..i + 4).map(|s| u32::from_be_bytes([s[0], s[1], s[2], s[3]]));
+    let be16 = |b: &[u8], i: usize| b.get(i..i + 2).map(|s| u16::from_be_bytes([s[0], s[1]]));
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        let mut i = 8usize;
+        for _ in 0..64 {
+            let len = be32(bytes, i)? as usize;
+            let kind = bytes.get(i + 4..i + 8)?;
+            if kind == b"pHYs" {
+                let (x, y, unit) = (be32(bytes, i + 8)?, be32(bytes, i + 12)?, *bytes.get(i + 16)?);
+                return if unit == 1 { Some((ok(x as f64 * 0.0254)?, ok(y as f64 * 0.0254)?)) } else { None };
+            }
+            if kind == b"IDAT" || kind == b"IEND" {
+                return None;
+            }
+            i = i.checked_add(12)?.checked_add(len)?;
+        }
+        return None;
+    }
+    if bytes.starts_with(&[0xFF, 0xD8]) && bytes.get(6..11) == Some(b"JFIF\0".as_slice()) {
+        let unit = *bytes.get(13)?;
+        let (x, y) = (be16(bytes, 14)? as f64, be16(bytes, 16)? as f64);
+        return match unit {
+            1 => Some((ok(x)?, ok(y)?)),
+            2 => Some((ok(x * 2.54)?, ok(y * 2.54)?)),
+            _ => None,
+        };
+    }
+    None
 }
 
 /// A premultiplied pixmap of the picture, downsampled so its longer side is near `want` px.
@@ -256,7 +308,15 @@ pub(crate) fn gif_pixmap(bytes: &Arc<Vec<u8>>, adj: &PictureAdjust, t: f64) -> O
 
 fn apply_adjust(img: &mut image::RgbaImage, a: &PictureAdjust) {
     let sat = a.saturation.unwrap_or(1.0);
-    if a.brightness == 0.0 && a.contrast == 0.0 && sat == 1.0 && !a.grayscale && a.clear_color.is_none() && a.duotone.is_none() {
+    if a.brightness == 0.0
+        && a.contrast == 0.0
+        && sat == 1.0
+        && !a.grayscale
+        && a.clear_color.is_none()
+        && a.duotone.is_none()
+        && a.bilevel.is_none()
+        && !a.alpha_inv
+    {
         return;
     }
     let duo = duotone_rgb(a);
@@ -273,24 +333,41 @@ fn apply_adjust(img: &mut image::RgbaImage, a: &PictureAdjust) {
             continue;
         }
         let mut rgb = [p[0] as f64, p[1] as f64, p[2] as f64];
-        let y = 0.299 * rgb[0] + 0.587 * rgb[1] + 0.114 * rgb[2];
+        let y = luma(rgb);
         let s = if a.grayscale { 0.0 } else { sat };
         for v in &mut rgb {
             *v = y + (*v - y) * s;
-            *v = (*v - 128.0) * cf + 128.0 + b;
+            // Measured on PowerPoint's export of grey ramps: contrast scales about mid-grey by
+            // `cf`, and brightness adds b · 255 scaled by (1 + cf) / 2 (half of it is applied
+            // before the contrast stretch, half after): +40% bright, +40% contrast maps 0 to 54.
+            *v = (*v - 127.5) * cf + 127.5 + b * (1.0 + cf) / 2.0;
         }
         // Duotone: the pixel's luminance picks a colour between the dark and the light one.
         if let Some((d, l)) = duo {
-            let t = ((0.299 * rgb[0] + 0.587 * rgb[1] + 0.114 * rgb[2]) / 255.0).clamp(0.0, 1.0);
+            let t = (luma(rgb) / 255.0).clamp(0.0, 1.0);
             rgb =
                 [d.r as f64 + (l.r as f64 - d.r as f64) * t, d.g as f64 + (l.g as f64 - d.g as f64) * t, d.b as f64 + (l.b as f64 - d.b as f64) * t];
+        }
+        // Black and white: white where the luminance reaches the threshold.
+        if let Some(t) = a.bilevel {
+            let v = if luma(rgb) >= t * 255.0 { 255.0 } else { 0.0 };
+            rgb = [v; 3];
         }
         for (i, v) in rgb.iter().enumerate() {
             if let Some(ch) = p.0.get_mut(i) {
                 *ch = v.round().clamp(0.0, 255.0) as u8;
             }
         }
+        if a.alpha_inv {
+            p[3] = 255 - p[3];
+        }
     }
+}
+
+/// Luminance as PowerPoint weighs it for grayscale, black-and-white and duotone pictures
+/// (measured: Rec. 709 weights on the stored values; pure red greys to 54, green to 182).
+fn luma(rgb: [f64; 3]) -> f64 {
+    0.2126 * rgb[0] + 0.7152 * rgb[1] + 0.0722 * rgb[2]
 }
 
 #[cfg(test)]
@@ -316,6 +393,58 @@ mod tests {
         let other = PictureAdjust { duotone: Some((ColorRef::rgb(Rgba::rgb(0, 0, 0)), ColorRef::rgb(Rgba::rgb(255, 0, 0)))), ..Default::default() };
         assert_ne!(adjust_key(&adj), adjust_key(&other));
         assert_ne!(adjust_key(&adj), adjust_key(&PictureAdjust::default()));
+    }
+
+    #[test]
+    fn brightness_and_contrast_map_greys_like_powerpoint() {
+        // Grey levels PowerPoint's export gives for inputs 0, 32, 64, 96 (and 128, 160).
+        let run = |b: f64, c: f64, input: &[u8]| -> Vec<u8> {
+            let mut img = image::RgbaImage::from_fn(input.len() as u32, 1, |x, _| {
+                let v = input[x as usize];
+                image::Rgba([v, v, v, 255])
+            });
+            apply_adjust(&mut img, &PictureAdjust { brightness: b, contrast: c, ..Default::default() });
+            img.pixels().map(|p| p[0]).collect()
+        };
+        let near = |got: Vec<u8>, want: &[u8]| got.iter().zip(want).all(|(g, w)| (*g as i32 - *w as i32).abs() <= 5);
+        assert!(near(run(0.4, 0.4, &[0, 32, 64, 96]), &[54, 105, 157, 210]), "{:?}", run(0.4, 0.4, &[0, 32, 64, 96]));
+        assert!(near(run(0.4, -0.4, &[0, 32, 64, 96]), &[133, 152, 171, 190]));
+        assert!(near(run(-0.4, 0.4, &[128, 160, 192]), &[0, 45, 97]));
+        assert!(near(run(0.0, -0.8, &[0, 128, 255]), &[102, 127, 152]));
+    }
+
+    #[test]
+    fn grayscale_black_and_white_and_inverted_alpha_like_powerpoint() {
+        let swatches = [[255u8, 0, 0], [0, 255, 0], [0, 0, 255], [200, 100, 50], [60, 160, 110], [120, 120, 130]];
+        let run = |adj: PictureAdjust| -> Vec<[u8; 4]> {
+            let mut img = image::RgbaImage::from_fn(swatches.len() as u32, 1, |x, _| {
+                let c = swatches[x as usize];
+                image::Rgba([c[0], c[1], c[2], 200])
+            });
+            apply_adjust(&mut img, &adj);
+            img.pixels().map(|p| p.0).collect()
+        };
+        // PowerPoint's export of these swatches in grayscale: 54, 182, 18, 117, 135, 120.
+        let g = run(PictureAdjust { grayscale: true, ..Default::default() });
+        for (got, want) in g.iter().zip([54u8, 182, 18, 117, 135, 120]) {
+            assert!((got[0] as i32 - want as i32).abs() <= 1 && got[0] == got[1] && got[1] == got[2], "{got:?} vs {want}");
+        }
+        // Black and white at 50%: only green and the light green reach mid-grey.
+        let bw: Vec<u8> = run(PictureAdjust { bilevel: Some(0.5), ..Default::default() }).iter().map(|p| p[0]).collect();
+        assert_eq!(bw, [0, 255, 0, 0, 255, 0]);
+        // Inverted alpha: 200 becomes 55.
+        assert!(run(PictureAdjust { alpha_inv: true, ..Default::default() }).iter().all(|p| p[3] == 55));
+    }
+
+    #[test]
+    fn opposite_brightness_and_contrast_are_cached_apart() {
+        let a = PictureAdjust { brightness: 0.4, contrast: 0.4, ..Default::default() };
+        let b = PictureAdjust { brightness: -0.4, contrast: -0.4, ..Default::default() };
+        assert_ne!(adjust_key(&a), adjust_key(&b));
+        let c = PictureAdjust { brightness: 0.4, contrast: -0.4, ..Default::default() };
+        let d = PictureAdjust { brightness: -0.4, contrast: 0.4, ..Default::default() };
+        assert_ne!(adjust_key(&c), adjust_key(&d));
+        assert_eq!(adjust_key(&a), adjust_key(&a.clone()));
     }
 
     #[test]

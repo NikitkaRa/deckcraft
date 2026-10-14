@@ -6,7 +6,7 @@
 //! [`visual_order`] rule L2). Rule L4 (mirrored brackets) is applied by the shaper, which draws
 //! mirrorable characters in right-to-left items with their mirrored glyphs.
 
-use unicode_bidi::BidiClass::{self, AL, AN, B, BN, FSI, LRE, LRI, LRO, PDF, PDI, R, RLE, RLI, RLO, S, WS};
+use unicode_bidi::BidiClass::{self, AL, AN, B, BN, CS, EN, ES, ET, FSI, L, LRE, LRI, LRO, NSM, ON, PDF, PDI, R, RLE, RLI, RLO, S, WS};
 use unicode_bidi::{BidiInfo, Level, bidi_class};
 
 /// Does anything in the text need the full algorithm? (Strong right-to-left, Arabic numbers or
@@ -25,6 +25,149 @@ pub(crate) fn levels(text: &str, chars: &[char], rtl: bool) -> Vec<u8> {
     let info = BidiInfo::new(text, Some(if rtl { Level::rtl() } else { Level::ltr() }));
     // `levels` is per byte; take each character's first byte.
     text.char_indices().map(|(b, _)| info.levels.get(b).map(|l| l.number()).unwrap_or(base)).collect()
+}
+
+/// Is `lang` (BCP 47) a language written right to left? Its runs resolve neutral characters and
+/// digits the right-to-left way (see [`levels_lang`]).
+pub(crate) fn is_rtl_lang(lang: &str) -> bool {
+    let primary = lang.split(['-', '_']).next().unwrap_or("").to_ascii_lowercase();
+    matches!(primary.as_str(), "ar" | "he" | "iw" | "fa" | "ur" | "yi" | "ji" | "ps" | "sd" | "ug" | "dv" | "syr" | "ckb" | "arc")
+}
+
+/// How a character resolves before levels are assigned.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Dir {
+    L,
+    R,
+    /// A number inside right-to-left text: kept left to right, placed with the right-to-left text.
+    Num,
+    /// Not resolved yet (neutral).
+    Open,
+}
+
+/// Embedding levels as PowerPoint resolves them: the language of each character's run
+/// (`rtl_lang`, from `a:rPr/@lang`) decides how neutral characters and digits go, where UAX #9
+/// would look at the surrounding text only. Observed on desktop PowerPoint:
+/// - in a run of a left-to-right language (or none), digits and punctuation are left to right,
+///   and a space takes the direction of the character before it (so the space after a Hebrew word
+///   travels with that word);
+/// - in a run of a right-to-left language (Hebrew, Arabic…), punctuation and spaces between text
+///   of one direction take it, everywhere else they are right to left; digits are a number in
+///   right-to-left text unless left-to-right text precedes them.
+///
+/// Paragraphs with explicit embeddings or isolates keep the plain algorithm ([`levels`]).
+pub(crate) fn levels_lang(text: &str, chars: &[char], rtl: bool, rtl_lang: &[bool]) -> Vec<u8> {
+    let base = u8::from(rtl);
+    let any_rtl_lang = rtl_lang.iter().any(|r| *r);
+    if !rtl && !any_rtl_lang && !needs_bidi(chars) {
+        return vec![0; chars.len()];
+    }
+    let classes: Vec<BidiClass> = chars.iter().map(|c| bidi_class(*c)).collect();
+    if classes.iter().any(|c| matches!(c, LRE | RLE | LRO | RLO | PDF | LRI | RLI | FSI | PDI)) {
+        return levels(text, chars, rtl);
+    }
+    let n = chars.len();
+    let rl = |i: usize| rtl_lang.get(i).copied().unwrap_or(false);
+    let sos = if rtl { Dir::R } else { Dir::L };
+    // W1: combining marks take the class of the character they sit on.
+    let mut cls = classes;
+    for i in 0..n {
+        if cls.get(i) == Some(&NSM) {
+            let prev = if i == 0 { if rtl { R } else { L } } else { cls.get(i - 1).copied().unwrap_or(L) };
+            if let Some(c) = cls.get_mut(i) {
+                *c = prev;
+            }
+        }
+    }
+    let mut dir = vec![Dir::Open; n];
+    // Strong letters and digits.
+    let mut last_strong: Option<BidiClass> = None;
+    for i in 0..n {
+        let c = cls.get(i).copied().unwrap_or(ON);
+        let d = match c {
+            L => Dir::L,
+            R | AL => Dir::R,
+            AN => Dir::Num,
+            EN if !rl(i) => Dir::L,
+            // W7: European digits after left-to-right text are left to right.
+            EN if last_strong == Some(L) => Dir::L,
+            EN => Dir::Num,
+            _ => Dir::Open,
+        };
+        if matches!(c, L | R | AL) {
+            last_strong = Some(c);
+        }
+        if let Some(x) = dir.get_mut(i) {
+            *x = d;
+        }
+    }
+    // W4/W5 in right-to-left runs: a separator between digits, and currency or percent signs next
+    // to them, belong to the number.
+    for i in 0..n {
+        if !rl(i) || dir.get(i) != Some(&Dir::Open) {
+            continue;
+        }
+        let c = cls.get(i).copied().unwrap_or(ON);
+        let num = |j: Option<usize>| j.and_then(|j| dir.get(j)).is_some_and(|d| *d == Dir::Num);
+        let joined = match c {
+            ES | CS => num(i.checked_sub(1)) && num(Some(i + 1)),
+            ET => num(i.checked_sub(1)) || (i + 1..n).find(|&j| cls.get(j) != Some(&ET)).is_some_and(|j| num(Some(j))),
+            _ => false,
+        };
+        if joined && let Some(x) = dir.get_mut(i) {
+            *x = Dir::Num;
+        }
+    }
+    // Punctuation in left-to-right runs is left to right.
+    for i in 0..n {
+        if !rl(i)
+            && dir.get(i) == Some(&Dir::Open)
+            && !matches!(cls.get(i), Some(WS | S))
+            && let Some(x) = dir.get_mut(i)
+        {
+            *x = Dir::L;
+        }
+    }
+    // Neutrals in right-to-left runs: the direction around them when both sides agree, else
+    // right to left. Unresolved spaces of left-to-right runs are looked through.
+    let strong_at = |dir: &[Dir], j: usize| match dir.get(j) {
+        Some(Dir::L) => Some(Dir::L),
+        Some(Dir::R | Dir::Num) => Some(Dir::R),
+        _ => None,
+    };
+    let mut i = 0;
+    while i < n {
+        if !(rl(i) && dir.get(i) == Some(&Dir::Open)) {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < n && rl(i) && dir.get(i) == Some(&Dir::Open) {
+            i += 1;
+        }
+        let before = (0..start).rev().find_map(|j| strong_at(&dir, j)).unwrap_or(sos);
+        let after = (i..n).find_map(|j| strong_at(&dir, j)).unwrap_or(sos);
+        let d = if before == after { before } else { Dir::R };
+        for x in dir.get_mut(start..i).into_iter().flatten() {
+            *x = d;
+        }
+    }
+    // Spaces in left-to-right runs follow the character before them.
+    let mut prev = Dir::L;
+    for d in dir.iter_mut() {
+        if *d == Dir::Open {
+            *d = prev;
+        }
+        prev = if *d == Dir::Num { Dir::R } else { *d };
+    }
+    dir.iter()
+        .map(|d| match (d, base % 2 == 1) {
+            (Dir::L, false) | (Dir::R, true) => base,
+            (Dir::L, true) | (Dir::R, false) | (Dir::Open, _) => base + 1,
+            (Dir::Num, false) => base + 2,
+            (Dir::Num, true) => base + 1,
+        })
+        .collect()
 }
 
 /// Whitespace-like for rule L1: reset to the paragraph level when trailing a line or preceding a
@@ -129,6 +272,40 @@ mod tests {
         assert_eq!(vis, "ab نس cd");
         // An RTL paragraph of Latin text: the text stays left to right inside it.
         assert_eq!(lv("ab", true), vec![2, 2]);
+    }
+
+    /// Visual string of `s` laid out on one line with every character in a run of language
+    /// direction `rtl_lang`, as PowerPoint orders it.
+    fn vis_lang(s: &str, rtl: bool, rtl_lang: bool) -> String {
+        let chars: Vec<char> = s.chars().collect();
+        let l = levels_lang(s, &chars, rtl, &vec![rtl_lang; chars.len()]);
+        visual_order(&line_levels(&chars, &l, u8::from(rtl))).iter().map(|&i| chars[i]).collect()
+    }
+
+    #[test]
+    fn run_language_decides_neutrals_like_powerpoint() {
+        // Observed in PowerPoint with each space highlighted. An English run: the space after a
+        // Hebrew word goes with it, punctuation is left to right.
+        assert_eq!(vis_lang("x אב גד y", false, false), "x  דג באy");
+        assert_eq!(vis_lang("אב גד x y", false, false), " דג באx y");
+        assert_eq!(vis_lang("x אב, גד! y", false, false), "x בא, דג! y");
+        // Digits after Hebrew stay left to right in an English run.
+        assert_eq!(vis_lang("אב 12", false, false), " בא12");
+        // A Hebrew run: neutrals between different directions are right to left, and digits are
+        // a number inside the right-to-left text.
+        assert_eq!(vis_lang("אב גד x y", false, true), " דג באx y");
+        assert_eq!(vis_lang("12 אב 34 x", false, true), " 34 בא 12x");
+        assert_eq!(vis_lang("x אב, גד! y", false, true), "x !דג ,בא y");
+        // Between two left-to-right words a Hebrew run's space stays left to right.
+        assert_eq!(vis_lang("Version 2.0 ok", false, true), "Version 2.0 ok");
+        // An English sentence in a right-to-left paragraph keeps its full stop at its end.
+        assert_eq!(vis_lang("Hello world.", true, false), "Hello world.");
+        // Right-to-left runs keep W4: "45.6%" is one number.
+        assert_eq!(vis_lang("אב 45.6% גד", false, true), "דג 45.6% בא");
+        // Without right-to-left text or runs, the fast path.
+        let chars: Vec<char> = "plain, text".chars().collect();
+        assert_eq!(levels_lang("plain, text", &chars, false, &[false; 11]), vec![0; 11]);
+        assert!(is_rtl_lang("he-IL") && is_rtl_lang("ar") && is_rtl_lang("FA-ir") && !is_rtl_lang("en-US") && !is_rtl_lang(""));
     }
 
     #[test]

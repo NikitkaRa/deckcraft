@@ -9,7 +9,7 @@ The summary between `<!-- SUMMARY -->
 |---|---|---|---|---|---|
 | P0 | 72 | 61 | 11 | 0 | 92% |
 | P1 | 65 | 38 | 21 | 6 | 75% |
-| P2 | 54 | 13 | 14 | 27 | 37% |
+| P2 | 54 | 13 | 15 | 26 | 38% |
 
 | Area | Parity |
 |---|---|
@@ -19,7 +19,7 @@ The summary between `<!-- SUMMARY -->
 | Views | 90% |
 | Masters & themes | 85% |
 | Shapes | 88% |
-| Format | 81% |
+| Format | 83% |
 | Arrange | 100% |
 | Text | 80% |
 | Tables | 89% |
@@ -126,7 +126,7 @@ Open P0 items: Contextual tabs (Shape Format, Picture Format, Table Design/Layou
 | Format | Arrowheads | P0 | D |
 | Format | Shadow (outer, inner, presets) | P1 | D |
 | Format | Reflection, glow, soft edges | P2 | P |
-| Format | Bevel and 3-D rotation | P2 | M |
+| Format | Bevel and 3-D rotation | P2 | P |
 | Format | Format Painter | P1 | D |
 | Format | Format Shape pane | P0 | P |
 | Arrange | Size and position (exact), lock aspect ratio | P0 | D |

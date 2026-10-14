@@ -101,11 +101,55 @@ fn pairs_are_kerned_only_from_the_kern_size() {
     assert!((above - off).abs() < 0.01, "40 pt is below a 48 pt threshold");
 }
 
+/// Width of the first paragraph "AVATAR WAVE" (kerned from 12 pt) when a second paragraph's run
+/// has character spacing `spc`.
+fn kerned_width_beside_spacing(family: &str, spc: f64) -> f64 {
+    let (p, mut sh) = setup("AVATAR WAVE", 2000.0, 300.0);
+    let t = sh.text.as_mut().unwrap();
+    let mut second = t.paragraphs[0].clone();
+    second.runs[0].props.spacing = Some(spc);
+    t.paragraphs.push(second);
+    for para in &mut t.paragraphs {
+        para.props.bullet = Some(Bullet::None);
+        for r in &mut para.runs {
+            r.props.font = Some(family.into());
+            r.props.size = Some(40.0);
+            r.props.kern = Some(12.0);
+        }
+    }
+    let l = lay(&p, &sh, 2000.0, 300.0);
+    l.lines[0].extent.1 - l.lines[0].extent.0
+}
+
+#[test]
+fn character_spacing_in_the_body_keeps_kerning() {
+    let kerns = |f: &FontFace| {
+        let w = |feat: &[deckcraft_fonts::Feature]| deckcraft_fonts::shape(f, "AVATAR", feat, |c| c).iter().map(|g| g.x_advance).sum::<i32>();
+        w(&[]) != w(&deckcraft_fonts::feature("-kern").into_iter().collect::<Vec<_>>())
+    };
+    let Some(family) = first_family(LATIN_FAMILIES, kerns) else {
+        eprintln!("skipped: no font that kerns AVATAR");
+        return;
+    };
+    let (_, off) = glyphs_and_width(&family, "AVATAR WAVE", Some(0.0));
+    let (_, on) = glyphs_and_width(&family, "AVATAR WAVE", Some(12.0));
+    assert!(on < off);
+    // Spacing elsewhere in the box leaves the pairs kerned (Calibri, Segoe UI, Times New Roman in
+    // PowerPoint; only Arial drops them).
+    for spc in [0.0, 0.5, -1.0, 0.6, 2.0] {
+        let w = kerned_width_beside_spacing(&family, spc);
+        assert!((w - on).abs() < 0.01, "{family} spc {spc}: {w} vs {on}");
+    }
+}
+
 #[test]
 fn ligatures_stay_for_scripts_that_need_them() {
     let has = |f: &[deckcraft_fonts::Feature], tag: &str| f.iter().any(|x| Some(*x) == deckcraft_fonts::feature(tag));
-    let cells =
-        |s: &str| s.chars().map(|ch| Cell { ch, style: 0, face: 0, level: 0, glyphs: vec![], adv: 0.0, head: 0, boundary: true }).collect::<Vec<_>>();
+    let cells = |s: &str| {
+        s.chars()
+            .map(|ch| Cell { ch, style: 0, face: 0, level: 0, glyphs: vec![], adv: 0.0, head: 0, boundary: true, upright: false })
+            .collect::<Vec<_>>()
+    };
     let latin = shaping_features(&cells("office"), &[], Some(*b"Latn"));
     assert!(has(&latin, "-liga") && has(&latin, "-clig") && has(&latin, "-kern"));
     // Arabic needs its ligatures; emoji sequences are joined by them.
@@ -264,7 +308,11 @@ fn arabic_face() -> Option<Arc<FontFace>> {
 
 #[test]
 fn rtl_mixed_string_is_reordered_per_line() {
-    let (p, sh) = bidi_setup(vec![Run::new(MIXED)], 2000.0, true, Align::Right);
+    // An Arabic run (PowerPoint tags typed Arabic `ar-…`): its digits and brackets go with the
+    // right-to-left text.
+    let mut run = Run::new(MIXED);
+    run.props.lang = Some("ar-SA".into());
+    let (p, sh) = bidi_setup(vec![run], 2000.0, true, Align::Right);
     let l = lay(&p, &sh, 2000.0, 300.0);
     assert_eq!(l.lines.len(), 1);
     let line = &l.lines[0];
@@ -291,6 +339,20 @@ fn rtl_mixed_string_is_reordered_per_line() {
     assert_eq!(line.levels[0], 1);
     assert_eq!(line.levels[4], 2);
     assert_eq!(line.levels[10], 2);
+}
+
+#[test]
+fn an_english_run_keeps_digits_and_brackets_left_to_right() {
+    // The same text in a run without a right-to-left language: PowerPoint keeps "2024 (Retrait) "
+    // one left-to-right stretch, its number on the left.
+    let (p, sh) = bidi_setup(vec![Run::new(MIXED)], 2000.0, true, Align::Right);
+    let l = lay(&p, &sh, 2000.0, 300.0);
+    let line = &l.lines[0];
+    let mid = |k: usize| (line.edges[k].0 + line.edges[k].1) / 2.0;
+    assert!(mid(0) > mid(10), "first Arabic word right of the Latin");
+    assert!(mid(4) < mid(10), "number left of the Latin word");
+    assert!(mid(9) < mid(10) && mid(17) > mid(16), "brackets around Retrait, unmirrored");
+    assert!(mid(19) < mid(4), "last Arabic word on the left");
 }
 
 #[test]
@@ -780,4 +842,377 @@ fn symbol_font_characters_draw_in_the_sym_font() {
     assert!(families.iter().any(|(f, c)| f.eq_ignore_ascii_case(symbol) && c.0 == 1), "{families:?}");
     // The letters around it keep the run's font.
     assert!(families.iter().all(|(f, c)| c.0 == 1 || !f.eq_ignore_ascii_case(symbol)), "{families:?}");
+}
+
+#[test]
+fn small_capitals_draw_smaller_than_the_capitals_beside_them() {
+    let (p, mut sh) = setup("HxHx", 2000.0, 300.0);
+    let para = &mut sh.text.as_mut().unwrap().paragraphs[0];
+    para.props.bullet = Some(Bullet::None);
+    para.runs[0].props.caps = Some(Caps::Small);
+    para.runs[0].props.size = Some(40.0);
+    let l = lay(&p, &sh, 2000.0, 300.0);
+    let sizes: Vec<(usize, f64)> = l.runs.iter().map(|r| (r.glyphs.len(), r.size)).collect();
+    // H at 40 pt, x as a capital at 80 % (four runs: the size changes at every letter).
+    assert_eq!(sizes, vec![(1, 40.0), (1, 32.0), (1, 40.0), (1, 32.0)]);
+}
+
+#[test]
+fn capitals_keep_characters_whose_capital_is_a_sequence() {
+    assert_eq!(caps_char('a'), 'A');
+    assert_eq!(caps_char('ǆ'), 'Ǆ');
+    // PowerPoint draws "ß", "ﬁ" and "ŉ" unchanged in all caps.
+    assert_eq!(caps_char('ß'), 'ß');
+    assert_eq!(caps_char('\u{FB01}'), '\u{FB01}');
+    assert_eq!(caps_char('ŉ'), 'ŉ');
+    let (p, mut sh) = setup("aß", 2000.0, 300.0);
+    let para = &mut sh.text.as_mut().unwrap().paragraphs[0];
+    para.runs[0].props.caps = Some(Caps::All);
+    let l = lay(&p, &sh, 2000.0, 300.0);
+    let r = l.runs.iter().find(|r| !r.cells.is_empty()).unwrap();
+    let face = &r.face;
+    if face.covers('ß') {
+        assert_eq!(r.glyphs[1].0, face.glyph_for('ß'), "ß is not drawn as S");
+    }
+}
+
+#[test]
+fn transparent_text_is_faded_once() {
+    let (p, mut sh) = setup("Faded", 2000.0, 300.0);
+    let run = &mut sh.text.as_mut().unwrap().paragraphs[0].runs[0];
+    run.props.fill = Some(deckcraft_model::Fill::solid(
+        deckcraft_model::ColorRef::rgb(deckcraft_color::Rgba::rgb(255, 0, 0)).with(deckcraft_color::ColorTransform::Alpha(40000)),
+    ));
+    let l = lay(&p, &sh, 2000.0, 300.0);
+    let r = l.runs.iter().find(|r| !r.cells.is_empty()).unwrap();
+    // 60 % transparency: 40 % opaque in all, not 40 % of 40 %.
+    let opacity = r.color.a as f64 / 255.0 * r.alpha;
+    assert!((opacity - 0.4).abs() < 0.01, "{opacity}");
+}
+
+/// One paragraph `text` with tab stops `tabs` (position, `algn`), no bullet or indent.
+fn tabbed(text: &str, tabs: &[(f64, &str)], w: f64) -> TextLayout {
+    let (p, mut sh) = setup(text, w, 300.0);
+    let para = &mut sh.text.as_mut().unwrap().paragraphs[0];
+    for r in &mut para.runs {
+        r.props.size = Some(18.0);
+    }
+    let pp = &mut para.props;
+    pp.bullet = Some(Bullet::None);
+    pp.margin_left = Some(0.0);
+    pp.indent = Some(0.0);
+    pp.default_tab = Some(72.0);
+    pp.tabs = Some(tabs.iter().map(|(pos, a)| deckcraft_model::text::TabStop { pos: *pos, align: a.to_string() }).collect());
+    lay(&p, &sh, w, 300.0)
+}
+
+#[test]
+fn tab_stops_align_the_text_after_them() {
+    let x0 = |l: &TextLayout| l.inner.x0;
+    // Right: the text ends at the stop. Centre: centred on it. Decimal: the "." at the stop.
+    let l = tabbed("a\tright", &[(200.0, "r")], 600.0);
+    assert!((l.lines[0].extent.1 - x0(&l) - 200.0).abs() < 0.01, "{:?}", l.lines[0].extent);
+    let l = tabbed("a\tmid", &[(200.0, "ctr")], 600.0);
+    let (s, e) = (l.lines[0].edges[2].0, l.lines[0].edges[4].1);
+    assert!(((s + e) / 2.0 - x0(&l) - 200.0).abs() < 0.01);
+    let l = tabbed("x\t1234.567", &[(150.0, "dec")], 600.0);
+    assert!((l.lines[0].edges[6].0 - x0(&l) - 150.0).abs() < 0.01, "the point sits at the stop");
+    // Text without a point ends at a decimal stop.
+    let l = tabbed("x\t12,5", &[(150.0, "dec")], 600.0);
+    assert!((l.lines[0].extent.1 - x0(&l) - 150.0).abs() < 0.01);
+    // Text wider than the room before a right stop starts where the tab is; it never moves back.
+    let l = tabbed("x\twider than the gap", &[(20.0, "r")], 600.0);
+    assert!((l.lines[0].edges[2].0 - l.lines[0].edges[0].1).abs() < 0.01);
+    // A left stop and then default stops every 72 pt.
+    let l = tabbed("a\tb\tc", &[(30.0, "l")], 600.0);
+    assert!((l.lines[0].edges[2].0 - x0(&l) - 30.0).abs() < 0.01);
+    assert!((l.lines[0].edges[4].0 - x0(&l) - 72.0).abs() < 0.01);
+}
+
+#[test]
+fn a_tab_past_the_end_moves_to_the_next_line() {
+    // PowerPoint: "abcdefghij\tk\tl\tm…" in a narrow box puts the tab that doesn't fit on the next
+    // line, so the text after it lands on that line's first stop.
+    let l = tabbed("abcdefghij\tk", &[], 130.0);
+    assert_eq!(l.lines.len(), 2);
+    assert_eq!(l.lines[1].start, 10, "the tab starts the second line: {:?}", l.lines.iter().map(|x| (x.start, x.end, x.extent)).collect::<Vec<_>>());
+    assert!((l.lines[1].edges[1].0 - l.inner.x0 - 72.0).abs() < 0.01);
+}
+
+/// Underline decorations of "ab cd" underlined `u` at 40 pt.
+fn underline_decos(u: &str) -> (TextLayout, Vec<Deco>) {
+    let (p, mut sh) = setup("ab cd", 2000.0, 300.0);
+    let para = &mut sh.text.as_mut().unwrap().paragraphs[0];
+    para.props.bullet = Some(Bullet::None);
+    para.runs[0].props.size = Some(40.0);
+    para.runs[0].props.underline = Some(u.into());
+    let l = lay(&p, &sh, 2000.0, 300.0);
+    let d = l.decos.iter().filter(|d| !d.behind).cloned().collect();
+    (l, d)
+}
+
+#[test]
+fn underlines_sit_at_the_font_underline_in_their_style() {
+    let (l, sng) = underline_decos("sng");
+    let r = l.runs.iter().find(|r| !r.cells.is_empty()).unwrap();
+    let k = 40.0 / r.face.upem;
+    let base = l.lines[0].baseline;
+    assert_eq!(sng.len(), 1);
+    assert!((sng[0].rect.y0 - base - r.face.underline.0 * k).abs() < 0.01, "top at the font's underline position");
+    assert!((sng[0].rect.height() - (r.face.underline.1 * k).max(0.5)).abs() < 0.01);
+    let t = sng[0].rect.height();
+    // Double: two thin lines spanning from one thickness above the single line to its bottom.
+    let (_, dbl) = underline_decos("dbl");
+    assert_eq!(dbl.len(), 2);
+    assert!((dbl[0].rect.y0 - (sng[0].rect.y0 - t)).abs() < 0.01 && (dbl[1].rect.y1 - sng[0].rect.y1).abs() < 0.01);
+    // Heavy is thicker; dotted is dots as long as the line is thick.
+    let (_, heavy) = underline_decos("heavy");
+    assert!(heavy[0].rect.height() > t * 1.4);
+    let (_, dotted) = underline_decos("dotted");
+    assert_eq!(dotted[0].line, DecoLine::Dashed(Dash::Dot));
+    let pieces = dotted[0].pieces();
+    assert!(pieces.len() > 3);
+    assert!((pieces[0].width() - t).abs() < 0.01 && (pieces[1].x0 - pieces[0].x1 - t).abs() < 0.01);
+    // Wavy: a zigzag between the box's top and bottom.
+    let (_, wavy) = underline_decos("wavy");
+    let (pts, w) = wavy[0].wave().expect("a wave");
+    assert!(pts.len() > 4 && w > 0.0 && w < t);
+    assert!(pts[0].y < pts[1].y);
+    // "words" underlines the spaces too, as PowerPoint draws it: one line.
+    let (_, words) = underline_decos("words");
+    assert_eq!(words.len(), 1);
+}
+
+#[test]
+fn no_break_after_a_zero_width_space_or_before_an_em_dash() {
+    let (allowed, _) = break_opportunities("ab\u{200B}cd", false);
+    assert!(!allowed[3], "PowerPoint does not break after a zero-width space");
+    let (allowed, _) = break_opportunities("ab\u{2014}cd", false);
+    assert!(!allowed[2] && allowed[3], "an em dash ends a line, never starts one");
+}
+
+#[test]
+fn a_line_broken_at_a_soft_hyphen_shows_a_hyphen() {
+    let (p, mut sh) = setup("Soft\u{AD}hyphenated\u{AD}words", 150.0, 300.0);
+    let para = &mut sh.text.as_mut().unwrap().paragraphs[0];
+    para.props.bullet = Some(Bullet::None);
+    para.runs[0].props.size = Some(24.0);
+    let l = lay(&p, &sh, 150.0, 300.0);
+    assert!(l.lines.len() >= 2);
+    let first = &l.lines[0];
+    let shy = first.end - 1;
+    assert_eq!(first.end, 5, "breaks after the soft hyphen: {:?}", l.lines.iter().map(|x| (x.start, x.end)).collect::<Vec<_>>());
+    let (x0, x1) = first.edges[shy - first.start];
+    assert!(x1 - x0 > 2.0, "the hyphen takes room");
+    let r = l.runs.iter().find(|r| r.cells.iter().any(|c| c.0 == shy)).expect("a glyph for the soft hyphen");
+    assert_eq!(r.glyphs[r.cells.iter().position(|c| c.0 == shy).unwrap()].0, r.face.glyph_for('-'));
+    // Soft hyphens draw only where a line ends; in a wide box, nowhere.
+    let ends: Vec<usize> = l.lines.iter().map(|x| x.end.saturating_sub(1)).collect();
+    for r in &l.runs {
+        for (g, c) in r.glyphs.iter().zip(&r.cells) {
+            assert!(c.1 != '\u{AD}' || ends.contains(&c.0) || g.0 != r.face.glyph_for('-'), "mid-line soft hyphen drawn");
+        }
+    }
+    let wide = lay(&p, &sh, 2000.0, 300.0);
+    assert_eq!(wide.lines.len(), 1);
+    assert!(wide.runs.iter().all(|r| r.cells.iter().all(|c| c.1 != '\u{AD}' || r.glyphs.iter().all(|g| g.0 != r.face.glyph_for('-')))));
+}
+
+#[test]
+fn small_kana_and_closing_brackets_follow_powerpoint_kinsoku() {
+    // "っ" and "ー" never start a line: the character before them moves down too.
+    let w = one_line("あいうえお") + 0.5;
+    for (text, first) in [("あいうえおっかき", "あいうえ"), ("あいうえおーかき", "あいうえ"), ("あいうえおかき", "あいうえお")]
+    {
+        let lines = wrapped(text, w, |p| p.hanging_punct = Some(true));
+        assert_eq!(lines[0], first, "{text}: {lines:?}");
+    }
+    // A closing bracket doesn't hang like "。" does: "「。」" overflowing by "」" moves down whole.
+    let w = one_line("あいうえ「。") + 0.5;
+    let lines = wrapped("あいうえ「。」かき", w, |p| p.hanging_punct = Some(true));
+    assert_eq!(lines[0], "あいうえ", "{lines:?}");
+}
+
+#[test]
+fn autonumber_schemes_follow_powerpoint() {
+    // As PowerPoint's export draws them (start values as in the probe deck).
+    for (scheme, n, want) in [
+        ("ea1ChsPlain", 4, "四"),
+        ("ea1ChsPeriod", 10, "十．"),
+        ("ea1ChtPeriod", 21, "二十一．"),
+        ("ea1JpnKorPeriod", 10, "一〇．"),
+        ("ea1JpnChsDbPeriod", 13, "一三．"),
+        ("arabicDbPlain", 10, "１０"),
+        ("arabicDbPeriod", 13, "１３．"),
+        ("circleNumDbPlain", 13, "⑬"),
+        ("circleNumWdWhitePlain", 13, "③"),
+        ("circleNumWdBlackPlain", 2, "❷"),
+        ("thaiAlphaPeriod", 1, "ก."),
+        ("thaiAlphaParenR", 4, "ง)"),
+        ("thaiAlphaParenBoth", 7, "(ช)"),
+        ("thaiNumPeriod", 10, "๑๐."),
+        ("hindiAlphaPeriod", 4, "ई."),
+        ("hindiAlpha1Period", 1, "क."),
+        ("hindiNumParenR", 13, "१३)"),
+        ("hebrew2Minus", 1, "א-"),
+        ("arabic1Minus", 13, "ش-"),
+        ("arabic2Minus", 10, "ي-"),
+        ("arabicPlain", 10, "10"),
+    ] {
+        assert_eq!(autonum(scheme, n), want, "{scheme} {n}");
+    }
+    assert_eq!(chinese_num(105), "一百零五");
+    assert_eq!(chinese_num(20), "二十");
+    // Past the end of an alphabet the letter doubles, like "aa".
+    assert_eq!(autonum("hebrew2Minus", 23), "אא-");
+    assert_eq!(autonum("thaiAlphaPeriod", 0), ".");
+}
+
+#[test]
+fn east_asian_vertical_text_marks_cjk_upright() {
+    let (p, mut sh) = setup("日本、ABC 12", 300.0, 600.0);
+    sh.text.as_mut().unwrap().body.vert = Some(deckcraft_model::text::TextDir::EaVertical);
+    let l = lay(&p, &sh, 300.0, 600.0);
+    assert_eq!(l.rotation, 90.0);
+    let upright: Vec<bool> = l
+        .runs
+        .iter()
+        .filter(|r| !r.cells.is_empty())
+        .flat_map(|r| r.cells.iter().map(move |c| (c.1, r.upright)))
+        .filter(|(c, _)| *c != ' ')
+        .map(|(_, u)| u)
+        .collect();
+    assert_eq!(upright, vec![true, true, true, false, false, false, false, false]);
+    // In vert nothing stands upright.
+    sh.text.as_mut().unwrap().body.vert = Some(deckcraft_model::text::TextDir::Vertical);
+    let l = lay(&p, &sh, 300.0, 600.0);
+    assert!(l.runs.iter().all(|r| !r.upright));
+    assert!(is_upright('あ') && is_upright('、') && is_upright('Ａ') && !is_upright('A') && !is_upright('1'));
+}
+
+#[test]
+fn mongolian_lines_run_left_to_right_and_stacked_letters_stand_one_em_apart() {
+    let (p, mut sh) = setup("one\ntwo", 200.0, 400.0);
+    sh.text.as_mut().unwrap().body.vert = Some(deckcraft_model::text::TextDir::Vertical);
+    let v = lay(&p, &sh, 200.0, 400.0);
+    sh.text.as_mut().unwrap().body.vert = Some(deckcraft_model::text::TextDir::MongolianVertical);
+    let m = lay(&p, &sh, 200.0, 400.0);
+    assert_eq!(m.rotation, 90.0);
+    // In layout space (turned a quarter turn) vert puts the first line at the top, which shows on
+    // the right; mongolianVert mirrors the line places, so the first line shows on the left.
+    assert!(v.lines[0].top < v.lines[1].top);
+    assert!(m.lines[0].top > m.lines[1].top);
+    let mid = (m.inner.y0 + m.inner.y1) / 2.0;
+    assert!(((m.lines[0].top + m.lines[0].bottom) / 2.0 - mid + ((v.lines[0].top + v.lines[0].bottom) / 2.0 - mid)).abs() < 0.01);
+    // Stacked: every letter upright, one em apart.
+    let (p, mut sh) = setup("Lil", 200.0, 400.0);
+    let t = sh.text.as_mut().unwrap();
+    t.body.vert = Some(deckcraft_model::text::TextDir::Stacked);
+    t.paragraphs[0].runs[0].props.size = Some(20.0);
+    let s = lay(&p, &sh, 200.0, 400.0);
+    assert!(s.runs.iter().filter(|r| !r.cells.is_empty()).all(|r| r.upright));
+    // Its lines run left to right too.
+    let (p2, mut sh2) = setup("one\ntwo", 200.0, 400.0);
+    sh2.text.as_mut().unwrap().body.vert = Some(deckcraft_model::text::TextDir::Stacked);
+    let st = lay(&p2, &sh2, 200.0, 400.0);
+    assert!(st.lines[0].top > st.lines[1].top);
+    // wordArtVertRtl stacks the same way with lines from right to left.
+    sh2.text.as_mut().unwrap().body.vert = Some(deckcraft_model::text::TextDir::StackedRtl);
+    let sr = lay(&p2, &sh2, 200.0, 400.0);
+    assert!(sr.lines[0].top < sr.lines[1].top);
+    assert!(sr.runs.iter().filter(|r| !r.cells.is_empty()).all(|r| r.upright));
+    let e = &s.lines[0].edges;
+    assert!((e[1].1 - e[1].0 - 20.0).abs() < 0.01 && (e[2].1 - e[2].0 - 20.0).abs() < 0.01, "{e:?}");
+}
+
+#[test]
+fn symbols_after_an_emoji_keep_a_text_face() {
+    // "✅ ⚠ ™": PowerPoint draws ✅ (emoji presentation) in colour and the symbols after it as text.
+    let db = FontDb::global();
+    if !db.cascade(&['✅'], &[], "Regular").is_color() {
+        return;
+    }
+    let (p, sh) = bidi_setup(vec![Run::new("✅ ⚠ ™")], 2000.0, false, Align::Left);
+    let l = lay(&p, &sh, 2000.0, 300.0);
+    for r in &l.runs {
+        for (_, c) in &r.cells {
+            assert_eq!(r.face.is_color(), *c == '✅', "{c:?} drawn with {}", r.face.family);
+        }
+    }
+}
+
+#[test]
+fn fallback_faces_do_not_move_the_baseline() {
+    // PowerPoint keeps a line's baseline and pitch from the run's own font when an emoji, a symbol
+    // or a script the font lacks is drawn from another face.
+    let base = |text: &str| {
+        let (p, sh) = bidi_setup(vec![Run::new(text)], 2000.0, false, Align::Left);
+        let l = lay(&p, &sh, 2000.0, 300.0);
+        (l.lines[0].baseline, l.lines[0].bottom)
+    };
+    let plain = base("Hxg Hxg");
+    for text in ["Hxg \u{1F600} Hxg", "Hxg \u{0E2A}\u{0E27}\u{0E31}\u{0E2A}", "Hxg \u{222B}\u{2211}"] {
+        let b = base(text);
+        assert!((b.0 - plain.0).abs() < 0.01 && (b.1 - plain.1).abs() < 0.01, "{text:?}: {b:?} vs {plain:?}");
+    }
+}
+
+#[test]
+fn strikethrough_sits_at_the_font_strikeout_position() {
+    let (p, mut sh) = setup("Struck", 2000.0, 300.0);
+    let para = &mut sh.text.as_mut().unwrap().paragraphs[0];
+    para.props.bullet = Some(Bullet::None);
+    para.runs[0].props.size = Some(96.0);
+    para.runs[0].props.strike = Some(Strike::Single);
+    let l = lay(&p, &sh, 2000.0, 300.0);
+    let r = l.runs.iter().find(|r| !r.cells.is_empty()).unwrap();
+    let k = 96.0 / r.face.upem;
+    let d = l.decos.iter().find(|d| !d.behind).expect("a strikethrough");
+    assert!((l.lines[0].baseline - d.rect.y0 - r.face.strikeout.0 * k).abs() < 0.01, "top at the strikeout position");
+    assert!((d.rect.height() - (r.face.strikeout.1 * k).max(0.5)).abs() < 0.01);
+}
+
+#[test]
+fn rtl_columns_start_on_the_right_and_just_anchoring_sits_at_the_bottom() {
+    let text = "word ".repeat(200);
+    let (p, mut sh) = setup(&text, 400.0, 200.0);
+    let t = sh.text.as_mut().unwrap();
+    t.body.columns = Some(2);
+    t.body.col_spacing = Some(20.0);
+    t.paragraphs[0].runs[0].props.size = Some(12.0);
+    let ltr = lay(&p, &sh, 400.0, 200.0);
+    sh.text.as_mut().unwrap().body.rtl_col = Some(true);
+    let rtl = lay(&p, &sh, 400.0, 200.0);
+    let first = |l: &TextLayout| l.lines.iter().find(|x| x.column == 0).map(|x| x.extent.0).unwrap();
+    let second = |l: &TextLayout| l.lines.iter().find(|x| x.column == 1).map(|x| x.extent.0).unwrap();
+    assert!(first(&ltr) < second(&ltr));
+    assert!(first(&rtl) > second(&rtl), "with rtlCol the first column is on the right");
+    // anchor="just" and "dist" draw like "b".
+    let (p, mut sh) = setup("one line", 400.0, 300.0);
+    sh.text.as_mut().unwrap().body.anchor = Some(Anchor::Bottom);
+    let b = lay(&p, &sh, 400.0, 300.0).lines[0].top;
+    for a in [Anchor::Justified, Anchor::Distributed] {
+        sh.text.as_mut().unwrap().body.anchor = Some(a);
+        assert!((lay(&p, &sh, 400.0, 300.0).lines[0].top - b).abs() < 0.01, "{a:?}");
+    }
+}
+
+#[test]
+fn stacked_combining_marks_take_a_face_that_draws_them() {
+    // A letter with marks the run's font lacks draws in a face that has them all (no boxes).
+    let db = FontDb::global();
+    let cluster = ['Z', '\u{0334}', '\u{0321}', '\u{031B}'];
+    let run_face = db.face("Inter", "Regular");
+    let f = db.cascade(&cluster, std::slice::from_ref(&run_face), "Regular");
+    if !deckcraft_fonts::covers_cluster(&run_face, &cluster) && ["DejaVu Sans", "Segoe UI"].iter().any(|fam| db.has_family(fam)) {
+        // Make sure a face with the marks is loaded, then the cluster must take one.
+        for fam in ["DejaVu Sans", "Segoe UI"] {
+            if db.has_family(fam) {
+                let _ = db.face(fam, "Regular");
+            }
+        }
+        let f = db.cascade(&cluster, std::slice::from_ref(&run_face), "Regular");
+        assert!(deckcraft_fonts::covers_cluster(&f, &cluster), "{} lacks the marks", f.family);
+    }
+    let _ = f;
 }

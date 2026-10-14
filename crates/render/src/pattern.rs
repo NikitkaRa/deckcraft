@@ -109,7 +109,10 @@ pub fn fill(ctx: &mut RenderContext, name: &str, fg: Rgba, bg: Rgba, alpha: f64,
         sampler: peniko::ImageSampler {
             x_extend: peniko::Extend::Repeat,
             y_extend: peniko::Extend::Repeat,
-            quality: peniko::ImageQuality::Low,
+            // Bilinear, as PowerPoint samples the tile: exact at a whole number of output pixels
+            // per cell; between, a pixel straddling two cells takes a blend of both (fitted to its
+            // export at 0.75 px per cell: mean error 0.067 against 0.082 for the nearest cell).
+            quality: peniko::ImageQuality::Medium,
             alpha: 1.0,
         },
     });

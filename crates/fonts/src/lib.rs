@@ -141,10 +141,15 @@ mod tests {
     #[test]
     fn emoji_clusters_are_recognised() {
         let c = |s: &str| s.chars().collect::<Vec<char>>();
-        for yes in ["😀", "👍🏽", "❤\u{FE0F}", "👨\u{200D}👩\u{200D}👧", "🇯🇵", "1\u{FE0F}\u{20E3}", "🏳\u{FE0F}\u{200D}🌈"] {
+        // As PowerPoint draws them: emoji-presentation characters (⭐ ✅ ☔ ⌚ ⏩) in colour even
+        // without a selector, text-presentation ones (♥ ✔ ☎ ⬆ ▶) as text unless U+FE0F asks, and
+        // keycaps always as text.
+        for yes in ["😀", "👍🏽", "❤\u{FE0F}", "👨\u{200D}👩\u{200D}👧", "🇯🇵", "🏳\u{FE0F}\u{200D}🌈", "⭐", "✅", "☔", "⌚", "⏩", "🀄"]
+        {
             assert!(is_emoji_cluster(&c(yes)), "{yes:?}");
         }
-        for no in ["a", "1", "❤", "☺\u{FE0E}", "😀\u{FE0E}", "字", "→"] {
+        for no in ["a", "1", "❤", "☺\u{FE0E}", "😀\u{FE0E}", "字", "→", "♥", "✔", "☎", "⬆", "▶", "1\u{FE0F}\u{20E3}", "#\u{20E3}"]
+        {
             assert!(!is_emoji_cluster(&c(no)), "{no:?}");
         }
     }
