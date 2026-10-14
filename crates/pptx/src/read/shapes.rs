@@ -11,7 +11,7 @@ use deckcraft_model::text::{Anchor, TextDir};
 use deckcraft_model::{Geom, MediaClip, PhType, Placeholder, Shape, ShapeId, ShapeKind, ShapeStyle};
 
 use super::{Imp, Part, dml};
-use crate::xml::El;
+use crate::xml::{El, Node};
 
 /// File shape ids at or above this are reassigned.
 pub const MAX_KEPT_ID: u32 = 1 << 30;
@@ -423,6 +423,9 @@ fn smartart(imp: &mut Imp, part: &Part, gd: &El, frame: &Shape, depth: usize) ->
     let mut d = imp.pkg.xml(&drawing_rel)?;
     super::resolve_mc(&mut d.root, 0);
     let dpart = Part::new(imp.pkg, &drawing_rel, &d);
+    if let Some(t) = d.root.elements_mut().find(|e| e.is("spTree")) {
+        split_text_boxes(t, 0);
+    }
     let tree = d.root.child("spTree")?;
     let mut sub = IdCtx { fresh: true, ..Default::default() };
     let children = sp_tree(imp, &dpart, &mut sub, tree, depth + 1);
@@ -433,6 +436,76 @@ fn smartart(imp: &mut Imp, part: &Part, gd: &El, frame: &Shape, depth: usize) ->
     let x = frame.xfrm.unwrap_or_default();
     g.kind = ShapeKind::Group { children, child: Xfrm::new(0.0, 0.0, x.w, x.h) };
     Some(g)
+}
+
+/// A SmartArt drawing's shape can set its text's box apart from its outline (`dsp:txXfrm`): Venn
+/// labels sit in the circles' outer parts, and a hexagon turned 90° keeps its text upright through
+/// the box's own turn, added to the shape's. Such a shape becomes the outline without text followed
+/// by a bare rectangle holding the text at that box.
+fn split_text_boxes(tree: &mut El, depth: usize) {
+    if depth > 64 {
+        return;
+    }
+    let mut out = Vec::with_capacity(tree.children.len());
+    for n in std::mem::take(&mut tree.children) {
+        let Node::El(mut e) = n else {
+            out.push(n);
+            continue;
+        };
+        if e.is("grpSp") {
+            split_text_boxes(&mut e, depth + 1);
+            out.push(Node::El(e));
+            continue;
+        }
+        let text = (e.is("sp") && e.child("txBody").is_some()).then(|| e.child("txXfrm").cloned()).flatten();
+        let xfrm = e.child("spPr").and_then(|p| p.child("xfrm")).cloned();
+        let (Some(tx), Some(xfrm)) = (text, xfrm) else {
+            out.push(Node::El(e));
+            continue;
+        };
+        let rect = |x: &El| (x.child("off").map(|o| (o.i64("x"), o.i64("y"))), x.child("ext").map(|o| (o.i64("cx"), o.i64("cy"))));
+        let tx_rot = tx.i64("rot").unwrap_or(0);
+        if tx_rot == 0 && rect(&tx) == rect(&xfrm) || tx.child("off").is_none() || tx.child("ext").is_none() {
+            out.push(Node::El(e));
+            continue;
+        }
+        let mut label = e.clone();
+        e.children.retain(|c| !matches!(c, Node::El(c) if c.is("txBody")));
+        let rot = (xfrm.i64("rot").unwrap_or(0) + tx_rot).rem_euclid(21_600_000);
+        let el = |name: &str, attrs: &[(&str, String)], children: Vec<El>| El {
+            name: name.into(),
+            attrs: attrs.iter().map(|(k, v)| (k.to_string(), v.clone())).collect(),
+            children: children.into_iter().map(Node::El).collect(),
+        };
+        let mut box_xfrm = el("a:xfrm", &[], tx.elements().filter(|c| c.is("off") || c.is("ext")).cloned().collect());
+        if rot != 0 {
+            box_xfrm.set_attr("rot", &rot.to_string());
+        }
+        let sp_pr = el(
+            "dsp:spPr",
+            &[],
+            vec![
+                box_xfrm,
+                el("a:prstGeom", &[("prst", "rect".into())], vec![el("a:avLst", &[], vec![])]),
+                el("a:noFill", &[], vec![]),
+                el("a:ln", &[], vec![el("a:noFill", &[], vec![])]),
+            ],
+        );
+        for c in label.elements_mut() {
+            if c.is("style") {
+                for r in c.elements_mut().filter(|r| r.is("effectRef")) {
+                    r.set_attr("idx", "0");
+                }
+            }
+        }
+        if let Some(i) = label.children.iter().position(|c| matches!(c, Node::El(c) if c.is("spPr"))) {
+            label.children[i] = Node::El(sp_pr);
+        }
+        label.children.retain(|c| !matches!(c, Node::El(c) if c.is("txXfrm")));
+        out.push(Node::El(e));
+        out.push(Node::El(label));
+    }
+    tree.children = out;
 }
 
 fn table(imp: &mut Imp, part: &Part, tbl: &El) -> Table {
@@ -508,4 +581,25 @@ fn cell(imp: &mut Imp, part: &Part, tc: &El) -> Cell {
         c.fill = dml::fill_of(imp, part, pr);
     }
     c
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn smartart_text_boxes_split_off_with_their_own_turn() {
+        let xml = br#"<dsp:spTree xmlns:dsp="d" xmlns:a="a"><dsp:sp><dsp:spPr><a:xfrm rot="5400000"><a:off x="0" y="0"/><a:ext cx="100" cy="100"/></a:xfrm><a:prstGeom prst="hexagon"/></dsp:spPr><dsp:txBody><a:p><a:r><a:t>ghi</a:t></a:r></a:p></dsp:txBody><dsp:txXfrm rot="-5400000"><a:off x="10" y="20"/><a:ext cx="80" cy="60"/></dsp:txXfrm></dsp:sp><dsp:sp><dsp:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="5" cy="5"/></a:xfrm></dsp:spPr><dsp:txBody/><dsp:txXfrm><a:off x="0" y="0"/><a:ext cx="5" cy="5"/></dsp:txXfrm></dsp:sp></dsp:spTree>"#;
+        let mut d = crate::xml::parse(xml).unwrap();
+        split_text_boxes(&mut d.root, 0);
+        let sps: Vec<&El> = d.root.children_named("sp").collect();
+        // The hexagon loses its text to a rectangle at the text box, turned 0° in all; the shape
+        // whose text box is its own outline stays whole.
+        assert_eq!(sps.len(), 3);
+        assert!(sps[0].child("txBody").is_none());
+        let x = sps[1].path(&["spPr", "xfrm"]).unwrap();
+        assert_eq!((x.attr("rot"), x.child("off").and_then(|o| o.i64("y"))), (None, Some(20)));
+        assert_eq!(sps[1].path(&["spPr", "prstGeom"]).and_then(|g| g.attr("prst")), Some("rect"));
+        assert!(sps[1].child("txBody").is_some() && sps[2].child("txBody").is_some());
+    }
 }
