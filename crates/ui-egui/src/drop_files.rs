@@ -3,6 +3,9 @@
 //! A picture dropped on the slide is centred on the pointer. Anywhere else in the window (the
 //! ribbon, the thumbnail pane) it keeps the centred insert. A presentation still opens.
 
+// Only the macOS drop path reads the AppKit pointer; elsewhere these helpers are test-only.
+#![cfg_attr(not(target_os = "macos"), allow(dead_code))]
+
 use egui::{Pos2, Rect};
 
 /// Cocoa reports the pointer from the bottom-left of the main display, in screen points.

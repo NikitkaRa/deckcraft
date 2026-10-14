@@ -2270,7 +2270,7 @@ mod icon_and_picture_tests {
 }
 
 #[cfg(test)]
-mod tests {
+mod drop_at_tests {
     use super::*;
 
     fn tiny_png() -> Vec<u8> {
