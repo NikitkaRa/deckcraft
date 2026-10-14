@@ -195,6 +195,7 @@ app's JSON control channel (`deckcraft --control PORT`).
 | 2026-10-14 | Draw: pen pressure scales ink width when the pointer reports it (a mouse or a missing reading stays at the pen width; a stroke saved as a flat 0.5 still draws at the pen width). Tilt is not read |
 | 2026-10-13 | Saving a presentation keeps the embedded workbook behind an unchanged chart, and the chart part's relationships (#335). Editing the chart drops that workbook instead of writing numbers that no longer match it |
 | 2026-10-13 | A presentation whose object ids are used up refuses to grow instead of handing out duplicate ids (#407) |
+| 2026-10-14 | The presenter window draws the laser dot (ordinary show and a recorded trace). Rehearse Timings: Pause and Repeat, then "Keep the new slide timings?". Breadth stays 80%; P2 41%; slide show 74% |
 | 2026-10-14 | Laser pointer in an ordinary show: hold Ctrl (or the on-screen button) for a dot in the colour chosen in Set Up Slide Show (red, green or blue; written to PPTX). Clear Timing and Clear Narration on the current slide or all slides. Breadth 80% |
 | 2026-10-14 | Record Slide Show narration and laser: each slide's microphone audio is embedded and plays in the show (Play Narrations turns it off), and it is written to PPTX; a laser trace is recorded and replayed. Screen capture and camera stay open |
 | 2026-10-14 | Record Slide Show (`show.record`): a recording badge in the show, slide timings kept on exit, and pen ink kept on the slide. Narration audio and screen capture stay open |
@@ -230,6 +231,7 @@ app's JSON control channel (`deckcraft --control PORT`).
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-10-14 | trivial | Laser dot in the presenter window; Rehearse Timings has Pause and Repeat and asks before keeping timings |
 | 2026-10-14 | trivial | remote MCP checks reply IDs, envelopes and bounded newline framing (#718) |
 | 2026-10-14 | minor | Gray list markers on empty paragraphs while editing; caret keeps the list indent before typing |
 | 2026-10-14 | minor | Community PR wave folded: headline breadth 84% over 191 features (P0 92%, P1 82%, P2 55%) and the feature-area breadths from `cargo xtask parity`; one row per area; Upcoming item 2 merged; per-PR count notes dropped from the progress log. Ready stays ~55%, stage alpha |

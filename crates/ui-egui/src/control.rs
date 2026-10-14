@@ -349,6 +349,11 @@ pub fn handle(app: &mut SlideApp, ctx: &egui::Context, req: &ControlRequest) -> 
             {
                 show.record = true;
             }
+            if p.get("rehearse").and_then(Value::as_bool) == Some(true)
+                && let Some(show) = app.show.as_mut()
+            {
+                show.rehearse = true;
+            }
             ok(Value::Null)
         }
         "show.end" => {

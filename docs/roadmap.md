@@ -137,6 +137,7 @@ plan above.
 | 2026-10-13 | minor | M10: Grid Options dialog; New Window stays open |
 | 2026-10-13 | minor | M9: WordArt adjust handles drag; the Transform gallery and command stay open |
 | 2026-10-14 | trivial | After beta: pen pressure scales ink width; tilt and pinch zoom remain |
+| 2026-10-14 | trivial | Presenter window draws the laser dot. Rehearse Timings: Pause, Repeat, and a prompt to keep the new timings |
 | 2026-10-14 | trivial | Laser pointer during a show, and Clear Timing / Clear Narration on the current slide or all slides |
 | 2026-10-14 | trivial | Record Slide Show keeps narration and a laser trace; screen capture and camera stay after beta |
 | 2026-10-14 | trivial | Record Slide Show keeps timings and pen ink; narration audio and screen capture stay after beta |

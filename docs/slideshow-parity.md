@@ -5,7 +5,7 @@
 Presenting is the job PowerPoint is hired for. This doc covers the show window, presenter view,
 rehearsal and recording. Transition and animation playback are in
 [animation-parity.md](animation-parity.md); display hardware in
-[hardware-parity.md](hardware-parity.md). Area score: checklist breadth **71%** (measured), **~60%
+[hardware-parity.md](hardware-parity.md). Area score: checklist breadth **74%** (measured), **~60%
 ready** (estimated), **10–16 h** to parity.
 
 ## Running the show
@@ -31,7 +31,7 @@ ready** (estimated), **10–16 h** to parity.
 | See All Slides grid during the show | yes | yes: G, or All on the show bar and in presenter view; click a thumbnail, Esc closes the grid | Hidden slides are labelled; the first 48 slides are shown |
 | Zoom into part of a slide during the show | yes | yes: Z, then click the slide (or the presenter slide); 2×, Esc or another click leaves it | The presenter keeps the whole slide and draws a frame on the zoomed part |
 | Pen and highlighter ink | yes | pen only (Cmd+P pen, Cmd+A arrow, E erases all ink) | No highlighter, per-stroke eraser, ink colours, or keep/discard annotations prompt |
-| Laser pointer | yes | yes in the show | Cmd/Ctrl+L, holding Ctrl, or the on-screen button draw the show's laser colour (red, green or blue in Set Up Slide Show) and leave no ink. A recorded trace still replays. The presenter window does not move that dot |
+| Laser pointer | yes | yes in the show | Cmd/Ctrl+L, holding Ctrl, or the on-screen button draw the show's laser colour (red, green or blue in Set Up Slide Show) and leave no ink. The presenter window draws the same dot. A recorded trace still replays, including in the presenter window |
 | Subtitles and live captions | yes (cloud speech) | no | AI dimension |
 | Custom shows | yes | yes: Show plays that list in order and does not change Set Up; Set Up Slide Show can keep one for Play from Start | Hidden slides in the list are skipped |
 | Set Up Show: loop until Esc, kiosk (browsed at a kiosk), show without animation/narration, pen colour, laser colour, slides range | yes | yes, most options | Laser colour is red, green or blue |
@@ -49,7 +49,7 @@ ready** (estimated), **10–16 h** to parity.
 | Notes font size, scrolling | yes | yes: A- / A+ (and `[` / `]`), 12–48 pt in steps of 4, default 18; the notes scroll | |
 | Placed on the presenter's display automatically, show on the projector | yes | **no**: opens wherever the OS puts it | Beta blocker, 3–5 h. Open PR #433 places the show on a second display when one is attached. This change does not |
 | Swap displays | yes | no | Still open on #433 |
-| Pen, laser, black screen, zoom from presenter view | yes | Black, White and Zoom buttons; the audience zoom is framed on the presenter slide | Pen and laser are driven from the audience window only; the presenter window does not move the laser dot |
+| Pen, laser, black screen, zoom from presenter view | yes | Black, White and Zoom buttons; the audience zoom is framed on the presenter slide | The current slide shows the laser dot; pen and laser are driven from the audience window |
 | See all slides from presenter view | yes | yes: All slides opens the grid on the show | |
 | Rehearse with Coach (Speaker Coach) | yes (cloud) | no | AI dimension |
 
@@ -57,7 +57,7 @@ ready** (estimated), **10–16 h** to parity.
 
 | Feature | PowerPoint | DeckCraft |
 |---|---|---|
-| Rehearse Timings, keep timings | yes | yes |
+| Rehearse Timings, keep timings | yes | yes: Pause and Repeat on the timer; ending asks whether to keep the new timings, and No discards them |
 | Record Slide Show (narration, ink, laser, camera; Cameo) | yes | timings, per-slide narration audio, pen ink and a recorded laser trace; no camera or screen capture |
 | Clear timing / narration | yes | current slide or all slides |
 | Export the recorded show to video | yes | no (see [file-format-parity.md](file-format-parity.md)) |
