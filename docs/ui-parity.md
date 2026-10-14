@@ -1,6 +1,6 @@
 # UI parity with PowerPoint
 
-> **Last reviewed:** 2026-10-10 · **Last updated:** 2026-10-12 · **Change:** minor (File tab / Backstage, #76; previous: off-slide objects in Normal view, #270) · **Target:** Microsoft PowerPoint for Mac 16.113 (Microsoft 365)
+> **Last reviewed:** 2026-10-14 · **Last updated:** 2026-10-14 · **Change:** minor (Home ribbon toggles follow a mixed selection; previous: File tab / Backstage, #76) · **Target:** Microsoft PowerPoint for Mac 16.113 (Microsoft 365)
 
 > **Last reviewed:** 2026-10-12 · **Last updated:** 2026-10-12 · **Change:** minor (text editing keys observed in PowerPoint for Windows, #268) · **Target:** Microsoft PowerPoint for Mac 16.113 (Microsoft 365)
 
@@ -95,6 +95,12 @@ group/ungroup, bold/italic/underline, alignment, font size, list levels, Format 
 start/current, view switching. Not yet: Cmd+F Find opening a find bar on the slide, Option+drag
 precision without snapping, F6 pane cycling, ribbon KeyTips (Windows).
 
+Home ribbon toggles report a property only when every run or paragraph the command would change
+agrees. Bold, italic, underline, strikethrough, superscript, subscript, bullets and numbering stay
+off on a mixed selection, and clicking one turns that property on for the whole span. Alignment
+buttons light only when every paragraph shares that alignment. The font and size fields stay blank
+when the runs disagree. A caret still shows the formatting at the insertion point.
+
 ### Text editing keys
 
 Observed black-box in PowerPoint for Windows (Microsoft 365, October 2026) on synthetic text, and
@@ -148,6 +154,7 @@ imitate Microsoft's. No pixel comparison against PowerPoint screenshots has been
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-10-14 | minor | Home ribbon toggles, alignment and the font and size fields follow a mixed selection |
 | 2026-10-12 | minor | File tab (Backstage) observed in PowerPoint for Windows and matched (#76); the start screen is File › Home |
 | 2026-10-12 | minor | Off-slide objects drawn and editable around the slide in Normal view (#270) |
 | 2026-10-12 | minor | Selection Pane matched to PowerPoint (#133): drag and drop, arrows, groups, eye, Lock |

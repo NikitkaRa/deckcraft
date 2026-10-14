@@ -163,7 +163,15 @@ pub fn specs() -> Vec<CommandSpec> {
         ),
         cmd!(noundo "format.painter", "Format Painter", ["Home", "Clipboard"], Some("Cmd+Shift+C"), "{sticky?: bool}", has_text_or_shapes, painter_pick),
         cmd!("format.painterApply", "Paste Formatting", [], Some("Cmd+Shift+V"), "{ids?}", has_text_or_shapes, painter_apply),
-        cmd!(query "format.state", "Formatting State", [], None, "{} → the effective formatting at the selection (font, size, bold, …)", has_doc, state),
+        cmd!(
+            query "format.state",
+            "Formatting State",
+            [],
+            None,
+            "{} → the effective formatting at the selection (font, size, bold, …). Bold, italic, underline, strike, baseline, alignment, bullets and numbering are reported only when the whole selection agrees",
+            has_doc,
+            state
+        ),
     ]
 }
 
@@ -216,22 +224,144 @@ fn current_para(s: &Session) -> ParaProps {
     }
 }
 
+/// Resolved runs and paragraphs a format command would change.
+///
+/// A caret is the insertion point. A text range, or one or more selected shapes, is every run and
+/// paragraph in that span — including every cell of a selected table. Ribbon toggles use this so
+/// a mixed selection is not shown as bold, centred or bulleted.
+fn selection_samples(s: &Session) -> (Vec<RunProps>, Vec<ParaProps>) {
+    let Ok(st) = s.doc() else { return (vec![], vec![]) };
+    let ctx = super::text::ctx_for(&st.doc, &st.selection);
+    let mut runs = Vec::new();
+    let mut paras = Vec::new();
+    let mut push_body = |shape: &Shape, body: &deckcraft_model::text::TextBody, span: Option<((usize, usize), (usize, usize))>| {
+        let n = body.paragraphs.len();
+        if n == 0 {
+            return;
+        }
+        let (p0, p1) = match span {
+            Some((a, b)) => (a.0.min(n - 1), b.0.min(n - 1)),
+            None => (0, n - 1),
+        };
+        for (pi, para) in body.paragraphs.iter().enumerate().take(p1 + 1).skip(p0) {
+            paras.push(match &ctx {
+                Some(c) => resolve::para(c, shape, para),
+                None => para.props.clone(),
+            });
+            let from = span.filter(|(a, _)| a.0 == pi).map(|(a, _)| a.1).unwrap_or(0);
+            let to = span.filter(|(_, b)| b.0 == pi).map(|(_, b)| b.1);
+            let mut acc = 0usize;
+            let mut any = false;
+            for r in &para.runs {
+                let start = acc;
+                let len = r.char_len();
+                acc += len;
+                if len == 0 {
+                    continue;
+                }
+                let end = to.unwrap_or(usize::MAX);
+                if acc <= from || start >= end {
+                    continue;
+                }
+                runs.push(match &ctx {
+                    Some(c) => resolve::run(c, shape, para, &r.props),
+                    None => r.props.clone(),
+                });
+                any = true;
+            }
+            // An empty paragraph still has an end mark. A zero-width boundary (the selection ends
+            // at the start of the next paragraph) does not.
+            let empty = para.runs.iter().all(|r| r.char_len() == 0);
+            if !any && empty && to != Some(from) {
+                runs.push(match &ctx {
+                    Some(c) => resolve::run(c, shape, para, &para.end_props),
+                    None => para.end_props.clone(),
+                });
+            }
+        }
+    };
+    if let Some(t) = &st.selection.text {
+        let Some(body) = super::text::body_of(st, t) else { return (vec![], vec![]) };
+        let shape = st.shape(t.shape).cloned().unwrap_or_default();
+        if !t.is_range() {
+            let para = body.paragraphs.get(t.caret.0).cloned().unwrap_or_default();
+            let rp = ed::props_at(body, t.caret);
+            let run = match &ctx {
+                Some(c) => resolve::run(c, &shape, &para, &rp),
+                None => rp,
+            };
+            let pp = match &ctx {
+                Some(c) => resolve::para(c, &shape, &para),
+                None => para.props,
+            };
+            return (vec![run], vec![pp]);
+        }
+        push_body(&shape, body, Some(t.ordered()));
+        return (runs, paras);
+    }
+    for sh in st.selected_shapes() {
+        match &sh.kind {
+            deckcraft_model::ShapeKind::Table(table) => {
+                for row in &table.rows {
+                    for cell in &row.cells {
+                        push_body(sh, &cell.text, None);
+                    }
+                }
+            }
+            _ => {
+                if let Some(body) = &sh.text {
+                    push_body(sh, body, None);
+                }
+            }
+        }
+    }
+    (runs, paras)
+}
+
+fn all_runs(runs: &[RunProps], pred: impl Fn(&RunProps) -> bool) -> bool {
+    !runs.is_empty() && runs.iter().all(pred)
+}
+
+fn all_paras(paras: &[ParaProps], pred: impl Fn(&ParaProps) -> bool) -> bool {
+    !paras.is_empty() && paras.iter().all(pred)
+}
+
+fn uniform_text(values: impl Iterator<Item = String>) -> String {
+    let mut values = values;
+    let Some(first) = values.next() else { return String::new() };
+    if values.all(|v| v == first) { first } else { String::new() }
+}
+
+fn uniform_size(runs: &[RunProps]) -> Option<f64> {
+    let first = runs.first()?.size?;
+    if runs.iter().all(|r| r.size.is_some_and(|v| (v - first).abs() < 0.01)) { Some(first) } else { None }
+}
+
+fn uniform_align(paras: &[ParaProps]) -> Option<&'static str> {
+    let first = paras.first()?.align;
+    if paras.iter().all(|p| p.align == first) { first.map(Align::xml) } else { None }
+}
+
 fn bold(s: &mut Session, p: &Value) -> Result<Value> {
-    let v = on_param(p, current_run(s).bold);
+    let (runs, _) = selection_samples(s);
+    let v = on_param(p, Some(all_runs(&runs, |r| r.bold.unwrap_or(false))));
     format_run(s, &move |r| r.bold = Some(v))
 }
 fn italic(s: &mut Session, p: &Value) -> Result<Value> {
-    let v = on_param(p, current_run(s).italic);
+    let (runs, _) = selection_samples(s);
+    let v = on_param(p, Some(all_runs(&runs, |r| r.italic.unwrap_or(false))));
     format_run(s, &move |r| r.italic = Some(v))
 }
 fn underline(s: &mut Session, p: &Value) -> Result<Value> {
-    let cur = current_run(s).underline.is_some_and(|u| u != "none");
+    let (runs, _) = selection_samples(s);
+    let cur = all_runs(&runs, |r| r.underline.as_deref().is_some_and(|u| u != "none"));
     let v = on_param(p, Some(cur));
     let style = str_param(p, "style").unwrap_or("sng").to_string();
     format_run(s, &move |r| r.underline = Some(if v { style.clone() } else { "none".into() }))
 }
 fn strike(s: &mut Session, p: &Value) -> Result<Value> {
-    let cur = current_run(s).strike.is_some_and(|x| x != Strike::None);
+    let (runs, _) = selection_samples(s);
+    let cur = all_runs(&runs, |r| r.strike.is_some_and(|x| x != Strike::None));
     let v = on_param(p, Some(cur));
     let d = bool_or(p, "double", false);
     format_run(s, &move |r| {
@@ -245,11 +375,13 @@ fn strike(s: &mut Session, p: &Value) -> Result<Value> {
     })
 }
 fn superscript(s: &mut Session, p: &Value) -> Result<Value> {
-    let v = on_param(p, Some(current_run(s).baseline.unwrap_or(0.0) > 0.0));
+    let (runs, _) = selection_samples(s);
+    let v = on_param(p, Some(all_runs(&runs, |r| r.baseline.unwrap_or(0.0) > 0.0)));
     format_run(s, &move |r| r.baseline = Some(if v { 0.3 } else { 0.0 }))
 }
 fn subscript(s: &mut Session, p: &Value) -> Result<Value> {
-    let v = on_param(p, Some(current_run(s).baseline.unwrap_or(0.0) < 0.0));
+    let (runs, _) = selection_samples(s);
+    let v = on_param(p, Some(all_runs(&runs, |r| r.baseline.unwrap_or(0.0) < 0.0)));
     format_run(s, &move |r| r.baseline = Some(if v { -0.25 } else { 0.0 }))
 }
 fn font(s: &mut Session, p: &Value) -> Result<Value> {
@@ -438,7 +570,8 @@ fn rtl(s: &mut Session, p: &Value) -> Result<Value> {
 }
 
 fn bullets(s: &mut Session, p: &Value) -> Result<Value> {
-    let cur = matches!(current_para(s).bullet, Some(Bullet::Char { .. }));
+    let (_, paras) = selection_samples(s);
+    let cur = all_paras(&paras, |p| matches!(p.bullet, Some(Bullet::Char { .. })));
     let on = on_param(p, Some(cur));
     let ch = str_param(p, "char").unwrap_or("•").to_string();
     let col = color_param(p, "color");
@@ -467,7 +600,8 @@ fn bullets(s: &mut Session, p: &Value) -> Result<Value> {
 }
 
 fn numbering(s: &mut Session, p: &Value) -> Result<Value> {
-    let cur = matches!(current_para(s).bullet, Some(Bullet::AutoNum { .. }));
+    let (_, paras) = selection_samples(s);
+    let cur = all_paras(&paras, |p| matches!(p.bullet, Some(Bullet::AutoNum { .. })));
     let on = on_param(p, Some(cur));
     let scheme = str_param(p, "scheme").unwrap_or("arabicPeriod").to_string();
     let start = p.get("start").and_then(Value::as_u64).map(|v| v.clamp(1, 32767) as u32).unwrap_or(1);
@@ -661,24 +795,26 @@ fn painter_apply(s: &mut Session, p: &Value) -> Result<Value> {
 }
 
 fn state(s: &mut Session, _p: &Value) -> Result<Value> {
-    let r = current_run(s);
-    let pp = current_para(s);
+    let (runs, paras) = selection_samples(s);
     let st = s.doc()?;
-    let family = super::text::ctx_for(&st.doc, &st.selection).map(|c| resolve::font_family(&c, &r)).unwrap_or_default();
+    let ctx = super::text::ctx_for(&st.doc, &st.selection);
+    let family = uniform_text(runs.iter().map(|r| ctx.as_ref().map(|c| resolve::font_family(c, r)).unwrap_or_default()));
+    let font_ref = uniform_text(runs.iter().map(|r| r.font.clone().unwrap_or_default()));
+    let spacing = paras.first().map(|p| serde_json::to_value(p.line_spacing).unwrap_or_default()).unwrap_or(Value::Null);
     Ok(json!({
         "font": family,
-        "fontRef": r.font,
-        "size": r.size,
-        "bold": r.bold.unwrap_or(false),
-        "italic": r.italic.unwrap_or(false),
-        "underline": r.underline.as_deref().is_some_and(|u| u != "none"),
-        "strike": r.strike.is_some_and(|x| x != Strike::None),
-        "superscript": r.baseline.unwrap_or(0.0) > 0.0,
-        "subscript": r.baseline.unwrap_or(0.0) < 0.0,
-        "align": pp.align.map(|a| a.xml()),
-        "bullets": matches!(pp.bullet, Some(Bullet::Char { .. })),
-        "numbering": matches!(pp.bullet, Some(Bullet::AutoNum { .. })),
-        "lineSpacing": serde_json::to_value(pp.line_spacing).unwrap_or_default(),
+        "fontRef": if font_ref.is_empty() { Value::Null } else { Value::String(font_ref) },
+        "size": uniform_size(&runs),
+        "bold": all_runs(&runs, |r| r.bold.unwrap_or(false)),
+        "italic": all_runs(&runs, |r| r.italic.unwrap_or(false)),
+        "underline": all_runs(&runs, |r| r.underline.as_deref().is_some_and(|u| u != "none")),
+        "strike": all_runs(&runs, |r| r.strike.is_some_and(|x| x != Strike::None)),
+        "superscript": all_runs(&runs, |r| r.baseline.unwrap_or(0.0) > 0.0),
+        "subscript": all_runs(&runs, |r| r.baseline.unwrap_or(0.0) < 0.0),
+        "align": uniform_align(&paras),
+        "bullets": all_paras(&paras, |p| matches!(p.bullet, Some(Bullet::Char { .. }))),
+        "numbering": all_paras(&paras, |p| matches!(p.bullet, Some(Bullet::AutoNum { .. }))),
+        "lineSpacing": spacing,
         "painter": s.painter.is_some(),
     }))
 }

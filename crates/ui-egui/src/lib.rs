@@ -1408,4 +1408,37 @@ mod tests {
         harness.run_steps(3);
         assert_eq!(harness.state().textures.canvas_renders, n, "an unchanged slide isn't rendered again");
     }
+
+    /// The Bold button stays off for a mixed selection, and clicking it bolds every run.
+    #[test]
+    fn bold_button_follows_a_mixed_selection() {
+        use egui_kittest::kittest::{NodeT, Queryable};
+        let mut s = deckcraft_engine::Session::with_new();
+        s.execute("slide.new", &json!({"layout": "blank"})).unwrap();
+        let id = s.execute("shape.insert", &json!({"preset": "rect", "rect": [40.0, 40.0, 280.0, 80.0], "text": "Bold plain"})).unwrap()["id"]
+            .as_u64()
+            .unwrap();
+        s.execute("text.edit", &json!({"id": id})).unwrap();
+        s.execute("text.select", &json!({"anchor": [0, 0], "caret": [0, 4]})).unwrap();
+        s.execute("format.bold", &json!({})).unwrap();
+        s.execute("text.exit", &json!({})).unwrap();
+        let mut app = SlideApp::new(s, Services::default());
+        app.ui.notes = false;
+        let mut h = egui_kittest::Harness::builder().with_size(egui::vec2(1400.0, 900.0)).build_ui_state(
+            |ui, app: &mut SlideApp| {
+                app.logic(ui.ctx());
+                app.ui(ui);
+            },
+            app,
+        );
+        h.run_steps(3);
+        let bold = h.get_by_label_contains("Bold (");
+        assert_eq!(bold.accesskit_node().toggled(), Some(egui::accesskit::Toggled::False), "{bold:?}");
+        bold.click();
+        h.run_steps(2);
+        let st = h.state_mut().session.execute("format.state", &json!({})).unwrap();
+        assert_eq!(st["bold"], true, "{st}");
+        let bold = h.get_by_label_contains("Bold (");
+        assert_eq!(bold.accesskit_node().toggled(), Some(egui::accesskit::Toggled::True), "{bold:?}");
+    }
 }

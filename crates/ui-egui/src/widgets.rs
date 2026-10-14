@@ -155,6 +155,7 @@ pub fn icon_toggle(ui: &mut Ui, icon: Icon, tip: &str, enabled: bool, on: bool) 
         painter.rect_filled(rect, CornerRadius::same(4), c);
     }
     icons::paint(&painter, rect.shrink(3.0), icon, t.text, !enabled);
+    resp.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::Button, enabled, on, tip));
     resp.on_hover_text(tip)
 }
 

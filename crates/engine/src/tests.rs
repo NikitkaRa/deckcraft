@@ -835,3 +835,49 @@ fn slide_ranges_parse_like_powerpoints_print_box() {
     let opts = cmd::file::pdf_options(&json!({"slides": [0, 7, 1]}), 2).unwrap();
     assert_eq!(opts.slides, Some(vec![0, 1]), "indices past the end are dropped");
 }
+
+/// Bold, alignment and bullets describe the whole selection. A mixed selection is off, and
+/// pressing the toggle turns the whole selection on rather than following the first run.
+#[test]
+fn format_toggles_follow_a_mixed_selection() {
+    let mut s = session();
+    s.execute("slide.new", &json!({"layout": "blank"})).unwrap();
+    let id = s.execute("shape.insert", &json!({"preset": "rect", "rect": [40.0, 40.0, 300.0, 80.0], "text": "Bold plain"})).unwrap()["id"]
+        .as_u64()
+        .unwrap();
+    s.execute("text.edit", &json!({"id": id})).unwrap();
+    s.execute("text.select", &json!({"anchor": [0, 0], "caret": [0, 4]})).unwrap();
+    s.execute("format.bold", &json!({})).unwrap();
+    // The caret inside the bold word still reports bold.
+    s.execute("text.select", &json!({"anchor": [0, 1], "caret": [0, 1]})).unwrap();
+    assert_eq!(s.execute("format.state", &json!({})).unwrap()["bold"], true);
+    // The whole line is mixed: the button is off.
+    s.execute("text.select", &json!({"anchor": [0, 0], "caret": [0, 10]})).unwrap();
+    let mixed = s.execute("format.state", &json!({})).unwrap();
+    assert_eq!(mixed["bold"], false);
+    // Pressing Bold turns the rest on; it does not clear the bold run.
+    s.execute("format.bold", &json!({})).unwrap();
+    let body = s.doc().unwrap().shape(deckcraft_model::ShapeId(id as u32)).unwrap().text.clone().unwrap();
+    assert!(body.paragraphs[0].runs.iter().all(|r| r.props.bold == Some(true)), "{:?}", body.paragraphs[0].runs);
+    assert_eq!(s.execute("format.state", &json!({})).unwrap()["bold"], true);
+
+    // Two paragraphs with different alignment and bullets: neither button is on, and Bullets
+    // turns the whole shape on.
+    s.execute("text.exit", &json!({})).unwrap();
+    s.execute("text.set", &json!({"id": id, "text": "Left\nRight"})).unwrap();
+    s.execute("text.edit", &json!({"id": id})).unwrap();
+    s.execute("text.select", &json!({"anchor": [0, 0], "caret": [0, 4]})).unwrap();
+    s.execute("format.alignLeft", &json!({})).unwrap();
+    s.execute("format.bullets", &json!({"on": false})).unwrap();
+    s.execute("text.select", &json!({"anchor": [1, 0], "caret": [1, 5]})).unwrap();
+    s.execute("format.alignRight", &json!({})).unwrap();
+    s.execute("format.bullets", &json!({"on": true})).unwrap();
+    s.execute("text.exit", &json!({})).unwrap();
+    let shape = s.execute("format.state", &json!({})).unwrap();
+    assert!(shape["align"].is_null(), "{shape}");
+    assert_eq!(shape["bullets"], false, "{shape}");
+    s.execute("format.bullets", &json!({})).unwrap();
+    let on = s.execute("format.state", &json!({})).unwrap();
+    assert_eq!(on["bullets"], true, "{on}");
+    assert!(on["align"].is_null(), "alignment stays mixed: {on}");
+}
