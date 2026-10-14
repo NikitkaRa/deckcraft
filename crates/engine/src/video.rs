@@ -278,17 +278,19 @@ pub fn timeline(pres: &Presentation, opts: &VideoOpts) -> Vec<Step> {
     plan(pres, opts).steps
 }
 
-/// An image fitted to exactly `w`×`h` RGBA (the renderer's size can differ by a pixel): copied
-/// into a black frame, cropped where it overhangs.
+/// An image fitted to exactly `w`×`h` RGBA: centred in a black frame (letterboxed when the
+/// slide's shape differs from the frame's; the renderer's size can also differ by a pixel),
+/// cropped where it overhangs.
 fn fit(img: &deckcraft_render::Image, w: u32, h: u32) -> Vec<u8> {
     let mut out = vec![0u8; (w as usize).saturating_mul(h as usize).saturating_mul(4)];
     for px in out.as_chunks_mut::<4>().0 {
         px[3] = 255;
     }
     let cw = img.width.min(w) as usize;
+    let (ox, oy) = (((w - cw as u32) / 2) as usize, ((h - img.height.min(h)) / 2) as usize);
     for y in 0..img.height.min(h) as usize {
         let src = y.saturating_mul(img.width as usize).saturating_mul(4);
-        let dst = y.saturating_mul(w as usize).saturating_mul(4);
+        let dst = (y + oy).saturating_mul(w as usize).saturating_add(ox).saturating_mul(4);
         if let (Some(s), Some(d)) = (img.pixels.get(src..src + cw * 4), out.get_mut(dst..dst + cw * 4)) {
             d.copy_from_slice(s);
         }
@@ -296,10 +298,13 @@ fn fit(img: &deckcraft_render::Image, w: u32, h: u32) -> Vec<u8> {
     out
 }
 
-/// The renderer options for a frame `h` pixels high.
-fn render_opts<'a>(pres: &Presentation, h: u32, state: Option<&'a dyn Fn(ShapeId) -> ShapeState>) -> deckcraft_render::RenderOpts<'a> {
-    let scale = h as f64 / pres.slide_size.height.max(1.0);
-    deckcraft_render::RenderOpts { scale: if scale.is_finite() { scale.clamp(0.01, 16.0) } else { 1.0 }, state, ..Default::default() }
+/// The renderer options for a `w`×`h` frame: the whole slide, as large as fits. The frame's
+/// aspect is limited to 1:10–10:1 and the slide's isn't (Design › Slide Size allows 1:56), so
+/// scaling to the frame height alone rendered a very wide slide far past the frame (cropped to
+/// its left part) and, past the 16× cap, a very short one smaller than the frame.
+fn render_opts<'a>(pres: &Presentation, (w, h): (u32, u32), state: Option<&'a dyn Fn(ShapeId) -> ShapeState>) -> deckcraft_render::RenderOpts<'a> {
+    let scale = (w as f64 / pres.slide_size.width.max(1.0)).min(h as f64 / pres.slide_size.height.max(1.0));
+    deckcraft_render::RenderOpts { scale: if scale.is_finite() && scale > 0.0 { scale } else { 1.0 }, state, ..Default::default() }
 }
 
 /// A shape's state at main step `step`, `t` seconds in (as the slide show draws it).
@@ -482,7 +487,7 @@ impl<'p> Renderer<'p> {
                 }
                 let vf: Vec<(ShapeId, deckcraft_render::VideoFrame)> =
                     held.iter().map(|(s, f)| (*s, deckcraft_render::VideoFrame { width: f.width, height: f.height, rgba: &f.rgba })).collect();
-                let mut opts = render_opts(pres, self.size.1, Some(&f));
+                let mut opts = render_opts(pres, self.size, Some(&f));
                 opts.video_frames = &vf;
                 let img = match step {
                     Step::Transition { index, t } => deckcraft_render::render_transition(pres, *index, *t, &opts),
@@ -751,6 +756,35 @@ mod tests {
         });
         assert_eq!(n, Ok(2));
         assert!(seen.iter().all(|l| *l == size.0 as usize * size.1 as usize * 4));
+    }
+
+    /// Slides outside the frame's 1:10–10:1 shape are drawn whole, letterboxed in black, not
+    /// cropped to their left part (the frame scale used to follow the height alone).
+    #[test]
+    fn extreme_slide_shapes_are_letterboxed_whole() {
+        for (sw, sh) in [(4032.0, 72.0), (72.0, 4032.0)] {
+            let mut p = deck(1);
+            p.slide_size = deckcraft_model::Size::new(sw, sh);
+            let (w, h) = frame_size(&p, &VideoOpts { height: 480, ..Default::default() });
+            let mut frame = vec![];
+            frames(&p, &[Step::Hold { index: 0, frames: 1 }], (w, h), &mut |px| {
+                frame = px.to_vec();
+                Ok(())
+            })
+            .unwrap();
+            let at = |x: u32, y: u32| frame[((y * w + x) * 4) as usize..][..3].to_vec();
+            let white = |c: Vec<u8>| c.iter().all(|v| *v > 200);
+            let black = |c: Vec<u8>| c.iter().all(|v| *v < 30);
+            // The slide's centre and both of its ends along its long side are in the frame.
+            assert!(white(at(w / 2, h / 2)), "{sw}x{sh}: centre");
+            if sw > sh {
+                assert!(white(at(1, h / 2)) && white(at(w - 2, h / 2)), "{sw}x{sh}: ends");
+                assert!(black(at(w / 2, 1)) && black(at(w / 2, h - 2)), "{sw}x{sh}: bars above and below");
+            } else {
+                assert!(white(at(w / 2, 1)) && white(at(w / 2, h - 2)), "{sw}x{sh}: ends");
+                assert!(black(at(0, h / 2)) && black(at(w - 1, h / 2)), "{sw}x{sh}: bars at the sides");
+            }
+        }
     }
 
     #[test]
