@@ -541,6 +541,27 @@ fn star(n: usize, w: f64, h: f64, inner: f64) -> Vec<(f64, f64)> {
     pts
 }
 
+/// The text rectangle ECMA-376's presetShapeDefinitions give a star (`inner` is the adjust value
+/// over 50000), where known: star4's is the square inside its inner points, star5's spans the
+/// inner pentagon from its upper side points to its bottom inner point.
+fn star_text_rect(n: usize, w: f64, h: f64, inner: f64) -> Option<Rect> {
+    let (hc, vc) = (w / 2.0, h / 2.0);
+    match n {
+        4 => {
+            let (dx, dy) = (hc * inner * 45f64.to_radians().cos(), vc * inner * 45f64.to_radians().sin());
+            Some(Rect::new(hc - dx, vc - dy, hc + dx, vc + dy))
+        }
+        5 => {
+            let (swd2, shd2, svc) = (hc * 1.05146, vc * 1.10557, vc * 1.10557);
+            let (iwd2, ihd2) = (swd2 * inner, shd2 * inner);
+            let sdx1 = iwd2 * 18f64.to_radians().cos();
+            let sdy1 = ihd2 * 54f64.to_radians().sin();
+            Some(Rect::new(hc - sdx1, svc - sdy1, hc + sdx1, svc + ihd2))
+        }
+        _ => None,
+    }
+}
+
 #[derive(Clone, Copy)]
 enum Corner {
     Square,
@@ -1307,8 +1328,17 @@ pub fn build(name: &str, w: f64, h: f64, adj: &[f64]) -> Option<Geometry> {
             } else {
                 vec![(0.0, 0.0), (w - d, 0.0), (w, h / 2.0), (w - d, h), (0.0, h), (d, h / 2.0)]
             };
-            let tx = if name == "homePlate" { 0.0 } else { d };
-            let mut g = simple(b.poly(&pts).take(), Rect::new(tx, 0.0, w - d / 2.0, h), w, h);
+            // Text rectangles as presetShapeDefinitions give them: homePlate's runs to halfway
+            // along the point; chevron's lies between the notch and the point's base (x1..x2)
+            // and covers the whole width once those meet or cross (`?: dx x1 l`).
+            let text = if name == "homePlate" {
+                Rect::new(0.0, 0.0, w - d / 2.0, h)
+            } else if w - d > d {
+                Rect::new(d, 0.0, w - d, h)
+            } else {
+                Rect::new(0.0, 0.0, w, h)
+            };
+            let mut g = simple(b.poly(&pts).take(), text, w, h);
             g.handles.push(Handle::new(0, Point::new(w, 0.0), Vec2::new(-ss / 1e5, 0.0), v, 0.0, 100000.0 * w / ss.max(1e-9)));
             g
         }
@@ -1615,7 +1645,8 @@ pub fn build(name: &str, w: f64, h: f64, adj: &[f64]) -> Option<Geometry> {
             let n: usize = name.trim_start_matches("star").parse().unwrap_or(5);
             let v = a(0).clamp(0.0, 50000.0);
             let inner = v / 50000.0;
-            let mut g = simple(b.poly(&star(n, w, h, inner)).take(), full.inset(-ss * (0.5 - inner * 0.5) * 0.5), w, h);
+            let text = star_text_rect(n, w, h, inner).unwrap_or_else(|| full.inset(-ss * (0.5 - inner * 0.5) * 0.5));
+            let mut g = simple(b.poly(&star(n, w, h, inner)).take(), text, w, h);
             g.handles.push(Handle::new(0, Point::new(w / 2.0, h / 2.0), Vec2::new(0.0, -h / 2.0 / 50000.0), v, 0.0, 50000.0));
             g
         }
@@ -2304,6 +2335,19 @@ mod tests {
         for (x, y) in [(0.18375, 0.00774), (0.84, 0.2), (1.0, 0.8), (0.16, 0.8)] {
             assert!(on_path(&g, Point::new(300.0 * x, 120.0 * y), 0.05), "shifted wave ({x}, {y})");
         }
+    }
+
+    #[test]
+    fn star_text_rectangles_follow_the_standard() {
+        // star5 at its default 19098 in a 144 pt square: the inner pentagon, about 0.38 of the
+        // width (PowerPoint wraps "Shape 3" at 18 pt there), from y ≈ 55 to ≈ 110.
+        let g = build("star5", 144.0, 144.0, &[]).unwrap();
+        let t = g.text_rect;
+        assert!((t.width() - 55.0).abs() < 1.0, "{t:?}");
+        assert!((t.y0 - 55.0).abs() < 1.0 && (t.y1 - 110.0).abs() < 1.0, "{t:?}");
+        // star4 at 12500: the square through its inner points' 45° corners.
+        let g = build("star4", 144.0, 144.0, &[]).unwrap();
+        assert!((g.text_rect.width() - 72.0 * 0.25 * 2f64.sqrt()).abs() < 0.5, "{:?}", g.text_rect);
     }
 
     #[test]

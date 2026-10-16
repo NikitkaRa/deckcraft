@@ -206,10 +206,33 @@ pub struct Decoder {
     /// Frames submitted to the workers and not known to be finished (oldest first).
     in_flight: VecDeque<Arc<FrameSlot>>,
     max_in_flight: usize,
+    /// Bytes the picture store may take ([`deckcraft_bitstream::budget`]).
+    memory_budget: u64,
     /// Shown pictures not yet returned, in output order.
     out: VecDeque<Output>,
     /// pts of the temporal unit being decoded.
     pts: i64,
+}
+
+/// Whether `pictures` frames of `width` x `height`, padded as `FrameBuf::new` pads them, fit in
+/// `budget` bytes.
+fn store_fits(width: u32, height: u32, color: &crate::header::ColorConfig, pictures: usize, budget: u64) -> bool {
+    let shape = deckcraft_bitstream::budget::PictureShape {
+        width: u64::from(width).div_ceil(128) * 128 + 160,
+        height: u64::from(height).div_ceil(128) * 128 + 160,
+        shift_x: u32::from(color.subsampling_x),
+        shift_y: u32::from(color.subsampling_y),
+        chroma_planes: if color.mono_chrome { 0 } else { 2 },
+        bytes_per_sample: 2,
+    };
+    shape.fits(pictures as u64, budget)
+}
+
+impl Decoder {
+    /// Cap the bytes of decoded pictures (references, current, in flight) this decoder may hold.
+    pub fn set_memory_budget(&mut self, bytes: u64) {
+        self.memory_budget = bytes;
+    }
 }
 
 fn default_threads() -> usize {
@@ -268,6 +291,7 @@ impl Decoder {
             workers,
             in_flight: VecDeque::new(),
             max_in_flight: fthreads + 2,
+            memory_budget: deckcraft_bitstream::budget::DECODE_MEMORY_BUDGET,
             out: VecDeque::new(),
             pts: 0,
         }
@@ -508,6 +532,12 @@ impl Decoder {
         if fh.upscaled_width > 65536 || fh.frame_height > 65536 {
             return Err(Error::Invalid("frame size"));
         }
+        // The axis cap alone allows 8 GiB pictures: check the whole store (every reference slot,
+        // the new frame and those in flight, as `FrameBuf::new` pads them) before allocating.
+        let width = fh.upscaled_width.max(fh.frame_width);
+        if !store_fits(width, fh.frame_height, &seq.color, NUM_REF_FRAMES + 1 + self.max_in_flight, self.memory_budget) {
+            return Err(Error::Invalid("frame size exceeds the decoder memory budget"));
+        }
         if !fh.frame_is_intra {
             for i in 0..REFS_PER_FRAME {
                 if self.ref_frames[fh.ref_frame_idx[i]].is_none() {
@@ -555,6 +585,7 @@ impl Decoder {
         if tg_end >= num_tiles || tg_start > tg_end {
             return Err(Error::Invalid("tile group range"));
         }
+        check_tile_group_start(job.tiles.len(), tg_start)?;
         let mut pos = r.byte_pos();
         for tile_num in tg_start..=tg_end {
             let size = if tile_num == tg_end {
@@ -633,7 +664,9 @@ impl Decoder {
 /// Decode a frame job and publish its results.
 fn run_job(job: FrameJob, pool: &Pool, stats: &Mutex<DecodeStats>) {
     let mut st = DecodeStats::default();
-    match decode_frame(&job, pool, &mut st) {
+    // A panic while decoding must still publish an error: the output and every frame that
+    // references this one wait on these slots.
+    match guarded(|| decode_frame(&job, pool, &mut st)) {
         Ok((rf, pic)) => {
             if let Some(ps) = &job.picture {
                 ps.set(pic.map(Arc::new).ok_or(Error::Invalid("shown frame without picture")));
@@ -650,6 +683,12 @@ fn run_job(job: FrameJob, pool: &Pool, stats: &Mutex<DecodeStats>) {
     if let Ok(mut s) = stats.lock() {
         s.merge(&st);
     }
+}
+
+/// Run `f`, turning a panic into an error (the decoder's own code never panics on purpose; this
+/// keeps a bug from stranding the job's waiters).
+fn guarded<R>(f: impl FnOnce() -> Result<R>) -> Result<R> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).unwrap_or(Err(Error::Invalid("frame decode panicked")))
 }
 
 /// The whole decoding process of one frame: setup, tiles, post-filters, motion vector storage
@@ -946,4 +985,85 @@ fn project(fs: &mut FrameState, src: usize, dst_sign: i32) -> bool {
         }
     }
     true
+}
+
+/// Tile groups must arrive in order with no gaps and no overlap: each one starts at the tile
+/// after the last one received (`tg_start` semantics, 6.10.1).
+fn check_tile_group_start(received: usize, tg_start: usize) -> Result<()> {
+    if tg_start == received { Ok(()) } else { Err(Error::Invalid("tile group out of order")) }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::check_tile_group_start;
+
+    #[test]
+    fn tile_groups_must_be_contiguous() {
+        assert!(check_tile_group_start(0, 0).is_ok());
+        assert!(check_tile_group_start(2, 2).is_ok());
+        // duplicate coverage
+        assert!(check_tile_group_start(2, 0).is_err());
+        assert!(check_tile_group_start(2, 1).is_err());
+        // skipped tiles
+        assert!(check_tile_group_start(0, 1).is_err());
+        assert!(check_tile_group_start(2, 3).is_err());
+    }
+}
+
+#[cfg(test)]
+mod guard_tests {
+    use super::*;
+
+    #[test]
+    fn a_panicking_job_still_publishes_an_error_to_its_waiters() {
+        let slot: Arc<Slot<u32>> = Slot::new();
+        let picture: Arc<Slot<u32>> = Slot::new();
+        // Waiters: the output and a dependent frame, on their own threads.
+        let (tx, rx) = std::sync::mpsc::channel();
+        for s in [slot.clone(), picture.clone()] {
+            let tx = tx.clone();
+            std::thread::spawn(move || {
+                let _ = tx.send(s.wait().is_err());
+            });
+        }
+        let (s, p) = (slot.clone(), picture.clone());
+        std::thread::spawn(move || {
+            let r: Result<u32> = guarded(|| panic!("hostile frame"));
+            p.set(r.clone());
+            s.set(r);
+        });
+        for _ in 0..2 {
+            assert_eq!(rx.recv_timeout(std::time::Duration::from_secs(10)), Ok(true));
+        }
+        assert_eq!(guarded(|| Ok(5)).ok(), Some(5));
+    }
+}
+
+#[cfg(test)]
+mod budget_tests {
+    use super::*;
+    use deckcraft_bitstream::budget::DECODE_MEMORY_BUDGET;
+
+    fn color(mono: bool) -> crate::header::ColorConfig {
+        crate::header::ColorConfig { mono_chrome: mono, subsampling_x: 1, subsampling_y: 1, ..Default::default() }
+    }
+
+    #[test]
+    fn the_axis_maximum_is_over_budget_and_4k_is_not() {
+        let refs = NUM_REF_FRAMES + 1 + 4;
+        assert!(!store_fits(65536, 65536, &color(false), refs, DECODE_MEMORY_BUDGET));
+        assert!(!store_fits(65536, 65536, &color(true), 1, DECODE_MEMORY_BUDGET));
+        assert!(store_fits(3840, 2160, &color(false), refs, DECODE_MEMORY_BUDGET));
+        assert!(store_fits(1920, 1080, &color(false), refs, DECODE_MEMORY_BUDGET));
+    }
+
+    #[test]
+    fn exact_budget_boundary_and_reference_count() {
+        // 8x8 pads to 288x288: luma 82944 + chroma 2 * 20736 samples, 2 bytes each.
+        let one = (288 * 288 + 2 * 144 * 144) * 2;
+        assert!(store_fits(8, 8, &color(false), 9, 9 * one));
+        assert!(!store_fits(8, 8, &color(false), 9, 9 * one - 1));
+        assert!(!store_fits(8, 8, &color(false), 10, 9 * one));
+        assert!(store_fits(8, 8, &color(true), 9, 9 * 288 * 288 * 2));
+    }
 }

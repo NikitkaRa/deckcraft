@@ -354,6 +354,15 @@ fn parse_block<S: ByteSource + ?Sized>(
     Ok(Some((track, rel, flags, frames)))
 }
 
+/// Cluster timestamps are unsigned and must fit in `i64` before a signed block offset is added.
+fn cluster_timestamp(raw: u64) -> Result<i64> {
+    i64::try_from(raw).map_err(|_| Error::Invalid("cluster timestamp out of range".into()))
+}
+
+fn block_timestamp(cluster_ts: i64, rel: i16) -> Result<i64> {
+    cluster_ts.checked_add(i64::from(rel)).ok_or_else(|| Error::Invalid("block timestamp overflow".into()))
+}
+
 /// Parse one SimpleBlock or BlockGroup element.
 fn parse_block_elem<S: ByteSource + ?Sized>(
     io: &mut Io<'_, S>,
@@ -369,7 +378,7 @@ fn parse_block_elem<S: ByteSource + ?Sized>(
             Ok(Some(BlockRef {
                 track,
                 block_offset: h.pos,
-                ts: cluster_ts + rel as i64,
+                ts: block_timestamp(cluster_ts, rel)?,
                 frames,
                 block_duration: None,
                 keyframe: flags & 0x80 != 0,
@@ -398,7 +407,7 @@ fn parse_block_elem<S: ByteSource + ?Sized>(
             Ok(Some(BlockRef {
                 track,
                 block_offset: h.pos,
-                ts: cluster_ts + rel as i64,
+                ts: block_timestamp(cluster_ts, rel)?,
                 frames,
                 block_duration: dur,
                 keyframe: !has_ref,
@@ -492,7 +501,7 @@ fn scan_cluster<S: ByteSource + ?Sized>(
         }
         let ce = c.end(lim);
         match c.id {
-            TIMESTAMP => ts = ebml::uint(io.peek(c.data_start(), (ce - c.data_start()) as usize)?) as i64,
+            TIMESTAMP => ts = cluster_timestamp(ebml::uint(io.peek(c.data_start(), (ce - c.data_start()) as usize)?))?,
             SIMPLE_BLOCK | BLOCK_GROUP => {
                 if let Some(b) = parse_block_elem(io, &c, ce, ts, &lookup)? {
                     blocks.push(b);
@@ -1104,7 +1113,7 @@ impl<S: ByteSource> Demuxer<S> {
                 self.pos = he;
                 match h.id {
                     TIMESTAMP => {
-                        let v = ebml::uint(io.peek(h.data_start(), (he - h.data_start()) as usize)?) as i64;
+                        let v = cluster_timestamp(ebml::uint(io.peek(h.data_start(), (he - h.data_start()) as usize)?))?;
                         self.cluster = Some(InCluster { ts: v, end: c.end });
                     }
                     SIMPLE_BLOCK | BLOCK_GROUP => {

@@ -7,7 +7,7 @@ use deckcraft_model::{LayoutType, Presentation, Xfrm};
 fn setup(text: &str, w: f64, h: f64) -> (Presentation, Shape) {
     let mut p = Presentation::default();
     let lay = defaults::layout_of_kind(&p, LayoutType::TitleAndContent).unwrap();
-    let mut s = defaults::new_slide(&mut p, lay);
+    let mut s = defaults::new_slide(&mut p, lay).expect("slide");
     let mut body = s.shapes.remove(1);
     body.xfrm = Some(Xfrm::new(0.0, 0.0, w, h));
     body.text = Some(TextBody::from_text(text));
@@ -179,6 +179,132 @@ fn shrink_on_overflow() {
     let l = lay(&p, &sh, 600.0, 200.0);
     assert!(l.font_scale < 1.0, "scale {}", l.font_scale);
     assert!(!l.overflow || l.font_scale <= 0.11);
+}
+
+#[test]
+fn saved_shrink_scale_is_drawn() {
+    // A file saved with fontScale 62.5% and lnSpcReduction 20% draws at that scale even though
+    // the text would fit at full size, as PowerPoint draws it.
+    let (p, mut sh) = setup("Short", 600.0, 300.0);
+    sh.text.as_mut().unwrap().body.autofit = Some(AutoFit::Shrink { font_scale: Some(0.625), line_reduction: 0.2 });
+    let l = lay(&p, &sh, 600.0, 300.0);
+    assert_eq!((l.font_scale, l.line_reduction), (0.625, 0.2));
+    // Text our metrics find overflowing at the saved scale is still drawn at it, as PowerPoint
+    // draws it until the text changes; with no saved scale it shrinks to fit.
+    let text = (0..30).map(|i| format!("Line number {i}")).collect::<Vec<_>>().join("\n");
+    let (p, mut sh) = setup(&text, 600.0, 200.0);
+    sh.text.as_mut().unwrap().body.autofit = Some(AutoFit::Shrink { font_scale: Some(0.9), line_reduction: 0.1 });
+    let l = lay(&p, &sh, 600.0, 200.0);
+    assert_eq!((l.font_scale, l.line_reduction), (0.9, 0.1));
+    sh.text.as_mut().unwrap().body.autofit = Some(AutoFit::Shrink { font_scale: Some(1.0), line_reduction: 0.0 });
+    let l = lay(&p, &sh, 600.0, 200.0);
+    assert!(l.font_scale < 0.9, "{}", l.font_scale);
+    // Nonsense saved values are ignored.
+    let (p, mut sh) = setup("Short", 600.0, 300.0);
+    sh.text.as_mut().unwrap().body.autofit = Some(AutoFit::Shrink { font_scale: Some(f64::NAN), line_reduction: 5.0 });
+    let l = lay(&p, &sh, 600.0, 300.0);
+    assert_eq!((l.font_scale, l.line_reduction), (1.0, 0.2));
+}
+
+/// A body whose file has `<a:normAutofit/>` with no `fontScale` is the schema default 100 %:
+/// PowerPoint draws it as it is, even overflowing. DeckCraft draws it the same (#724).
+#[test]
+fn bare_normautofit_draws_at_full_size() {
+    let text = (0..30).map(|i| format!("Line number {i}")).collect::<Vec<_>>().join("\n");
+    let (p, mut sh) = setup(&text, 600.0, 200.0);
+    sh.text.as_mut().unwrap().body.autofit = Some(AutoFit::Shrink { font_scale: None, line_reduction: 0.0 });
+    let l = lay(&p, &sh, 600.0, 200.0);
+    assert_eq!(l.font_scale, 1.0, "a body with no saved fontScale draws at 100%");
+    assert!(l.overflow, "it overflows, as PowerPoint draws it");
+}
+
+#[test]
+fn exact_line_spacing_ends_at_the_last_descent() {
+    // 12 pt text at exactly 26.59 pt per line (a table cell PowerPoint sizes to 24.3 pt of text):
+    // the baseline at 80 % of the pitch, the text ending at the last line's descent.
+    let (p, mut sh) = setup("One\nTwo", 600.0, 300.0);
+    for para in &mut sh.text.as_mut().unwrap().paragraphs {
+        para.props.line_spacing = Some(Spacing::Pts(26.59));
+        para.props.bullet = Some(Bullet::None);
+        for r in &mut para.runs {
+            r.props.size = Some(12.0);
+        }
+    }
+    let l = lay(&p, &sh, 600.0, 300.0);
+    let first = &l.lines[0];
+    assert!((first.baseline - first.top - 26.59 * 0.8).abs() < 0.01, "{:?}", first.baseline - first.top);
+    // The text ends at the last line's descent: above its full pitch by 20 % of it less the
+    // descent (~2.3 pt for 12 pt type).
+    let short = (l.lines[1].bottom - l.lines[0].top) - l.content_height;
+    assert!(short > 1.0 && short < 26.59 * 0.2, "{short}");
+    // Proportional spacing keeps full pitches.
+    for para in &mut sh.text.as_mut().unwrap().paragraphs {
+        para.props.line_spacing = Some(Spacing::Pct(1.0));
+    }
+    let l = lay(&p, &sh, 600.0, 300.0);
+    assert!((l.content_height - (l.lines[1].bottom - l.lines[0].top)).abs() < 0.01);
+}
+
+#[test]
+fn line_spacing_reduction_comes_off_the_percentage() {
+    // 90 % line spacing and 10 pt before paragraphs, shrunk with a 20 % line spacing reduction:
+    // PowerPoint draws 70 % lines and keeps the 10 pt.
+    let (p, mut sh) = setup("One\nTwo\nThree", 600.0, 400.0);
+    for (i, para) in sh.text.as_mut().unwrap().paragraphs.iter_mut().enumerate() {
+        para.props.line_spacing = Some(Spacing::Pct(0.9));
+        para.props.space_before = Some(Spacing::Pts(10.0));
+        para.props.bullet = Some(Bullet::None);
+        if i == 0 {
+            para.runs[0].text.push_str(" wraps onto a second line because this paragraph is long enough to wrap in a narrow box");
+        }
+    }
+    let ctx = Ctx::for_slide(&p, &p.slides[0]).unwrap();
+    let body = sh.text.clone().unwrap();
+    let bp = resolve::body(&ctx, &sh);
+    let opts = Opts { rect: Rect::new(0.0, 0.0, 200.0, 400.0), fields: &NoFields, prompt_color: None, no_shrink: true };
+    let full = layout_scaled(&ctx, &sh, &body, &bp, &opts, 1.0, 0.0);
+    let reduced = layout_scaled(&ctx, &sh, &body, &bp, &opts, 1.0, 0.2);
+    let pitch = |l: &TextLayout| l.lines[1].top - l.lines[0].top;
+    // Lines within the first paragraph: 0.7 / 0.9 of the full pitch.
+    assert!(full.lines[1].para == 0 && reduced.lines[1].para == 0);
+    assert!((pitch(&reduced) / pitch(&full) - 0.7 / 0.9).abs() < 0.005, "{} {}", pitch(&reduced), pitch(&full));
+    // The space before the next paragraph is the same 10 pt.
+    let gap = |l: &TextLayout| {
+        let k = l.lines.iter().position(|x| x.para == 1).unwrap();
+        l.lines[k].top - l.lines[k - 1].bottom
+    };
+    assert!((gap(&full) - 10.0).abs() < 1e-6 && (gap(&reduced) - 10.0).abs() < 1e-6, "{} {}", gap(&full), gap(&reduced));
+}
+
+#[test]
+fn shrink_gives_up_at_once_when_even_the_smallest_scale_overflows() {
+    // Found by fuzzing: a tiny box with 20,000 paragraphs and shrink on overflow took 15 s to
+    // open, laying out the whole body 13 times in a search that could never fit.
+    let text = (0..400).map(|i| format!("Line number {i}")).collect::<Vec<_>>().join("\n");
+    let (p, sh) = setup(&text, 100.0, 20.0);
+    crate::LAYOUT_PASSES.with(|n| n.set(0));
+    let l = lay(&p, &sh, 100.0, 20.0);
+    assert!(l.overflow && l.font_scale <= 0.11, "scale {}", l.font_scale);
+    assert!(crate::LAYOUT_PASSES.with(|n| n.get()) <= 2, "{} passes", crate::LAYOUT_PASSES.with(|n| n.get()));
+    // Text that fits somewhere in the range still gets the search.
+    let (p, sh) = setup(&(0..12).map(|i| format!("Line number {i}")).collect::<Vec<_>>().join("\n"), 600.0, 200.0);
+    let l = lay(&p, &sh, 600.0, 200.0);
+    assert!(l.font_scale > 0.11 && l.font_scale < 1.0 && !l.overflow, "scale {} overflow {}", l.font_scale, l.overflow);
+}
+
+#[test]
+fn space_before_the_first_paragraph_with_spc_first_last_para() {
+    // 10 pt before every paragraph: skipped on the first one, unless the body asks for it.
+    let (p, mut sh) = setup("One\nTwo", 600.0, 300.0);
+    for para in &mut sh.text.as_mut().unwrap().paragraphs {
+        para.props.space_before = Some(Spacing::Pts(10.0));
+        para.props.space_after = Some(Spacing::Pts(6.0));
+    }
+    let plain = lay(&p, &sh, 600.0, 300.0);
+    sh.text.as_mut().unwrap().body.space_first_last = Some(true);
+    let both = lay(&p, &sh, 600.0, 300.0);
+    assert!((both.lines[0].top - plain.lines[0].top - 10.0).abs() < 1e-6);
+    assert!((both.content_height - plain.content_height - 16.0).abs() < 1e-6);
 }
 
 #[test]
@@ -828,8 +954,11 @@ fn symbol_font_characters_draw_in_the_sym_font() {
     // U+F0DE is the Symbol font's double arrow (⇒). It must come from that font, not from
     // whichever installed font happens to map U+F0DE (Wingdings draws an arrow at another angle).
     let symbol = "Symbol";
-    if !FontDb::global().has_family(symbol) {
-        eprintln!("skipped: no Symbol font installed");
+    let db = FontDb::global();
+    // Some installed Symbol faces use Unicode mappings only, without the legacy U+F0xx cmap.
+    // This integration test needs a face that can draw the symbol code used by the document.
+    if !db.has_family(symbol) || !db.face(symbol, "Regular").covers('\u{F0DE}') {
+        eprintln!("skipped: no installed Symbol face covers U+F0DE");
         return;
     }
     let (p, mut sh) = setup("x\u{F0DE}y", 600.0, 300.0);
@@ -1215,4 +1344,126 @@ fn stacked_combining_marks_take_a_face_that_draws_them() {
         assert!(deckcraft_fonts::covers_cluster(&f, &cluster), "{} lacks the marks", f.family);
     }
     let _ = f;
+}
+
+/// #736: `anchorCtr` centres the text block horizontally, whatever the paragraphs' own
+/// alignment, and overflowing content centres symmetrically past both edges.
+#[test]
+fn anchorctr_centres_the_text_block() {
+    let text = "The shape is top - center - overriding paragraph right alignment.";
+    // The block's centre: (min left + max right) over the laid-out lines, in box coordinates.
+    let block_centre = |l: &TextLayout| -> f64 {
+        // Empty lines carry no ink and sit where their alignment left them: not part of the block.
+        let ink = l.lines.iter().filter(|li| li.end > li.start);
+        let (min, max) = ink.fold((f64::INFINITY, f64::NEG_INFINITY), |(a, b), li| (a.min(li.extent.0), b.max(li.extent.1)));
+        (min + max) / 2.0
+    };
+    let para = |align: Option<Align>, text: &str| Paragraph {
+        props: ParaProps { align, ..Default::default() },
+        runs: vec![Run::new(text)],
+        ..Default::default()
+    };
+    let anchored =
+        |paragraphs: Vec<Paragraph>| TextBody { body: BodyProps { anchor_ctr: Some(true), ..Default::default() }, paragraphs, ..Default::default() };
+    // One right-aligned line in a wide box: the block is centred, not pushed past the right edge.
+    let body_right = anchored(vec![para(Some(Align::Right), text)]);
+    let (p, mut sh) = setup("", 828.0, 104.0);
+    sh.text = Some(body_right);
+    let l = lay(&p, &sh, 828.0, 104.0);
+    assert!((block_centre(&l) - 414.0).abs() <= 1.0, "right-aligned: centre {}, want 414", block_centre(&l));
+    // Left-aligned text centres the same way.
+    let body_left = anchored(vec![para(None, text)]);
+    let (p, mut sh) = setup("", 828.0, 104.0);
+    sh.text = Some(body_left);
+    let l = lay(&p, &sh, 828.0, 104.0);
+    assert!((block_centre(&l) - 414.0).abs() <= 1.0, "left-aligned: centre {}, want 414", block_centre(&l));
+    // A trailing empty paragraph carries no ink and must not skew the block.
+    let body_empty = anchored(vec![para(Some(Align::Right), text), para(None, "")]);
+    let (p, mut sh) = setup("", 828.0, 104.0);
+    sh.text = Some(body_empty);
+    let l = lay(&p, &sh, 828.0, 104.0);
+    assert!((block_centre(&l) - 414.0).abs() <= 1.0, "trailing empty paragraph: centre {}, want 414", block_centre(&l));
+    // Mixed alignments: the drawn block (not either alignment edge) is what centres.
+    let body_mixed = anchored(vec![para(Some(Align::Right), text), para(None, "short")]);
+    let (p, mut sh) = setup("", 828.0, 104.0);
+    sh.text = Some(body_mixed);
+    let l = lay(&p, &sh, 828.0, 104.0);
+    assert!((block_centre(&l) - 414.0).abs() <= 1.0, "mixed: centre {}, want 414", block_centre(&l));
+    // Content wider than the box overflows symmetrically past both edges (no wrap).
+    let body_wide = TextBody {
+        body: BodyProps { anchor_ctr: Some(true), wrap: Some(false), ..Default::default() },
+        paragraphs: vec![para(Some(Align::Right), text)],
+        ..Default::default()
+    };
+    let (p, mut sh) = setup("", 300.0, 104.0);
+    sh.text = Some(body_wide);
+    let l = lay(&p, &sh, 300.0, 104.0);
+    assert!((block_centre(&l) - 150.0).abs() <= 2.0, "overflowing: centre {}, want 150", block_centre(&l));
+    // Control: without anchorCtr a right-aligned line still ends at the box's right edge.
+    let body_control = TextBody { body: BodyProps::default(), paragraphs: vec![para(Some(Align::Right), text)], ..Default::default() };
+    let (p, mut sh) = setup(text, 828.0, 104.0);
+    sh.text = Some(body_control);
+    let l = lay(&p, &sh, 828.0, 104.0);
+    assert!(
+        l.lines.iter().all(|li| li.extent.1 > 810.0),
+        "control: right-aligned at the box edge, got {:?}",
+        l.lines.iter().map(|li| li.extent).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn empty_bullets_reserve_the_typed_indent_without_becoming_content() {
+    for rtl in [false, true] {
+        for level in [0, 1, 2] {
+            let (p, mut sh) = setup("First\n", 600.0, 300.0);
+            for para in &mut sh.text.as_mut().unwrap().paragraphs {
+                para.level = level;
+                para.props.rtl = Some(rtl);
+                para.props.align = Some(if rtl { Align::Right } else { Align::Left });
+            }
+            let empty = lay(&p, &sh, 600.0, 300.0);
+            assert_eq!(empty.empty_bullets.len(), 1);
+            assert_eq!(empty.empty_bullets[0].para, 1);
+            assert!(empty.runs.iter().all(|r| r.para == 0), "empty bullet must not be exported");
+            let caret = empty.caret(Pos { para: 1, ch: 0 }).unwrap();
+            let bx = empty.empty_bullets[0].glyphs[0].1;
+            assert!(if rtl { bx >= caret.0 } else { bx < caret.0 });
+            deckcraft_model::edit::insert(sh.text.as_mut().unwrap(), (1, 0), if rtl { "אבג" } else { "Next" }, None);
+            let typed = lay(&p, &sh, 600.0, 300.0);
+            assert!(typed.empty_bullets.is_empty());
+            let after = typed.caret(Pos { para: 1, ch: 0 }).unwrap();
+            assert!(
+                (caret.0 - after.0).abs() < 1e-6 && (caret.1 - after.1).abs() < 1e-6 && (caret.2 - after.2).abs() < 1e-6,
+                "typing must not move the line's start: {caret:?} vs {after:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn empty_numbered_paragraph_previews_the_next_number_without_consuming_it() {
+    let (p, mut sh) = setup("One\n\nTwo", 600.0, 300.0);
+    for para in &mut sh.text.as_mut().unwrap().paragraphs {
+        para.props.bullet = Some(Bullet::AutoNum { scheme: "arabicPeriod".into(), start_at: 4 });
+    }
+    let l = lay(&p, &sh, 600.0, 300.0);
+    let preview = &l.empty_bullets[0];
+    let next = l.runs.iter().find(|r| r.para == 2 && r.cells.is_empty()).unwrap();
+    let ids = |r: &GlyphRun| r.glyphs.iter().map(|g| g.0).collect::<Vec<_>>();
+    assert_eq!(preview.para, 1);
+    assert_eq!(ids(preview), ids(next), "both should use 5.");
+    let expected = measure_str(&preview.face, preview.size, "5.").1;
+    assert_eq!(ids(preview), expected.iter().map(|g| g.0).collect::<Vec<_>>());
+}
+
+#[test]
+fn empty_plain_paragraphs_and_soft_breaks_have_no_bullet_preview() {
+    let (p, mut sh) = setup("", 600.0, 300.0);
+    sh.text.as_mut().unwrap().paragraphs[0].props.bullet = Some(Bullet::None);
+    assert!(lay(&p, &sh, 600.0, 300.0).empty_bullets.is_empty());
+    sh.text = Some(TextBody::from_text("First"));
+    deckcraft_model::edit::insert(sh.text.as_mut().unwrap(), (0, 5), "\u{b}", None);
+    let l = lay(&p, &sh, 600.0, 300.0);
+    assert_eq!(l.lines.len(), 2);
+    assert!(l.empty_bullets.is_empty(), "a soft line break is not a new list item");
 }

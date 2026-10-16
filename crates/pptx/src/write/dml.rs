@@ -100,6 +100,9 @@ const NS_ASVG: &str = "http://schemas.microsoft.com/office/drawing/2016/SVG/main
 /// `a:blipFill` / `p:blipFill`.
 pub fn blip_fill(w: &mut W, x: &mut Exp, o: &mut Out, tag: &str, pf: &PictureFill) {
     let svg = x.p.media(pf.media).is_some_and(|m| deckcraft_svg::svg_xml(&m.data).is_some());
+    // An image that lives outside the package is a linked picture: `a:blip` names it through
+    // `r:link`; `r:embed` may only reference a part inside the package.
+    let linked = x.p.media(pf.media).is_some_and(|m| m.data.is_empty() && m.link.is_some());
     let rid = if svg {
         x.svg_png_rel(o, pf.media).unwrap_or_else(|| x.placeholder_rel(o))
     } else {
@@ -116,8 +119,9 @@ pub fn blip_fill(w: &mut W, x: &mut Exp, o: &mut Out, tag: &str, pf: &PictureFil
         || adj.duotone.is_some()
         || adj.clear_color.is_some()
         || adj.bilevel.is_some()
-        || adj.alpha_inv;
-    let a = A::new().a("r:embed", &rid);
+        || adj.alpha_inv
+        || pf.artistic.is_some();
+    let a = if linked { A::new().a("r:link", &rid) } else { A::new().a("r:embed", &rid) };
     if has_kids {
         w.open("a:blip", a);
         if let Some(c) = adj.clear_color {
@@ -151,11 +155,31 @@ pub fn blip_fill(w: &mut W, x: &mut Exp, o: &mut Out, tag: &str, pf: &PictureFil
         if adj.brightness != 0.0 || adj.contrast != 0.0 {
             w.empty("a:lum", A::new().a("bright", pct(adj.brightness.clamp(-1.0, 1.0))).a("contrast", pct(adj.contrast.clamp(-1.0, 1.0))));
         }
-        if let Some(sid) = &svg_rid {
+        // Artistic effect: the blip is the processed picture; the original rides in an
+        // `a14:imgLayer` with the effect's name, as PowerPoint writes it.
+        let art = pf
+            .artistic
+            .as_ref()
+            .filter(|art| art.effect.starts_with("artistic") && art.effect.chars().all(|c| c.is_ascii_alphanumeric()))
+            .and_then(|art| x.media_rel(o, art.original, "image").map(|orig| (art, orig)));
+        if art.is_some() || svg_rid.is_some() {
             w.open0("a:extLst");
-            w.open("a:ext", A::new().a("uri", SVG_EXT_URI));
-            w.empty("asvg:svgBlip", A::new().a("xmlns:asvg", NS_ASVG).a("r:embed", sid));
-            w.close("a:ext");
+            if let Some((art, orig)) = &art {
+                w.open("a:ext", A::new().a("uri", "{BEBA8EAE-BF5A-486C-A8C5-ECC9F3942E4B}"));
+                w.open("a14:imgProps", A::new().a("xmlns:a14", crate::opc::NS_A14));
+                w.open("a14:imgLayer", A::new().a("r:embed", orig));
+                w.open0("a14:imgEffect");
+                w.empty0(&format!("a14:{}", art.effect));
+                w.close("a14:imgEffect");
+                w.close("a14:imgLayer");
+                w.close("a14:imgProps");
+                w.close("a:ext");
+            }
+            if let Some(sid) = &svg_rid {
+                w.open("a:ext", A::new().a("uri", SVG_EXT_URI));
+                w.empty("asvg:svgBlip", A::new().a("xmlns:asvg", NS_ASVG).a("r:embed", sid));
+                w.close("a:ext");
+            }
             w.close("a:extLst");
         }
         w.close("a:blip");
@@ -357,6 +381,15 @@ pub fn effects(w: &mut W, fx: &Effects) {
     w.close("a:effectLst");
 }
 
+/// `a:sp3d` for a bevel preset when the shape or theme style has no kept 3-D XML.
+/// The preset name is limited to ASCII letters and digits so it cannot break the markup.
+pub fn bevel_sp3d(preset: &str) -> Option<String> {
+    if preset.is_empty() || preset.len() > 32 || !preset.chars().all(|c| c.is_ascii_alphanumeric()) {
+        return None;
+    }
+    Some(format!("<a:sp3d><a:bevelT prst=\"{preset}\"/></a:sp3d>"))
+}
+
 pub fn xfrm(w: &mut W, tag: &str, x: &Xfrm, child: Option<&Xfrm>) {
     let x = if x.is_finite() { *x } else { Xfrm::default() };
     let rot = ang(x.rot);
@@ -395,9 +428,10 @@ pub fn hyperlink(w: &mut W, x: &mut Exp, o: &mut Out, tag: &str, h: &Hyperlink) 
         Action::LastSlide => (String::new(), Some("ppaction://hlinkshowjump?jump=lastslide".into())),
         Action::EndShow => (String::new(), Some("ppaction://hlinkshowjump?jump=endshow".into())),
         Action::LastViewed => (String::new(), Some("ppaction://hlinkshowjump?jump=lastslideviewed".into())),
-        Action::CustomShow { name } => {
+        Action::CustomShow { name, returns } => {
             let id = x.p.custom_shows.iter().position(|c| c.name == *name).unwrap_or(0);
-            (String::new(), Some(format!("ppaction://customshow?id={id}&return=true")))
+            let ret = if *returns { "true" } else { "false" };
+            (String::new(), Some(format!("ppaction://customshow?id={id}&return={ret}")))
         }
         Action::Program { path } => {
             if path.is_empty() {
@@ -407,14 +441,28 @@ pub fn hyperlink(w: &mut W, x: &mut Exp, o: &mut Out, tag: &str, h: &Hyperlink) 
         }
         Action::PlayMedia => (String::new(), Some("ppaction://media".into())),
     };
-    w.empty(
-        tag,
-        A::new()
-            .a("r:id", rid)
-            .o("action", action)
-            .o("tooltip", (!h.tooltip.is_empty()).then_some(h.tooltip.as_str()))
-            .t("highlightClick", h.highlight_click),
-    );
+    let attrs = A::new()
+        .a("r:id", rid)
+        .o("action", action)
+        .o("tooltip", (!h.tooltip.is_empty()).then_some(h.tooltip.as_str()))
+        .t("highlightClick", h.highlight_click)
+        .t("endSnd", h.stop_sound);
+    let sound = h.sound.and_then(|id| x.media_rel(o, id, "audio").map(|rid| (rid, id)));
+    let Some((sound_rid, sound_id)) = sound else {
+        w.empty(tag, attrs);
+        return;
+    };
+    w.open(tag, attrs);
+    let name = x.p.media(sound_id).map(|m| sound_label(&m.name)).unwrap_or_else(|| "sound.wav".into());
+    w.empty("a:snd", A::new().a("r:embed", sound_rid).a("name", name));
+    w.close(tag);
+}
+
+/// Display name PowerPoint stores on `a:snd`.
+fn sound_label(name: &str) -> String {
+    let file = name.rsplit(['/', '\\']).next().unwrap_or(name);
+    let label: String = file.chars().filter(|c| c.is_ascii() && !c.is_control() && *c != '"' && *c != '<' && *c != '>').take(80).collect();
+    if label.is_empty() { "sound.wav".into() } else { label }
 }
 
 pub fn body_pr(w: &mut W, b: &BodyProps) {
@@ -431,7 +479,8 @@ pub fn body_pr(w: &mut W, b: &BodyProps) {
         .b("rtlCol", b.rtl_col)
         .o("anchor", b.anchor.map(|a| a.xml()))
         .b("anchorCtr", b.anchor_ctr)
-        .b("upright", b.upright);
+        .b("upright", b.upright)
+        .b("spcFirstLastPara", b.space_first_last);
     let warp = b.warp.as_deref().filter(|s| !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric()));
     if warp.is_none() && b.autofit.is_none() {
         w.empty("a:bodyPr", a);
@@ -459,9 +508,11 @@ pub fn body_pr(w: &mut W, b: &BodyProps) {
         Some(AutoFit::None) => w.empty0("a:noAutofit"),
         Some(AutoFit::Shape) => w.empty0("a:spAutoFit"),
         Some(AutoFit::Shrink { font_scale, line_reduction }) => {
-            let fs = pct(font_scale.clamp(0.01, 1.0));
+            // A scale the model holds is written, 100 % included: reopening then keeps the same
+            // "draw the saved scale" state instead of becoming a bare `<a:normAutofit/>` (#724).
+            let fs = font_scale.map(|s| pct(s.clamp(0.01, 1.0)));
             let lr = pct(line_reduction.clamp(0.0, 1.0));
-            w.empty("a:normAutofit", A::new().o("fontScale", (fs != 100_000).then_some(fs)).o("lnSpcReduction", (lr != 0).then_some(lr)));
+            w.empty("a:normAutofit", A::new().o("fontScale", fs).o("lnSpcReduction", (lr != 0).then_some(lr)));
         }
         None => {}
     }
@@ -539,7 +590,12 @@ pub fn ppr(w: &mut W, x: &mut Exp, o: &mut Out, tag: &str, level: Option<u8>, p:
         Some(Bullet::Picture { media }) => match x.media_rel(o, *media, "image") {
             Some(rid) => {
                 w.open0("a:buBlip");
-                w.empty("a:blip", A::new().a("r:embed", rid));
+                let a = if x.p.media(*media).is_some_and(|m| m.data.is_empty() && m.link.is_some()) {
+                    A::new().a("r:link", &rid)
+                } else {
+                    A::new().a("r:embed", &rid)
+                };
+                w.empty("a:blip", a);
                 w.close("a:buBlip");
             }
             None => w.empty("a:buChar", A::new().a("char", "•")),
@@ -597,17 +653,18 @@ pub fn rpr(w: &mut W, x: &mut Exp, o: &mut Out, tag: &str, r: &RunProps) {
         .o("spc", r.spacing.map(|s| (s.clamp(-4000.0, 4000.0) * 100.0).round() as i64))
         .o("baseline", r.baseline.map(|b| pct(b.clamp(-10.0, 10.0))))
         .b("noProof", r.no_proof);
+    let has_fx = r.shadow.is_some() || r.inner_shadow.is_some() || r.glow.is_some() || r.reflection.is_some() || r.soft_edge.is_some();
     let has_kids = r.outline.is_some()
         || r.fill.is_some()
-        || r.shadow.is_some()
-        || r.glow.is_some()
+        || has_fx
         || r.highlight.is_some()
         || r.underline_color.is_some()
         || r.font.is_some()
         || r.font_ea.is_some()
         || r.font_cs.is_some()
         || r.font_sym.is_some()
-        || r.link.is_some();
+        || r.link.is_some()
+        || r.hover.is_some();
     if !has_kids {
         w.empty(tag, a);
         return;
@@ -622,8 +679,19 @@ pub fn rpr(w: &mut W, x: &mut Exp, o: &mut Out, tag: &str, r: &RunProps) {
             f => fill(w, x, o, f),
         }
     }
-    if r.shadow.is_some() || r.glow.is_some() {
-        effects(w, &Effects { outer_shadow: r.shadow.clone(), glow: r.glow.clone(), ..Default::default() });
+    if has_fx {
+        // Same child order as a shape's effect list: glow, inner shadow, outer shadow, reflection, soft edge.
+        effects(
+            w,
+            &Effects {
+                outer_shadow: r.shadow.clone(),
+                inner_shadow: r.inner_shadow.clone(),
+                glow: r.glow.clone(),
+                reflection: r.reflection.clone(),
+                soft_edge: r.soft_edge,
+                ..Default::default()
+            },
+        );
     }
     if let Some(h) = &r.highlight {
         w.open0("a:highlight");
@@ -641,6 +709,10 @@ pub fn rpr(w: &mut W, x: &mut Exp, o: &mut Out, tag: &str, r: &RunProps) {
     typeface(w, "a:sym", &r.font_sym);
     if let Some(h) = &r.link {
         hyperlink(w, x, o, "a:hlinkClick", h);
+    }
+    // Schema order: hlinkClick, hlinkMouseOver.
+    if let Some(h) = &r.hover {
+        hyperlink(w, x, o, "a:hlinkMouseOver", h);
     }
     w.close(tag);
 }
@@ -695,8 +767,9 @@ fn run_text(w: &mut W, x: &mut Exp, o: &mut Out, text: &str, props: &RunProps) {
 
 pub fn paragraph(w: &mut W, x: &mut Exp, o: &mut Out, p: &Paragraph, math: bool, index: usize) {
     w.open0("a:p");
-    if p.level > 0 || !is_default_ppr(&p.props) {
-        ppr(w, x, o, "a:pPr", Some(p.level), &p.props, None);
+    let def = (p.def_props != RunProps::default()).then_some(&p.def_props);
+    if p.level > 0 || !is_default_ppr(&p.props) || def.is_some() {
+        ppr(w, x, o, "a:pPr", Some(p.level), &p.props, def);
     }
     for (ri, r) in p.runs.iter().enumerate() {
         match &r.kind {

@@ -11,7 +11,11 @@ use crate::theme::{self, Tokens};
 pub fn show(app: &mut SlideApp, ui: &mut Ui) {
     let t = Tokens::get(ui.ctx());
     let in_master = app.session.active().is_some_and(|d| d.selection.target != Target::Slides);
-    egui::Panel::left("thumbs")
+    // Handout Master view has one page and no thumbnails, as in PowerPoint.
+    if app.session.active().is_some_and(|d| d.selection.target.is_page_master()) {
+        return;
+    }
+    let panel = egui::Panel::left("thumbs")
         .resizable(true)
         .default_size(app.ui.thumbs_width)
         .size_range(150.0..=420.0)
@@ -28,6 +32,10 @@ pub fn show(app: &mut SlideApp, ui: &mut Ui) {
                 ui.add_space(20.0);
             });
         });
+    // Focus follows the last press: inside the pane keeps it, anywhere else (canvas, ribbon) drops it.
+    if let Some(pos) = ui.input(|i| if i.pointer.primary_pressed() { i.pointer.interact_pos() } else { None }) {
+        app.slides_focused = panel.response.rect.contains(pos);
+    }
 }
 
 fn list(app: &mut SlideApp, ui: &mut Ui) {
@@ -86,7 +94,7 @@ fn list(app: &mut SlideApp, ui: &mut Ui) {
             });
         }
         let (row, resp) = ui.allocate_exact_size(vec2(width, th + 16.0), Sense::click_and_drag());
-        let img = Rect::from_min_size(pos2(row.min.x + 30.0, row.min.y + 6.0), vec2(tw, th));
+        let img = crate::textures::device_pixel_rect(Rect::from_min_size(pos2(row.min.x + 30.0, row.min.y + 6.0), vec2(tw, th)), ppp);
         rects.push((i, row));
         let p = ui.painter();
         let id = doc.slides.get(i).map(|s| s.id);
@@ -106,7 +114,7 @@ fn list(app: &mut SlideApp, ui: &mut Ui) {
         if has_anim {
             p.text(pos2(row.min.x + 14.0, img.min.y + 20.0), Align2::CENTER_TOP, "★", theme::font(10.0), t.text_faint);
         }
-        let wpx = (tw * ppp).round() as u32;
+        let wpx = (img.width() * ppp).round() as u32;
         match app.textures.thumb(ui.ctx(), &doc, i, wpx, &mut budget) {
             Some(tex) => {
                 p.image(
@@ -268,22 +276,25 @@ fn master_list(app: &mut SlideApp, ui: &mut Ui) {
                 let tw = (width - indent - 14.0).max(40.0) * if li.is_some() { 0.8 } else { 1.0 };
                 let th = tw * (doc.slide_size.height / doc.slide_size.width.max(1.0)) as f32;
                 let (row, resp) = ui.allocate_exact_size(vec2(width, th + 12.0), Sense::click());
-                let img = Rect::from_min_size(pos2(row.min.x + indent, row.min.y + 4.0), vec2(tw, th));
                 let ppp = ui.ctx().pixels_per_point();
-                let px = ((tw * ppp) as u32).max(1);
+                let img = crate::textures::device_pixel_rect(Rect::from_min_size(pos2(row.min.x + indent, row.min.y + 4.0), vec2(tw, th)), ppp);
+                let wpx = ((img.width() * ppp).round() as u32).max(1);
+                let px = crate::textures::fit_size(
+                    (wpx, (wpx as f64 * doc.slide_size.height / doc.slide_size.width.max(1.0)).clamp(1.0, 1e9) as u32),
+                    crate::textures::max_side(ui.ctx()),
+                );
                 let pic = deckcraft_render::render_layout(
                     &doc,
                     mi,
                     li,
                     &deckcraft_render::RenderOpts {
-                        scale: px as f64 / doc.slide_size.width.max(1.0),
+                        scale: px.0 as f64 / doc.slide_size.width.max(1.0),
                         edit: true,
-                        size: Some((px, (px as f64 * doc.slide_size.height / doc.slide_size.width.max(1.0)) as u32)),
+                        size: Some(px),
                         ..Default::default()
                     },
                 );
-                let tex =
-                    ui.ctx().load_texture(format!("ml-{mi}-{li:?}"), crate::textures::to_color_image(&pic, false), egui::TextureOptions::LINEAR);
+                let tex = crate::textures::upload_editor(ui.ctx(), format!("ml-{mi}-{li:?}"), crate::textures::to_color_image(&pic, false));
                 ui.painter().image(tex.id(), img, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
                 let selected = match (target, li) {
                     (Target::Master { master }, None) => master == mi,

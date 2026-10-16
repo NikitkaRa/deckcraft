@@ -241,6 +241,7 @@ pub fn body(ctx: &Ctx, shape: &Shape) -> BodyProps {
         warp_adj: Vec::new(),
         rtl_col: Some(false),
         upright: Some(false),
+        space_first_last: Some(false),
     });
     b
 }
@@ -284,16 +285,22 @@ pub fn level_style(ctx: &Ctx, shape: &Shape, level: u8) -> LevelStyle {
 /// Fully resolved run properties for `run` in paragraph `para` (explicit → paragraph style).
 pub fn run(ctx: &Ctx, shape: &Shape, para: &crate::text::Paragraph, run: &RunProps) -> RunProps {
     let mut r = run.clone();
+    // Paragraph `defRPr` fills gaps in the run, and the list style (including the layout
+    // placeholder this shape inherits from) fills whatever is still unset.
+    r.inherit(&para.def_props);
     let lvl = level_style(ctx, shape, para.level);
     r.inherit(&lvl.run);
     // Hyperlinked text is drawn in the theme's hyperlink colour and underlined, as in PowerPoint,
     // unless the run itself sets a colour (honoured since PowerPoint 2019) or an underline
     // (`u="none"` removes it). Colours and underlines from list styles don't count.
     if r.link.is_some() {
-        if run.fill.is_none() {
+        // A colour or underline on the run, or on the same `defRPr` that carries the link, is
+        // kept. A colour that arrived only from a list style is not.
+        let from_def = run.link.is_none();
+        if run.fill.is_none() && !(from_def && para.def_props.fill.is_some()) {
             r.fill = Some(Fill::solid(ColorRef::scheme(SchemeSlot::Hlink)));
         }
-        if run.underline.is_none() {
+        if run.underline.is_none() && !(from_def && para.def_props.underline.is_some()) {
             r.underline = Some("sng".into());
         }
     }

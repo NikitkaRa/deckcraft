@@ -402,3 +402,38 @@ fn keys_never_panic_on_any_text() {
         }
     }
 }
+
+#[test]
+fn select_into_another_body_settles_the_composition() {
+    let (mut s, a) = editing("hello", (0, 0));
+    s.execute("insert.textBox", &json!({"rect": [60.0, 400.0, 600.0, 100.0], "text": "x"})).unwrap();
+    let b = s.doc().unwrap().selection.shapes[0].0;
+    s.execute("text.set", &json!({"id": b, "text": "0123456789"})).unwrap();
+    s.execute("text.edit", &json!({"id": a, "at": [0, 0]})).unwrap();
+    s.compose_text("ab", None).unwrap();
+    s.select(|_, sel| {
+        sel.text = Some(crate::TextSel { shape: deckcraft_model::ShapeId(b), ..Default::default() });
+    })
+    .unwrap();
+    assert!(s.doc().unwrap().composition.is_none());
+    s.commit_text("X").unwrap();
+    assert_eq!(text(&mut s, b), "X0123456789");
+    assert_eq!(text(&mut s, a), "abhello");
+}
+
+#[test]
+fn select_into_another_table_cell_settles_the_composition() {
+    let (mut s, _) = editing("x", (0, 0));
+    let data = json!([["hello", "0123456789"]]);
+    let r = s.execute("insert.table", &json!({"rows": 1, "cols": 2, "rect": [60.0, 400.0, 600.0, 60.0], "data": data})).unwrap();
+    let id = deckcraft_model::ShapeId(r["id"].as_u64().unwrap() as u32);
+    s.select(|_, sel| sel.text = Some(crate::TextSel { shape: id, cell: Some((0, 0)), ..Default::default() })).unwrap();
+    s.compose_text("ab", None).unwrap();
+    s.select(|_, sel| sel.text = Some(crate::TextSel { shape: id, cell: Some((0, 1)), ..Default::default() })).unwrap();
+    assert!(s.doc().unwrap().composition.is_none());
+    s.commit_text("X").unwrap();
+    let st = s.doc().unwrap();
+    let Some(deckcraft_model::ShapeKind::Table(t)) = st.shape(id).map(|sh| &sh.kind) else { panic!("not a table") };
+    let cell = |c| t.cell(0, c).map(|x| x.text.text()).unwrap_or_default();
+    assert_eq!((cell(0), cell(1)), ("abhello".to_string(), "X0123456789".to_string()));
+}

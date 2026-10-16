@@ -28,7 +28,7 @@ pub fn specs() -> Vec<CommandSpec> {
             has_selection,
             add
         ),
-        cmd!("animation.remove", "Remove Animation", ["Animation Pane"], None, "{index} | {ids?} (all of the shapes' animations)", has_slide, remove),
+        cmd!("animation.remove", "Remove Animation", ["Animation Pane"], None, "{index} | {ids? (all of the shapes' animations)}", has_slide, remove),
         cmd!("animation.move", "Reorder Animation", ["Animations", "Timing"], None, "{index, to}", has_slide, move_anim),
         cmd!(
             "animation.timing",
@@ -82,6 +82,51 @@ fn start_of(s: &str) -> AnimStart {
     }
 }
 
+/// The effect option `given` as one of `allowed`. Besides the stored codes ("b", "lt", "u", …)
+/// it takes the direction words people type: "fromBottom", "bottom", "fromTopLeft",
+/// "upRight". `None` when it matches none of them: the renderer reads direction codes letter
+/// by letter, so an unchecked "fromBottom" would fly in from the right and the bottom.
+fn resolve_option(allowed: &[&str], given: &str) -> Option<String> {
+    if allowed.is_empty() || allowed.contains(&given) {
+        return Some(given.to_string());
+    }
+    let low = given.to_ascii_lowercase();
+    if let Some(o) = allowed.iter().find(|o| o.to_ascii_lowercase() == low) {
+        return Some(o.to_string());
+    }
+    let mut rest = low.strip_prefix("from").unwrap_or(&low).trim_start_matches(['-', '_', ' ']);
+    // Direction words in order, each as both its edge letter and its arrow letter.
+    let mut dirs: Vec<(char, char)> = Vec::new();
+    while !rest.is_empty() {
+        let words: [(&str, (char, char)); 8] = [
+            ("bottom", ('b', 'd')),
+            ("down", ('b', 'd')),
+            ("top", ('t', 'u')),
+            ("up", ('t', 'u')),
+            ("left", ('l', 'l')),
+            ("right", ('r', 'r')),
+            ("-", ('-', '-')),
+            ("_", ('-', '-')),
+        ];
+        let (w, d) = words.iter().find(|(w, _)| rest.starts_with(w))?;
+        if d.0 != '-' {
+            dirs.push(*d);
+        }
+        rest = &rest[w.len()..];
+    }
+    if dirs.is_empty() || dirs.len() > 2 {
+        return None;
+    }
+    let mut cands: Vec<String> = Vec::new();
+    for pick in [|d: &(char, char)| d.0, |d: &(char, char)| d.1] {
+        let code: String = dirs.iter().map(pick).collect();
+        let rev: String = code.chars().rev().collect();
+        cands.push(code);
+        cands.push(rev);
+    }
+    cands.into_iter().find(|c| allowed.contains(&c.as_str()))
+}
+
 fn build(p: &Value) -> Result<Animation> {
     let effect = str_param(p, "effect").ok_or_else(|| bad("animation", "missing `effect`"))?;
     let class = class_of(str_param(p, "class"));
@@ -93,7 +138,12 @@ fn build(p: &Value) -> Result<Animation> {
     let mut a = Animation {
         class: info.2,
         effect: info.0.to_string(),
-        option: str_param(p, "option").map(String::from).or_else(|| info.5.first().map(|o| o.to_string())).unwrap_or_default(),
+        option: match str_param(p, "option") {
+            Some(o) => {
+                resolve_option(info.5, o).ok_or_else(|| bad("animation", format!("option `{o}` is not one of {:?} for `{}`", info.5, info.0)))?
+            }
+            None => info.5.first().map(|o| o.to_string()).unwrap_or_default(),
+        },
         duration_ms: p.get("duration").and_then(Value::as_u64).map(|v| v.min(600_000) as u32).unwrap_or(info.4),
         delay_ms: p.get("delay").and_then(Value::as_u64).map(|v| v.min(600_000) as u32).unwrap_or(0),
         preset_id: Some(info.3),
@@ -127,7 +177,7 @@ pub fn default_path(effect: &str, option: &str) -> String {
         "turns" => format!("M 0 0 L {} {} C {} {} {dx} {} {dx} {dy} E", dx * 0.5, dy * 0.5, dx, dy * 0.5, dy * 0.75),
         "shapes" => "M 0 0 C 0.1 0 0.1 0.15 0 0.15 C -0.1 0.15 -0.1 0 0 0 Z E".into(),
         "loops" => "M 0 0 C 0.1 -0.1 0.2 0.1 0.1 0.1 C 0 0.1 0.1 -0.1 0.25 0 E".into(),
-        _ => format!("M 0 0 L {dx} {dy} E"),
+        other => deckcraft_model::anim::preset_path(other).unwrap_or_else(|| format!("M 0 0 L {dx} {dy} E")),
     }
 }
 
@@ -270,9 +320,14 @@ fn options(s: &mut Session, p: &Value) -> Result<Value> {
     });
     each_target(s, p, |a| {
         if let Some(o) = &option {
-            a.option = o.clone();
-            if a.class == AnimClass::Path {
-                a.path = Some(default_path(&a.effect, o));
+            // Each target takes the option in its own effect's terms; one it has no such
+            // option for keeps its own.
+            let allowed = animation_info(&a.effect, a.class).map(|i| i.5).unwrap_or(&[]);
+            if let Some(o) = resolve_option(allowed, o) {
+                if a.class == AnimClass::Path {
+                    a.path = Some(default_path(&a.effect, &o));
+                }
+                a.option = o;
             }
         }
         if let Some(b) = build_mode {
@@ -305,7 +360,7 @@ fn get(s: &mut Session, p: &Value) -> Result<Value> {
 
 fn painter_pick(s: &mut Session, p: &Value) -> Result<Value> {
     let st = s.doc()?;
-    let id = id_param(p, "id")
+    let id = id_param(p, "id", "animation.painter")?
         .or_else(|| st.selection.shapes.first().copied())
         .ok_or_else(|| bad("animation.painter", "select an animated shape first"))?;
     let sl = st.current_slide().ok_or_else(|| bad("animation.painter", "no slide"))?;
@@ -355,6 +410,26 @@ fn painter_apply(s: &mut Session, p: &Value) -> Result<Value> {
 
 #[cfg(test)]
 mod tests {
+    use super::resolve_option;
+
+    #[test]
+    fn direction_words_resolve_to_codes() {
+        let fly = &["b", "lb", "l", "lt", "t", "rt", "r", "rb"][..];
+        assert_eq!(resolve_option(fly, "fromBottom").as_deref(), Some("b"));
+        assert_eq!(resolve_option(fly, "bottom").as_deref(), Some("b"));
+        assert_eq!(resolve_option(fly, "fromTopLeft").as_deref(), Some("lt"));
+        assert_eq!(resolve_option(fly, "fromBottomRight").as_deref(), Some("rb"));
+        assert_eq!(resolve_option(fly, "lt").as_deref(), Some("lt"));
+        assert_eq!(resolve_option(fly, "sideways"), None);
+        assert_eq!(resolve_option(fly, "fromBottomTopLeft"), None);
+        let wipe = &["r", "l", "u", "d", "ru", "lu", "rd", "ld"][..];
+        assert_eq!(resolve_option(wipe, "fromBottom").as_deref(), Some("d"));
+        assert_eq!(resolve_option(wipe, "upRight").as_deref(), Some("ru"));
+        let split = &["horzIn", "horzOut", "vertIn", "vertOut"][..];
+        assert_eq!(resolve_option(split, "HorzIn").as_deref(), Some("horzIn"));
+        assert_eq!(resolve_option(&[], "anything").as_deref(), Some("anything"));
+    }
+
     use super::*;
 
     #[test]

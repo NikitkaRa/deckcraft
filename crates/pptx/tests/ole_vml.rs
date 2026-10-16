@@ -27,6 +27,11 @@ fn png(v: u8) -> Vec<u8> {
 
 /// A new deck whose first slide holds [`FRAME`], with the VML drawing, its rels and two pictures.
 fn deck() -> Vec<u8> {
+    deck_with(FRAME)
+}
+
+/// [`deck`] with `frames` in place of [`FRAME`].
+fn deck_with(frames: &str) -> Vec<u8> {
     let bytes = deckcraft_pptx::export(&defaults::new_presentation(None)).expect("export");
     let mut z = zip::ZipArchive::new(Cursor::new(bytes)).expect("zip");
     let mut out = zip::ZipWriter::new(Cursor::new(Vec::new()));
@@ -39,7 +44,7 @@ fn deck() -> Vec<u8> {
         if name == "ppt/slides/slide1.xml" {
             let s = String::from_utf8(d).expect("utf8");
             let at = s.rfind("</p:spTree>").expect("spTree");
-            let s = format!("{}{FRAME}{}", &s[..at], &s[at..]);
+            let s = format!("{}{frames}{}", &s[..at], &s[at..]);
             let at = s.rfind("</p:cSld>").expect("cSld");
             d = format!("{}{CONTROLS}{}", &s[..at], &s[at..]).into_bytes();
         } else if name == "ppt/slides/_rels/slide1.xml.rels" {
@@ -81,4 +86,33 @@ fn activex_controls_show_their_pictures() {
     let x = s.xfrm.expect("xfrm");
     assert_eq!((x.x, x.y, x.w, x.h), (1.0, 2.0, 10.0, 5.0));
     assert!(!p.slides[0].shapes.iter().any(|s| s.name == "NoPicture"), "a control without a picture draws nothing");
+}
+
+#[test]
+fn many_objects_sharing_one_vml_drawing_each_get_their_preview() {
+    // 200 frames look up the same drawing (it is parsed once); every other one names a shape id
+    // the drawing doesn't have.
+    let frames: String = (0..200)
+        .map(|i| {
+            let spid = match i % 4 {
+                0 => "_x0000_s2050",
+                1 => "_x0000_s9999",
+                2 => "_x0000_s2049",
+                _ => "missing",
+            };
+            FRAME.replace("id=\"90\" name=\"Object 3\"", &format!("id=\"{}\" name=\"Obj {i}\"", 1000 + i)).replace("_x0000_s2050", spid)
+        })
+        .collect();
+    let p = deckcraft_pptx::import(&deck_with(&frames)).expect("import");
+    for i in 0..200 {
+        let s = p.slides[0].shapes.iter().find(|s| s.name == format!("Obj {i}")).expect("frame");
+        let ShapeKind::Opaque { preview, .. } = &s.kind else { panic!("{:?}", s.kind) };
+        let name = preview.and_then(|m| p.media.iter().find(|x| x.id == m)).map(|m| m.name.as_str());
+        let want = match i % 4 {
+            0 => Some("preview.png"),
+            2 => Some("other.png"),
+            _ => None,
+        };
+        assert_eq!(name, want, "frame {i}");
+    }
 }

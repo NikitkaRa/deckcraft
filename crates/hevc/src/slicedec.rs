@@ -298,7 +298,7 @@ impl<'a> SliceDecoder<'a> {
         let sh = &job.sh;
         let (sps, pps) = (&*job.sps, &*job.pps);
         ensure!(sh.data_offset < job.rbsp.len(), "empty slice segment data");
-        let slice_qp = pps.init_qp + sh.qp_delta;
+        let slice_qp = pps.init_qp.checked_add(sh.qp_delta).ok_or_else(|| crate::Error::Invalid("SliceQpY out of range".into()))?;
         let init_type = match sh.slice_type {
             SliceType::I => 0,
             SliceType::P => {

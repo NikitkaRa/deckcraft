@@ -71,13 +71,14 @@ pub fn decode(bytes: &Bytes) -> Result<Pcm> {
         Container::Asf => Err(MediaError::Unsupported("Windows Media Audio (WMA)".into())),
         Container::Ogg => match decode_ogg_opus(bytes) {
             Some(r) => r,
-            None => decode_symphonia(bytes, "ogg"),
+            None => contained(|| decode_symphonia(bytes, "ogg")),
         },
         Container::Matroska => match decode_mkv_opus(bytes) {
             Some(r) => r,
-            None => decode_symphonia(bytes, "mkv"),
+            None => contained(|| decode_symphonia(bytes, "mkv")),
         },
-        c => decode_symphonia(bytes, c.name()),
+        Container::Mp4 if !crate::mp4guard::tables_fit(bytes) => Err(MediaError::Corrupt("the MP4's sample tables do not fit the file".into())),
+        c => contained(|| decode_symphonia(bytes, c.name())),
     }
 }
 
@@ -92,7 +93,7 @@ fn decode_ogg_opus(bytes: &Bytes) -> Option<Result<Pcm>> {
         let mut dec = deckcraft_opus::Decoder::new(head).map_err(|e| MediaError::Corrupt(e.to_string()))?;
         dec.set_trim_pre_skip(true);
         let channels = dec.channels() as u16;
-        let timing = deckcraft_ogg::OpusTiming::of(stream, dec.pre_skip() as u32);
+        let timing = deckcraft_ogg::OpusTiming::of(stream, dec.pre_skip() as u32).map_err(|e| MediaError::Corrupt(e.to_string()))?;
         let mut out = Vec::new();
         for i in 0..stream.packets.len() {
             let Ok(p) = file.read_packet(src, s, i) else { continue };
@@ -142,6 +143,15 @@ fn sym_err(e: SymError) -> MediaError {
     }
 }
 
+/// Runs symphonia, whose demuxers can panic on damaged files (Matroska's EBML reader asserts
+/// its position, for one): the panic becomes a corrupt-file error instead of ending the app.
+fn contained<T>(f: impl FnOnce() -> Result<T>) -> Result<T> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).unwrap_or_else(|_| Err(MediaError::Corrupt("the audio could not be read".into())))
+}
+
+/// Demux errors in a row after which a file is taken to have no more audio.
+const MAX_DEMUX_ERRORS: u32 = 64;
+
 fn decode_symphonia(bytes: &Bytes, ext: &str) -> Result<Pcm> {
     let mss = MediaSourceStream::new(Box::new(Cursor::new(Shared(bytes.clone()))), MediaSourceStreamOptions::default());
     let mut hint = Hint::new();
@@ -172,12 +182,21 @@ fn decode_symphonia(bytes: &Bytes, ext: &str) -> Result<Pcm> {
     let mut rate = 0;
     let mut channels = 0u16;
     let mut buf: Option<SampleBuffer<f32>> = None;
+    // A damaged file can make the demuxer report the same error forever without moving on.
+    let mut demux_errors = 0u32;
     loop {
         let packet = match format.next_packet() {
-            Ok(p) => p,
+            Ok(p) => {
+                demux_errors = 0;
+                p
+            }
             Err(SymError::IoError(_)) | Err(SymError::ResetRequired) => break,
             Err(SymError::DecodeError(e)) => {
                 log::debug!("audio demux: {e}");
+                demux_errors += 1;
+                if demux_errors > MAX_DEMUX_ERRORS {
+                    break;
+                }
                 continue;
             }
             Err(e) => {

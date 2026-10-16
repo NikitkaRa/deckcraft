@@ -12,7 +12,9 @@ fn text_of(s: &Shape) -> String {
 
 /// Pairs of (shape on `a`, shape on `b`) that Morph animates from one to the other: first by
 /// `!!name` (forced match), then by exact name, then by the same kind and text, then by the same
-/// kind and preset geometry. Each shape is used once; top-level shapes only (groups move whole).
+/// kind and preset geometry if neither carries text. A text box with neither a name nor its text on
+/// the other slide stays unpaired and fades in place, as in PowerPoint (#119). Each shape is used
+/// once; top-level shapes only (groups move whole).
 pub fn morph_pairs(a: &Slide, b: &Slide) -> Vec<(ShapeId, ShapeId)> {
     let mut pairs: Vec<(ShapeId, ShapeId)> = Vec::new();
     let mut used_a = vec![false; a.shapes.len()];
@@ -31,7 +33,8 @@ pub fn morph_pairs(a: &Slide, b: &Slide) -> Vec<(ShapeId, ShapeId)> {
             x.kind_name() == y.kind_name()
                 && x.geom.preset_name().is_some()
                 && x.geom.preset_name() == y.geom.preset_name()
-                && text_of(x).trim().is_empty() == text_of(y).trim().is_empty()
+                && text_of(x).trim().is_empty()
+                && text_of(y).trim().is_empty()
         },
     ];
     for pass in passes {
@@ -173,9 +176,58 @@ fn reshaped(a: &Shape, b: &Shape) -> bool {
     a.geom != b.geom && outlined(a) && outlined(b) && Shape { geom: Geom::default(), ..content(a) } == Shape { geom: Geom::default(), ..content(b) }
 }
 
+/// The content of a shape apart from what Morph interpolates, with a picture's crop left out.
+fn uncropped(s: &Shape) -> Shape {
+    let mut c = content(s);
+    if let ShapeKind::Picture { fill } = &mut c.kind {
+        fill.crop = [0.0; 4];
+    }
+    c
+}
+
+fn crop_of(s: &Shape) -> [f64; 4] {
+    match &s.kind {
+        ShapeKind::Picture { fill } => fill.crop,
+        _ => [0.0; 4],
+    }
+}
+
+/// Whether two pictures differ in their crop only (apart from box and fill), so the crop can morph.
+fn recropped(a: &Shape, b: &Shape) -> bool {
+    matches!(a.kind, ShapeKind::Picture { .. }) && crop_of(a) != crop_of(b) && uncropped(a) == uncropped(b)
+}
+
+/// The crop (left, top, right, bottom) of a picture morphing from box `xa` cropped by `ca` to box
+/// `xb` cropped by `cb`, when its box is `x` at progress `t`: the whole image moves and scales
+/// linearly between where it lies on either slide, and the crop is what of it `x` shows. Falls back
+/// to blending the crops when a crop leaves nothing visible.
+pub fn morph_crop(ca: [f64; 4], xa: Xfrm, cb: [f64; 4], xb: Xfrm, x: Xfrm, t: f64) -> [f64; 4] {
+    // Along one axis: (box start, box size, crop before, crop after) → the crops at `t`.
+    let axis = |(pa, sa, la, ha): (f64, f64, f64, f64), (pb, sb, lb, hb): (f64, f64, f64, f64), (p, s): (f64, f64)| {
+        let (va, vb) = (1.0 - la - ha, 1.0 - lb - hb);
+        if va <= 1e-6 || vb <= 1e-6 {
+            return (lerp(la, lb, t), lerp(ha, hb, t));
+        }
+        // The whole image: its extent and start on either slide.
+        let (ea, eb) = (sa / va, sb / vb);
+        let e = lerp(ea, eb, t);
+        if !e.is_finite() || e.abs() <= 1e-9 {
+            return (lerp(la, lb, t), lerp(ha, hb, t));
+        }
+        let o = lerp(pa - la * ea, pb - lb * eb, t);
+        let lo = (p - o) / e;
+        (lo, 1.0 - lo - s / e)
+    };
+    let (l, r) = axis((xa.x, xa.w, ca[0], ca[2]), (xb.x, xb.w, cb[0], cb[2]), (x.x, x.w));
+    let (tp, bt) = axis((xa.y, xa.h, ca[1], ca[3]), (xb.y, xb.h, cb[1], cb[3]), (x.y, x.h));
+    let c = [l, tp, r, bt];
+    if c.iter().all(|v| v.is_finite()) { c } else { cb }
+}
+
 /// Morph frame from slide `a` to slide `b` at progress `t` (0..1, eased here). Paired shapes
 /// ([`morph_pairs`]) move along [`morph_xfrm`]; when they differ only in solid fill colour the
-/// colour blends, when only in geometry (and fill colour) the outline morphs ([`MorphFrame::paths`]),
+/// colour blends, when pictures differ only in crop the crop morphs ([`morph_crop`]), when only
+/// in geometry (and fill colour) the outline morphs ([`MorphFrame::paths`]),
 /// otherwise the new shape fades in under the fading old one on the same moving
 /// box; with the transition option `words` or `characters` their texts are listed in
 /// [`MorphFrame::text`] to morph word by word or character by character. Unpaired shapes of `a` fade out, unpaired shapes of `b` fade in, and shapes of `b` for
@@ -223,8 +275,18 @@ pub fn morph_frame(pres: &Presentation, a: &Slide, b: &Slide, t: f64, hidden_b: 
             (_, xb) => xb,
         };
         let reshape = reshaped(sa, sb);
-        if reshape || content(sa) == content(sb) {
+        let recrop = recropped(sa, sb);
+        if reshape || recrop || content(sa) == content(sb) {
             let mut m = Shape { xfrm: x, ..sb.clone() };
+            if recrop && let ShapeKind::Picture { fill } = &mut m.kind {
+                fill.crop = match (xa, xb, x) {
+                    (Some(xa), Some(xb), Some(x)) => morph_crop(crop_of(sa), xa, crop_of(sb), xb, x, s),
+                    _ => {
+                        let (ca, cb) = (crop_of(sa), crop_of(sb));
+                        [lerp(ca[0], cb[0], s), lerp(ca[1], cb[1], s), lerp(ca[2], cb[2], s), lerp(ca[3], cb[3], s)]
+                    }
+                };
+            }
             if let (Some(fa), Some(fb)) = (solid_color(ca.as_ref(), sa), solid_color(cb.as_ref(), sb))
                 && fa != fb
             {
@@ -237,7 +299,11 @@ pub fn morph_frame(pres: &Presentation, a: &Slide, b: &Slide, t: f64, hidden_b: 
         } else {
             let new = push(Shape { xfrm: x, ..sb.clone() }, false, s);
             let old = push(Shape { xfrm: x, ..sa.clone() }, true, 1.0 - s);
-            if by_text
+            // The same text in shapes that differ otherwise (a title slide's centred title and a
+            // content slide's title: other placeholder, size, alignment) moves and resizes word
+            // by word even with the Objects option, as PowerPoint does, instead of cross-fading.
+            let same_text = text_of(sa).trim() == text_of(sb).trim();
+            if (by_text || same_text)
                 && has_text(sa)
                 && has_text(sb)
                 && let (Some(from), Some(to)) = (box_of(ca.as_ref(), sa), box_of(cb.as_ref(), sb))

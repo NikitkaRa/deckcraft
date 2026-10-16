@@ -10,7 +10,7 @@ use crate::{Result, Session};
 pub fn specs() -> Vec<CommandSpec> {
     vec![
         cmd!(query "document.inspect", "Inspect Presentation", [], None, "{} → slides with titles, layouts, shape counts; selection; size; theme", has_doc, document),
-        cmd!(query "slide.inspect", "Inspect Slide", [], None, "{index?} → the slide's shapes with ids, kinds, boxes, text, fills, animations, transition, notes", has_doc, slide),
+        cmd!(query "slide.inspect", "Inspect Slide", [], None, "{index?} → the slide's shapes with ids, kinds, boxes, text, fills, animations, transition, notes (text, and notesBody with its formatting)", has_doc, slide),
         cmd!(query "shape.inspect", "Inspect Shape", [], None, "{id} → full shape JSON plus its effective box", has_doc, shape),
         cmd!(query "commands.list", "List Commands", [], None, "{filter?: substring} → [{id, label, params, enabled}]", always, commands),
     ]
@@ -129,6 +129,7 @@ fn slide(s: &mut Session, p: &Value) -> Result<Value> {
         "transition": serde_json::to_value(&sl.transition).unwrap_or_default(),
         "animations": serde_json::to_value(&sl.animations).unwrap_or_default(),
         "notes": sl.notes_text(),
+        "notesBody": sl.notes,
         "comments": sl.comments.len(),
         "hidden": sl.hidden,
     }))
@@ -136,7 +137,8 @@ fn slide(s: &mut Session, p: &Value) -> Result<Value> {
 
 fn shape(s: &mut Session, p: &Value) -> Result<Value> {
     let st = s.doc()?;
-    let id = id_param(p, "id").or_else(|| st.selection.shapes.first().copied()).ok_or_else(|| bad("shape.inspect", "missing `id`"))?;
+    let id =
+        id_param(p, "id", "shape.inspect")?.or_else(|| st.selection.shapes.first().copied()).ok_or_else(|| bad("shape.inspect", "missing `id`"))?;
     let sh = st.shape(id).ok_or_else(|| bad("shape.inspect", format!("no shape {id}")))?;
     let x = xfrm_of(&st.doc, &st.selection, sh);
     Ok(json!({"shape": serde_json::to_value(sh).unwrap_or_default(), "box": x}))

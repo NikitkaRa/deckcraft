@@ -52,6 +52,7 @@ impl Session {
                     st.revision = revision.max(st.revision).saturating_add(1);
                 }
                 log::error!("command `{id}` panicked: {msg}");
+                self.panics_caught = self.panics_caught.saturating_add(1);
                 if let Some(dir) = self.recovery_dir.clone()
                     && let Err(e) = crate::recovery::save(self, &dir)
                 {
@@ -85,7 +86,36 @@ mod tests {
         assert!(err.to_string().contains("test.panic") && err.to_string().contains("boom"), "{err}");
         let st = s.active().unwrap();
         assert!(std::sync::Arc::ptr_eq(&st.doc, &before), "the document is the one from before the command");
+        assert_eq!(s.panics_caught, 1, "the guard counts what it caught");
         // The session keeps working.
         s.execute("shape.insert", &json!({"preset": "ellipse", "rect": [36, 236, 200, 400]})).unwrap();
+    }
+
+    #[test]
+    fn a_command_that_fails_after_editing_leaves_the_document_alone() {
+        let mut s = Session::new();
+        s.execute("file.new", &json!({})).unwrap();
+        let a = s.execute("shape.insert", &json!({"preset": "rect", "rect": [36, 36, 100, 100]})).unwrap()["id"].as_u64().unwrap();
+        let b = s.execute("shape.insert", &json!({"preset": "rect", "rect": [236, 36, 100, 100]})).unwrap()["id"].as_u64().unwrap();
+        let before = s.active().unwrap().doc.clone();
+        let undo_len = s.active().unwrap().history.undo.len();
+        // `shape.connect` inserts the requested preset first, then rejects it because it is not a line.
+        let r = s.execute("shape.connect", &json!({"from": a, "to": b, "preset": "rect"}));
+        assert!(r.is_err());
+        let st = s.active().unwrap();
+        assert!(std::sync::Arc::ptr_eq(&st.doc, &before), "the stray shape is gone");
+        assert_eq!(st.history.undo.len(), undo_len);
+    }
+
+    #[test]
+    fn a_failed_picture_change_adds_no_media() {
+        let mut s = Session::new();
+        s.execute("file.new", &json!({})).unwrap();
+        s.execute("shape.insert", &json!({"preset": "rect", "rect": [36, 36, 100, 100]})).unwrap();
+        let before = s.active().unwrap().doc.clone();
+        // `picture.change` stores the image first, then finds no shape with this id.
+        let r = s.execute("picture.change", &json!({"ids": [9999], "name": "a.png", "data": crate::cmd::base64_encode(b"not a picture")}));
+        assert!(r.is_err());
+        assert!(std::sync::Arc::ptr_eq(&s.active().unwrap().doc, &before), "the stored image is gone");
     }
 }

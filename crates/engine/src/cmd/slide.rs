@@ -32,7 +32,15 @@ pub fn specs() -> Vec<CommandSpec> {
         cmd!("slide.hide", "Hide Slide", ["Slide Show", "Set Up"], None, "{index?, hidden?: bool}", has_slide, hide),
         cmd!("slide.layout", "Layout", ["Home", "Slides"], None, "{layout: name or kind, index?}", has_slide, set_layout),
         cmd!("slide.reset", "Reset", ["Home", "Slides"], None, "{index?}", has_slide, reset),
-        cmd!("slide.notes", "Notes", ["View"], None, "{text, index?}", has_slide, notes),
+        cmd!(
+            "slide.notes",
+            "Notes",
+            ["View"],
+            None,
+            "{text | body: formatted notes (as in slide.inspect's notesBody), index?} (text as typed: untouched notes keep their formatting)",
+            has_slide,
+            notes
+        ),
         cmd!("slide.rename", "Rename Slide", [], None, "{name, index?}", has_slide, rename),
         cmd!("section.add", "Add Section", ["Home", "Slides", "Section"], None, "{name?, at?: slide index}", has_slide, section_add),
         cmd!("section.rename", "Rename Section", ["Home", "Slides", "Section"], None, "{index, name}", has_slide, section_rename),
@@ -47,7 +55,15 @@ pub fn specs() -> Vec<CommandSpec> {
         ),
         cmd!("section.removeAll", "Remove All Sections", ["Home", "Slides", "Section"], None, "{}", has_slide, section_remove_all),
         cmd!("section.move", "Move Section", [], None, "{index, to}", has_slide, section_move),
-        cmd!("slide.fromOutline", "Slides from Outline…", ["Insert", "Slides From"], None, "{text}", has_doc, from_outline),
+        cmd!(
+            "slide.fromOutline",
+            "Slides from Outline…",
+            ["Insert", "Slides From"],
+            None,
+            "{text, markdown?: bool (headings are slides, list items bullets)}",
+            has_doc,
+            from_outline
+        ),
     ]
 }
 
@@ -99,16 +115,21 @@ fn new(s: &mut Session, p: &Value) -> Result<Value> {
                 }
             }
         };
-        let mut slide = defaults::new_slide(doc, layout);
+        let mut slide = defaults::new_slide(doc, layout).ok_or_else(|| bad("slide.new", NO_ID_SPACE))?;
         if let Some(t) = str_param(p, "title")
             && let Some(sh) = slide.shapes.iter_mut().find(|x| x.ph_type().is_some_and(|k| k.is_title()))
         {
             sh.text = Some(TextBody::from_text(t));
         }
         if let Some(b) = str_param(p, "body")
-            && let Some(sh) = slide.shapes.iter_mut().find(|x| x.ph_type().is_some_and(|k| !k.is_title()))
+            && let Some(sh) = body_placeholder(&mut slide.shapes)
         {
-            sh.text = Some(TextBody::from_text(b));
+            let mut body = TextBody::from_text(b);
+            // Leading tabs set the outline level, as in text.set.
+            for para in &mut body.paragraphs {
+                super::text::apply_leading_tabs(para);
+            }
+            sh.text = Some(body);
         }
         let at = usize_param(p, "at").unwrap_or(if doc.slides.is_empty() { 0 } else { sel.slide + 1 }).min(doc.slides.len());
         let id = slide.id;
@@ -135,6 +156,25 @@ fn new(s: &mut Session, p: &Value) -> Result<Value> {
         sel.target = Target::Slides;
         Ok(json!({"index": at, "id": id}))
     })
+}
+
+/// The placeholder a new slide's `body` goes into: the layout's main content placeholder.
+/// Prefers `idx="1"` (the content slot PowerPoint fills), then a full-size text placeholder over
+/// a `half`/`quarter` one, then a text placeholder over a picture/chart/table one; ties keep
+/// shape order, so a layout with a single body placeholder behaves as before.
+fn body_placeholder(shapes: &mut [deckcraft_model::Shape]) -> Option<&mut deckcraft_model::Shape> {
+    use deckcraft_model::PhType;
+    let rank = |sh: &deckcraft_model::Shape| {
+        let ph = sh.ph.as_ref()?;
+        if ph.kind.is_title() {
+            return None;
+        }
+        let text = matches!(ph.kind, PhType::Body | PhType::Obj | PhType::SubTitle);
+        let small = matches!(ph.size.as_deref(), Some("half" | "quarter"));
+        Some((ph.idx != 1, small, !text))
+    };
+    let best = shapes.iter().enumerate().filter_map(|(i, sh)| rank(sh).map(|r| (r, i))).min()?.1;
+    shapes.get_mut(best)
 }
 
 fn index_of(s: &Session, p: &Value) -> Result<usize> {
@@ -165,25 +205,10 @@ fn duplicate(s: &mut Session, p: &Value) -> Result<Value> {
         for (k, i) in indices.iter().enumerate() {
             let Some(src) = doc.slides.get(*i).map(|x| x.as_ref().clone()) else { continue };
             let mut copy = src;
-            copy.id = SlideId(doc.alloc_id());
-            super::edit::reid(doc, &mut copy.shapes);
-            // Animations follow the new shape ids by position.
-            let old_ids: Vec<_> = doc
-                .slides
-                .get(*i)
-                .map(|x| {
-                    let mut v = vec![];
-                    deckcraft_model::walk(&x.shapes, &mut |sh, _| v.push(sh.id));
-                    v
-                })
-                .unwrap_or_default();
-            let mut new_shape_ids = vec![];
-            deckcraft_model::walk(&copy.shapes, &mut |sh, _| new_shape_ids.push(sh.id));
-            for a in &mut copy.animations {
-                if let Some(pos) = old_ids.iter().position(|x| *x == a.shape) {
-                    a.shape = new_shape_ids.get(pos).copied().unwrap_or(a.shape);
-                }
-            }
+            copy.id = SlideId(doc.alloc_id().ok_or_else(|| bad("slide.duplicate", NO_ID_SPACE))?);
+            // Animations follow the new shape ids, triggers included.
+            let map = super::edit::reid("slide.duplicate", doc, &mut copy.shapes)?;
+            super::edit::remap_animations(&mut copy.animations, &map);
             let section = doc.section_of(src_id(doc, *i));
             let at = (last + 1 + k).min(doc.slides.len());
             new_ids.push(copy.id);
@@ -193,6 +218,9 @@ fn duplicate(s: &mut Session, p: &Value) -> Result<Value> {
                 && let Some(sec) = doc.sections.get_mut(si)
             {
                 sec.slides.push(nid);
+                // Keep the section list in document order so the copy sits next to its source.
+                let order: Vec<SlideId> = doc.slides.iter().map(|x| x.id).collect();
+                sec.slides.sort_by_key(|x| order.iter().position(|o| o == x).unwrap_or(usize::MAX));
             }
         }
         sel.slide = (last + new_ids.len()).min(doc.slides.len().saturating_sub(1));
@@ -283,9 +311,16 @@ fn go_to(s: &mut Session, i: usize) -> Result<Value> {
 fn go(s: &mut Session, p: &Value) -> Result<Value> {
     let i = match (usize_param(p, "index"), p.get("id").and_then(Value::as_u64)) {
         (Some(i), _) => i,
-        (None, Some(id)) => s.doc()?.doc.slide_index(SlideId(u32::try_from(id).unwrap_or(0))).ok_or_else(|| bad("slide.go", "no such slide"))?,
+        (None, Some(id)) => s
+            .doc()?
+            .doc
+            .slide_index(SlideId(u32::try_from(id).map_err(|_| bad("slide.go", "no such slide"))?))
+            .ok_or_else(|| bad("slide.go", "no such slide"))?,
         _ => return Err(bad("slide.go", "missing `index`")),
     };
+    if i >= s.doc()?.doc.slides.len() {
+        return Err(bad("slide.go", format!("no slide {i}")));
+    }
     go_to(s, i)
 }
 fn next(s: &mut Session, _p: &Value) -> Result<Value> {
@@ -364,7 +399,7 @@ pub fn apply_layout(doc: &mut Presentation, index: usize, layout: LayoutId) -> R
         doc.layout(layout).map(|(_, l)| l.shapes.clone()).ok_or_else(|| bad("slide.layout", "no such layout"))?;
     let mut fresh = vec![];
     for ls in lay_shapes.iter().filter(|x| x.ph.as_ref().is_some_and(|p| !p.kind.is_footer_kind())) {
-        let id = deckcraft_model::ShapeId(doc.alloc_id());
+        let id = deckcraft_model::ShapeId(doc.alloc_id().ok_or_else(|| bad("slide.layout", NO_ID_SPACE))?);
         fresh.push((id, ls.clone()));
     }
     let slide = doc.slides.get_mut(index).ok_or_else(|| bad("slide.layout", "no slide"))?;
@@ -463,10 +498,20 @@ fn reset(s: &mut Session, p: &Value) -> Result<Value> {
 
 fn notes(s: &mut Session, p: &Value) -> Result<Value> {
     let i = index_of(s, p)?;
+    // Formatted notes as a whole (the notes editors), or text: then only what was retyped
+    // changes, so bold, levels and bullets around it survive.
+    let body = match p.get("body") {
+        Some(b) => Some(serde_json::from_value::<TextBody>(b.clone()).map_err(|e| bad("slide.notes", format!("invalid `body`: {e}")))?),
+        None => None,
+    };
     let text = str_param(p, "text").unwrap_or("").to_string();
     s.edit(|doc, _| {
         if let Some(sl) = doc.slides.get_mut(i) {
-            Arc::make_mut(sl).notes = TextBody::from_text(&text);
+            let notes = &mut Arc::make_mut(sl).notes;
+            match body {
+                Some(b) => *notes = b,
+                None => deckcraft_model::edit::replace_text(notes, &text),
+            }
         }
         Ok(())
     })?;
@@ -572,10 +617,11 @@ fn section_move(s: &mut Session, p: &Value) -> Result<Value> {
 
 fn from_outline(s: &mut Session, p: &Value) -> Result<Value> {
     let text = str_param(p, "text").unwrap_or("").to_string();
+    let markdown = bool_param(p, "markdown").unwrap_or(false);
     s.edit(|doc, sel| {
         let before = doc.slides.len();
-        let n = deckcraft_format::outline_to_slides(doc, &text);
-        // outline_to_slides appends; move them after the current slide.
+        let n = if markdown { deckcraft_format::markdown_to_slides(doc, &text) } else { deckcraft_format::outline_to_slides(doc, &text) };
+        // both append; move them after the current slide.
         let at = (sel.slide + 1).min(before);
         let new: Vec<_> = doc.slides.drain(before..).collect();
         for (k, sl) in new.into_iter().enumerate() {
@@ -583,4 +629,42 @@ fn from_outline(s: &mut Session, p: &Value) -> Result<Value> {
         }
         Ok(json!({"slides": n}))
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use crate::Session;
+
+    #[test]
+    fn duplicate_keeps_section_order_in_step_with_slides() {
+        let mut s = Session::with_new();
+        while s.doc().expect("doc").doc.slides.len() < 3 {
+            s.execute("slide.new", &json!({})).expect("new slide");
+        }
+        s.execute("section.add", &json!({"at": 0})).expect("section");
+        let orig = s.doc().expect("doc").doc.slides.first().expect("slide").id;
+        s.execute("slide.duplicate", &json!({"index": 0})).expect("dup");
+        let st = s.doc().expect("doc");
+        let all: Vec<_> = st.doc.slides.iter().map(|x| x.id).collect();
+        let sec = &st.doc.sections.first().expect("section").slides;
+        assert_eq!(all.len(), 4);
+        assert_eq!(sec, &all, "section order must match slide order");
+        assert_eq!(sec.first(), Some(&orig));
+    }
+
+    #[test]
+    fn new_slide_body_leading_tabs_become_levels() {
+        let mut s = Session::with_new();
+        let text = "Level one\n\tLevel two\n\t\tLevel three\nLevel one again";
+        s.execute("slide.new", &json!({"layout": "titleAndContent", "title": "Indent", "body": text})).expect("new slide");
+        let st = s.doc().expect("doc");
+        let slide = st.doc.slides.get(st.selection.slide).expect("slide");
+        let body = slide.shapes.iter().find(|x| x.ph_type().is_some_and(|k| !k.is_title())).expect("body");
+        let paras = &body.text.as_ref().expect("text").paragraphs;
+        let got: Vec<(u8, String)> = paras.iter().map(|p| (p.level, p.text())).collect();
+        let want = [(0, "Level one"), (1, "Level two"), (2, "Level three"), (0, "Level one again")];
+        assert_eq!(got, want.iter().map(|(l, t)| (*l, t.to_string())).collect::<Vec<_>>());
+    }
 }

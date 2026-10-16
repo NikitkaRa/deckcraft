@@ -5,6 +5,39 @@ use crate::header::{FilmGrainParams, SequenceHeader};
 use crate::spec_tables::{GAUSSIAN_SEQUENCE, MC_IDENTITY};
 
 #[inline]
+/// One plane's scaling lookup (7.18.3.4) from its `n` points. The header rejects points whose
+/// values don't strictly increase; a pair that still doesn't (defence in depth) is skipped
+/// instead of dividing by zero. No points: all zero.
+fn scaling_lut(n: usize, xs: &[u8], ys: &[u8]) -> [i32; 256] {
+    let mut l = [0i32; 256];
+    let n = n.min(xs.len()).min(ys.len());
+    let (Some(&x0), Some(&y0)) = (xs.first(), ys.first()) else { return l };
+    if n == 0 {
+        return l;
+    }
+    for v in l.iter_mut().take(x0 as usize) {
+        *v = y0 as i32;
+    }
+    for i in 0..n - 1 {
+        let (xa, xb, ya, yb) = (xs[i] as i32, xs[i + 1] as i32, ys[i] as i32, ys[i + 1] as i32);
+        let dx = xb - xa;
+        if dx <= 0 {
+            continue;
+        }
+        let delta = (yb - ya) * ((65536 + (dx >> 1)) / dx);
+        for x in 0..dx {
+            if let Some(v) = l.get_mut((xa + x) as usize) {
+                *v = ya + ((x * delta + 32768) >> 16);
+            }
+        }
+    }
+    let (xl, yl) = (xs[n - 1], ys[n - 1]);
+    for v in l.iter_mut().skip(xl as usize) {
+        *v = yl as i32;
+    }
+    l
+}
+
 fn round2(x: i32, n: u32) -> i32 {
     if n == 0 { x } else { (x + (1 << (n - 1))) >> n }
 }
@@ -124,23 +157,7 @@ pub(crate) fn apply(pic: &mut Picture, g: &FilmGrainParams, seq: &SequenceHeader
         } else {
             (g.num_cr_points, &g.point_cr_value, &g.point_cr_scaling)
         };
-        if n == 0 {
-            continue;
-        }
-        for v in l.iter_mut().take(xs[0] as usize) {
-            *v = ys[0] as i32;
-        }
-        for i in 0..n - 1 {
-            let dy = ys[i + 1] as i32 - ys[i] as i32;
-            let dx = xs[i + 1] as i32 - xs[i] as i32;
-            let delta = dy * ((65536 + (dx >> 1)) / dx);
-            for x in 0..dx {
-                l[xs[i] as usize + x as usize] = ys[i] as i32 + ((x * delta + 32768) >> 16);
-            }
-        }
-        for v in l.iter_mut().skip(xs[n - 1] as usize) {
-            *v = ys[n - 1] as i32;
-        }
+        *l = scaling_lut(n, xs, ys);
     }
     let scale_lut = |plane: usize, index: i32| -> i32 {
         let sh = bd - 8;
@@ -272,5 +289,21 @@ pub(crate) fn apply(pic: &mut Picture, g: &FilmGrainParams, seq: &SequenceHeader
                 py[y * w + x] = (orig + noise).clamp(min_value, max_luma) as u16;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scaling_lut_interpolates_and_tolerates_duplicate_points() {
+        let l = scaling_lut(2, &[0, 255], &[0, 255]);
+        assert_eq!((l[0], l[128], l[255]), (0, 128, 255));
+        // Duplicate and descending x values don't divide by zero.
+        let l = scaling_lut(4, &[10, 10, 5, 200], &[20, 40, 60, 80]);
+        assert_eq!(l[0], 20);
+        assert_eq!(l[255], 80);
+        assert_eq!(scaling_lut(0, &[], &[]), [0; 256]);
     }
 }

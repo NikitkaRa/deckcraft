@@ -1,6 +1,7 @@
 //! DeckCraft desktop app.
 //!
 //! Usage: `deckcraft [--control <port>] [--sample] [--show] [files…]`
+//! `deckcraft --help` prints the flags and exits. `deckcraft --version` prints the version and exits.
 //!
 //! `--control <port>` (or `DECKCRAFT_CONTROL_PORT`) starts a localhost JSON-lines control server:
 //! `{"id":1,"method":"ui.inspect","params":{}}` → `{"id":1,"ok":true,"result":…}`.
@@ -14,9 +15,13 @@
 
 mod audio;
 mod control_server;
+#[cfg(all(unix, not(target_os = "macos")))]
+mod display;
 #[cfg(any(target_os = "windows", test))]
 mod graphics;
 mod logging;
+#[cfg(not(target_arch = "wasm32"))]
+mod pasteboard;
 
 use deckcraft_engine::Session;
 use deckcraft_ui_egui::{Services, SlideApp};
@@ -35,6 +40,16 @@ impl eframe::App for App {
     }
     fn on_exit(&mut self) {
         save_prefs(&self.0);
+        // macOS (#279): end the process here, before eframe tears the window down. AccessKit's
+        // macOS adapter subclasses the window's content view and restores its class on teardown;
+        // AppKit's Touch Bar support observes that view (KVO), so in the next display cycle
+        // `-[_NSTouchBarFinderObservation invalidate]` throws "not registered" and the quit ends
+        // in a crash report. eframe calls `on_exit` on every way of quitting (⌘Q, the close
+        // button, `app.quit`), once the unsaved-changes prompt has let the window close, and
+        // nothing after it is needed: the preferences are saved and the log file is unbuffered.
+        // `on_exit` only runs once the app exists, never on a failed start. Same as GridCraft #117.
+        #[cfg(target_os = "macos")]
+        std::process::exit(0);
     }
 }
 
@@ -52,24 +67,16 @@ fn config_dir() -> Option<std::path::PathBuf> {
     }
 }
 
-fn prefs_path() -> Option<std::path::PathBuf> {
-    config_dir().map(|b| b.join("ui.json"))
-}
-
 fn load_prefs(app: &mut SlideApp) {
     if std::env::var_os("DECKCRAFT_NO_PREFS").is_some() {
         return;
     }
-    if let Some(p) = prefs_path()
-        && let Ok(bytes) = std::fs::read(&p)
-        && let Ok(ui) = serde_json::from_slice::<deckcraft_ui_egui::UiState>(&bytes)
-    {
+    let Some(dir) = config_dir() else { return };
+    let (ui, prefs) = deckcraft_ui_egui::settings::load(&dir);
+    if let Some(ui) = ui {
         app.ui = ui;
     }
-    if let Some(p) = prefs_path().map(|p| p.with_file_name("prefs.json"))
-        && let Ok(bytes) = std::fs::read(&p)
-        && let Ok(prefs) = serde_json::from_slice::<deckcraft_engine::Prefs>(&bytes)
-    {
+    if let Some(prefs) = prefs {
         app.session.prefs = prefs;
     }
 }
@@ -78,14 +85,8 @@ fn save_prefs(app: &SlideApp) {
     if std::env::var_os("DECKCRAFT_NO_PREFS").is_some() {
         return;
     }
-    if let Some(p) = prefs_path() {
-        let _ = std::fs::create_dir_all(p.parent().unwrap_or(std::path::Path::new(".")));
-        if let Ok(bytes) = serde_json::to_vec_pretty(&app.ui) {
-            let _ = std::fs::write(&p, bytes);
-        }
-        if let Ok(bytes) = serde_json::to_vec_pretty(&app.session.prefs) {
-            let _ = std::fs::write(p.with_file_name("prefs.json"), bytes);
-        }
+    if let Some(dir) = config_dir() {
+        deckcraft_ui_egui::settings::save(&dir, &app.ui, &app.session.prefs);
     }
 }
 
@@ -100,6 +101,7 @@ fn services() -> Services {
                     &["wav", "mp3", "m4a", "m4b", "aac", "flac", "ogg", "oga", "opus", "aif", "aiff", "aifc", "caf", "wma", "weba", "mka"],
                 ),
                 "video" => d.add_filter("Video", &["mp4", "m4v", "mov", "webm", "mkv", "wmv"]),
+                "theme" => d.add_filter("Themes and presentations", &["thmx", "pptx", "potx", "ppsx"]).add_filter("Office Theme", &["thmx"]),
                 _ => d
                     .add_filter("Presentations", &["deckcraft", "pptx", "potx", "ppsx"])
                     .add_filter("DeckCraft", &["deckcraft"])
@@ -111,14 +113,9 @@ fn services() -> Services {
         pick_save: Some(Box::new(|name: &str| rfd::FileDialog::new().set_file_name(name).save_file().map(|p| p.to_string_lossy().to_string()))),
         read: Some(Box::new(|p: &str| std::fs::read(p).map_err(|e| e.to_string()))),
         write: Some(Box::new(|p: &str, b: &[u8]| std::fs::write(p, b).map_err(|e| e.to_string()))),
-        clipboard_image: Some(Box::new(|| {
-            let mut cb = arboard::Clipboard::new().ok()?;
-            let img = cb.get_image().ok()?;
-            let rgba = image::RgbaImage::from_raw(img.width as u32, img.height as u32, img.bytes.into_owned())?;
-            let mut out = Vec::new();
-            rgba.write_to(&mut std::io::Cursor::new(&mut out), image::ImageFormat::Png).ok()?;
-            Some(out)
-        })),
+        clipboard_image: Some(Box::new(pasteboard::image_png)),
+        clipboard_html: Some(Box::new(pasteboard::html)),
+        clipboard_set_html: Some(Box::new(pasteboard::set_html)),
         // Media is mixed and clocked by the output device; `DECKCRAFT_NO_AUDIO` plays silently.
         audio_out: std::env::var_os("DECKCRAFT_NO_AUDIO")
             .is_none()
@@ -129,6 +126,41 @@ fn services() -> Services {
 
 const APP_ID: &str = "ai.storyteller.deckcraft";
 
+const USAGE: &str = "\
+Usage: deckcraft [--control PORT] [--sample] [--show] [FILE...]
+
+  --control PORT  JSON control server on 127.0.0.1:PORT
+  --sample        open the sample presentation
+  --show          start the slide show
+  --help, -h      print this help and exit
+  --version, -V   print the version and exit
+";
+
+enum Startup {
+    Help,
+    Version,
+    Run { control_port: Option<u16>, files: Vec<String>, sample: bool, show: bool },
+}
+
+/// `--help` and `--version` leave before the window and the log file.
+fn startup(mut control_port: Option<u16>, args: impl IntoIterator<Item = String>) -> Startup {
+    let mut files = Vec::new();
+    let mut sample = false;
+    let mut show = false;
+    let mut args = args.into_iter();
+    while let Some(a) = args.next() {
+        match a.as_str() {
+            "--control" => control_port = args.next().and_then(|p| p.parse().ok()),
+            "--sample" => sample = true,
+            "--show" => show = true,
+            "--version" | "-V" => return Startup::Version,
+            "--help" | "-h" => return Startup::Help,
+            _ => files.push(a),
+        }
+    }
+    Startup::Run { control_port, files, sample, show }
+}
+
 fn app_icon() -> Option<egui::IconData> {
     let png: &[u8] = include_bytes!("../../../assets/app-icon/hicolor/256x256/apps/ai.storyteller.deckcraft.png");
     eframe::icon_data::from_png_bytes(png).map_err(|e| log::warn!("app icon: {e}")).ok()
@@ -138,26 +170,21 @@ fn main() -> eframe::Result {
     // First, so every start-up record (and the engine's panic hook, installed with the first
     // Session) is captured; see `logging`.
     let logger = logging::install();
-    let mut control_port: Option<u16> = std::env::var("DECKCRAFT_CONTROL_PORT").ok().and_then(|p| p.parse().ok());
-    let mut files = Vec::new();
-    let mut sample = false;
-    let mut show = false;
-    let mut args = std::env::args().skip(1);
-    while let Some(a) = args.next() {
-        match a.as_str() {
-            "--control" => control_port = args.next().and_then(|p| p.parse().ok()),
-            "--sample" => sample = true,
-            "--show" => show = true,
-            "--version" => {
+    let (control_port, files, sample, show) =
+        match startup(std::env::var("DECKCRAFT_CONTROL_PORT").ok().and_then(|p| p.parse().ok()), std::env::args().skip(1)) {
+            Startup::Help => {
+                print!("{USAGE}");
+                return Ok(());
+            }
+            Startup::Version => {
                 println!("deckcraft {}", env!("CARGO_PKG_VERSION"));
                 return Ok(());
             }
-            _ => files.push(a),
-        }
-    }
+            Startup::Run { control_port, files, sample, show } => (control_port, files, sample, show),
+        };
     log::info!("DeckCraft {} ({} {})", env!("CARGO_PKG_VERSION"), std::env::consts::OS, std::env::consts::ARCH);
-    // The log file lives under the settings directory; opened after the arguments, so `--version`
-    // leaves no file behind. Records logged until now are written to it first.
+    // The log file lives under the settings directory; opened after the arguments, so `--help` and
+    // `--version` leave no file behind. Records logged until now are written to it first.
     if let Some(logger) = logger {
         match config_dir().map(|d| logger.attach_dir(&d.join(logging::LOG_DIR))) {
             Some(Ok(path)) => log::info!("log file {}", path.display()),
@@ -184,15 +211,26 @@ fn main() -> eframe::Result {
         options.viewport = options.viewport.with_icon(icon);
     }
     #[cfg(all(unix, not(target_os = "macos")))]
-    if std::env::var_os("DISPLAY").is_some() && std::env::var_os("DECKCRAFT_WAYLAND").is_none() {
+    let x11 = match display::choose_from_env() {
+        display::Choice::X11 => true,
+        display::Choice::Default => false,
+        display::Choice::None => {
+            // winit's own error says little to someone who started DeckCraft from a console.
+            log::error!("no display: DISPLAY and WAYLAND_DISPLAY are not set");
+            eprintln!("DeckCraft needs a graphical session: neither DISPLAY nor WAYLAND_DISPLAY is set.");
+            false
+        }
+    };
+    #[cfg(all(unix, not(target_os = "macos")))]
+    if x11 {
         options.event_loop_builder = Some(Box::new(|b| {
             use winit::platform::x11::EventLoopBuilderExtX11;
             b.with_x11();
         }));
     }
-    // Before eframe creates the wgpu instance: default Windows to DirectX 12 only (see graphics.rs).
+    // Before eframe creates the wgpu instance: default Windows to DirectX 12 with FXC (see graphics.rs).
     #[cfg(target_os = "windows")]
-    graphics::configure(&mut options, eframe::wgpu::Backends::from_env());
+    graphics::configure(&mut options, eframe::wgpu::Backends::from_env(), eframe::wgpu::Dx12Compiler::from_env());
     eframe::run_native(
         "DeckCraft",
         options,
@@ -227,4 +265,48 @@ fn main() -> eframe::Result {
             Ok(Box::new(App(app)))
         }),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// #279: on macOS the process ends inside `on_exit`, before eframe would tear the window down.
+    /// The check runs in a child (this test binary again), since on macOS it ends the process.
+    #[test]
+    fn on_exit_ends_the_process_on_macos() {
+        if std::env::var_os("DECKCRAFT_TEST_ON_EXIT").is_some() {
+            let mut app = App(SlideApp::new(Session::new(), Services::default()));
+            println!("calling on_exit");
+            eframe::App::on_exit(&mut app);
+            println!("on_exit returned");
+            return;
+        }
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "tests::on_exit_ends_the_process_on_macos", "--nocapture"])
+            .env("DECKCRAFT_TEST_ON_EXIT", "1")
+            .env("DECKCRAFT_NO_PREFS", "1")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(out.status.success(), "{stdout}");
+        assert!(stdout.contains("calling on_exit"), "the child didn't run the test: {stdout}");
+        assert_eq!(stdout.contains("on_exit returned"), !cfg!(target_os = "macos"), "{stdout}");
+    }
+
+    #[test]
+    fn help_exits_instead_of_opening_a_file() {
+        assert!(matches!(startup(None, ["--help".to_string()]), Startup::Help));
+        assert!(matches!(startup(None, ["-h".to_string()]), Startup::Help));
+        assert!(matches!(startup(None, ["talk.pptx".to_string(), "--help".to_string()]), Startup::Help));
+        assert!(matches!(startup(None, ["--version".to_string()]), Startup::Version));
+        let launch = startup(Some(9), ["--sample".to_string(), "--control".to_string(), "4242".to_string(), "talk.pptx".to_string()]);
+        assert!(matches!(launch, Startup::Run { .. }));
+        if let Startup::Run { control_port, files, sample, show } = launch {
+            assert_eq!(control_port, Some(4242));
+            assert_eq!(files, ["talk.pptx".to_string()]);
+            assert!(sample);
+            assert!(!show);
+        }
+    }
 }

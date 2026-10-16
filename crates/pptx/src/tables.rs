@@ -229,6 +229,16 @@ pub fn table_styles_xml(used: &[String], defs: &[deckcraft_model::table::TableSt
         let name = names.iter().find(|(id, _)| id == s).map(|(_, n)| format!("DeckCraft {n}")).unwrap_or_else(|| s.clone());
         style_def(&mut w, s, &name);
     }
+    // Styles the file defined but no table uses still belong to the deck.
+    for d in defs {
+        if done.iter().any(|s| s.eq_ignore_ascii_case(&d.id)) {
+            continue;
+        }
+        if crate::xml::parse(d.raw.as_bytes()).is_ok_and(|x| x.root.is("tblStyle")) {
+            done.push(&d.id);
+            w.raw(&d.raw);
+        }
+    }
     w.close("a:tblStyleLst");
     w.finish()
 }

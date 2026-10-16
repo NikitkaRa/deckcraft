@@ -144,7 +144,7 @@ pub struct SliceHeader {
 
 impl SliceHeader {
     pub fn qp(&self, pps: &Pps) -> i32 {
-        pps.pic_init_qp + self.slice_qp_delta
+        pps.pic_init_qp.saturating_add(self.slice_qp_delta)
     }
     pub fn has_mmco5(&self) -> bool {
         self.mmcos.iter().any(|m| m.op == 5)
@@ -315,7 +315,7 @@ impl SliceHeader {
             ensure!(cabac_init_idc <= 2, "cabac_init_idc out of range");
         }
         let slice_qp_delta = r.read_se()?;
-        let qp = pps.pic_init_qp + slice_qp_delta;
+        let qp = pps.pic_init_qp.checked_add(slice_qp_delta).ok_or_else(|| crate::Error::Invalid("slice QP out of range".into()))?;
         ensure!((0..=51).contains(&qp), "slice QP {qp} out of range");
         let mut sp_for_switch = false;
         let mut slice_qs_delta = 0;

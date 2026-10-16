@@ -1,5 +1,7 @@
 //! A slide's animation sequence: click steps, effect start times and per-shape state over time.
 
+use std::collections::{HashMap, HashSet};
+
 use deckcraft_model::anim::TextBuild;
 use deckcraft_model::style::Fill;
 use deckcraft_model::{AnimClass, AnimStart, Animation, ColorScheme, Rgba, SchemeSlot, ShapeId, Slide, Xfrm};
@@ -55,6 +57,16 @@ pub struct TriggerPlay {
     pub trigger: ShapeId,
     pub step: usize,
     pub t: f64,
+}
+
+/// When a step of a triggered sequence was started, counted in started steps on the slide. Effects
+/// of different triggers apply in this order, so that a shape hidden by one trigger and shown again
+/// by another ends up as the later of the two left it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct StepStamp {
+    pub trigger: ShapeId,
+    pub step: usize,
+    pub at: u64,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -151,25 +163,31 @@ impl Timeline {
         let accent = scheme.map(|s| s.get(SchemeSlot::Accent1)).unwrap_or(Rgba::rgb(0x15, 0x60, 0x82));
 
         let mut tl = Timeline::default();
-        // Sequences in order of first appearance: main first.
-        let mut seqs: Vec<Sequence> = vec![Sequence::Main];
-        for a in &slide.animations {
-            if let Some(tr) = a.trigger {
-                let s = Sequence::Trigger(tr);
-                if !seqs.contains(&s) {
-                    seqs.push(s);
-                }
+        // Group the animations by sequence in one pass, sequences in order of first appearance
+        // (main first), so many distinct triggers cost linear work, not a scan per trigger.
+        let mut seqs: Vec<(Sequence, Vec<usize>)> = vec![(Sequence::Main, Vec::new())];
+        let mut seq_index: HashMap<Sequence, usize> = HashMap::from([(Sequence::Main, 0)]);
+        for (ai, a) in slide.animations.iter().enumerate() {
+            let s = a.trigger.map(Sequence::Trigger).unwrap_or(Sequence::Main);
+            let i = *seq_index.entry(s).or_insert_with(|| {
+                seqs.push((s, Vec::new()));
+                seqs.len() - 1
+            });
+            if let Some((_, members)) = seqs.get_mut(i) {
+                members.push(ai);
             }
         }
-        for seq in seqs {
+        // Paragraph groups already recorded (the list itself keeps their order).
+        let mut grouped: HashSet<(ShapeId, usize, usize)> = HashSet::new();
+        for (seq, members) in seqs {
+            if tl.effects.len() >= MAX_EFFECTS {
+                break;
+            }
             let mut steps: Vec<StepInfo> = Vec::new();
             let mut group_begin = 0.0f64;
             let mut max_end = 0.0f64;
-            for (ai, a) in slide.animations.iter().enumerate() {
-                let aseq = a.trigger.map(Sequence::Trigger).unwrap_or(Sequence::Main);
-                if aseq != seq {
-                    continue;
-                }
+            for ai in members {
+                let Some(a) = slide.animations.get(ai) else { continue };
                 if tl.effects.len() >= MAX_EFFECTS {
                     break;
                 }
@@ -188,7 +206,7 @@ impl Timeline {
                                     owner = Some(i);
                                     v.push(Some(i));
                                 } else if let Some(o) = owner
-                                    && !tl.groups.contains(&(a.shape, i, o))
+                                    && grouped.insert((a.shape, i, o))
                                 {
                                     tl.groups.push((a.shape, i, o));
                                 }
@@ -249,7 +267,9 @@ impl Timeline {
                     max_end = max_end.max(end);
                     let step = steps.len().saturating_sub(1);
                     if let Some(s) = steps.last_mut() {
-                        s.duration = s.duration.max(end);
+                        // Media plays on by itself once started: it holds back an After Previous
+                        // effect (`max_end`), but not the next click (#116).
+                        s.duration = s.duration.max(if a.class == AnimClass::Media { start } else { end });
                     }
                     tl.effects.push(Effect {
                         timing: EffectTiming {
@@ -306,6 +326,20 @@ impl Timeline {
     /// Duration of main step `i` in seconds (0 when out of range).
     pub fn step_duration(&self, i: usize) -> f64 {
         self.main.get(i).map(|s| s.duration).unwrap_or(0.0)
+    }
+
+    /// Media effects (Play, Pause, Stop) of main step `step` that start after `from` and by `to`
+    /// seconds into it, in order: what a show running the step from `from` to `to` sets off.
+    pub fn media_cues(&self, step: usize, from: f64, to: f64) -> Vec<EffectTiming> {
+        let mut v: Vec<EffectTiming> = self
+            .effects
+            .iter()
+            .map(|e| &e.timing)
+            .filter(|e| e.class == AnimClass::Media && e.sequence == Sequence::Main && e.step == step && e.start > from && e.start <= to)
+            .cloned()
+            .collect();
+        v.sort_by(|a, b| a.start.total_cmp(&b.start));
+        v
     }
 
     /// Total duration of the main sequence played without pauses.
@@ -379,6 +413,21 @@ impl Timeline {
 
     /// [`Timeline::state`] with the playheads of triggered sequences.
     pub fn state_with(&self, shape: ShapeId, para: Option<usize>, step: usize, t: f64, triggers: &[TriggerPlay]) -> AnimState {
+        self.state_ordered(shape, para, step, t, triggers, &[])
+    }
+
+    /// [`Timeline::state_with`] applying the effects of triggered sequences in the order their steps
+    /// were started (`stamps`), after those of the main sequence. Without stamps they apply in
+    /// Animation Pane order.
+    pub fn state_ordered(
+        &self,
+        shape: ShapeId,
+        para: Option<usize>,
+        step: usize,
+        t: f64,
+        triggers: &[TriggerPlay],
+        stamps: &[StepStamp],
+    ) -> AnimState {
         let para = para.map(|p| self.groups.iter().find(|g| g.0 == shape && g.1 == p).map(|g| g.2).unwrap_or(p));
         let mine = self.effects.iter().filter(|e| e.timing.shape == shape && e.timing.paragraph == para);
         let base_color = self.colors.iter().find(|(s, _)| *s == shape).map(|(_, c)| *c).unwrap_or(Rgba::rgb(0x15, 0x60, 0x82));
@@ -391,7 +440,16 @@ impl Timeline {
         {
             st.visible = false;
         }
-        // Then play in time order: main sequence first, then triggered sequences.
+        // Then play in time order: main sequence first, then triggered sequences as they were clicked.
+        if !stamps.is_empty() {
+            let when = |e: &Effect| match e.timing.sequence {
+                Sequence::Main => 0,
+                Sequence::Trigger(tr) => {
+                    stamps.iter().find(|s| s.trigger == tr && s.step == e.timing.step).map_or(u64::MAX, |s| s.at.saturating_add(1))
+                }
+            };
+            ordered.sort_by_key(|e| (when(e), e.timing.anim));
+        }
         for e in &ordered {
             let (pstep, pt) = match e.timing.sequence {
                 Sequence::Main => (step, t),
@@ -471,7 +529,8 @@ fn build_spec(a: &Animation, xf: Xfrm, sw: f64, sh: f64, resolve: &dyn Fn(&deckc
     EffectSpec {
         class: a.class,
         effect,
-        option: a.option.clone(),
+        // Sink Down is Rise Up played backwards, leaving downward.
+        option: if a.effect == "sinkDown" { "d".into() } else { a.option.clone() },
         accel: a.smooth_start,
         decel: a.smooth_end,
         bounce: a.bounce_end,

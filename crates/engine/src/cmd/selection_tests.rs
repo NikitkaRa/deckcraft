@@ -201,7 +201,7 @@ fn locked_objects_are_picked_on_the_canvas_but_not_dragged() {
     s.execute("shape.lock", &json!({"id": a, "locked": true})).unwrap();
     s.execute("edit.select", &json!({"ids": []})).unwrap();
     let n = s.doc().unwrap().history.undo.len();
-    let ev = |kind, x, y| PointerEvent { kind, x, y, mods: Mods::default(), tol: 3.0 };
+    let ev = |kind, x, y| PointerEvent { kind, x, y, mods: Mods::default(), tol: 3.0, pressure: None };
     // A: x 20..120, y 50..130.
     s.pointer(ev(PointerKind::Down, 60.0, 90.0)).unwrap();
     assert_eq!(selected(&s), vec![a], "a click selects a locked object");

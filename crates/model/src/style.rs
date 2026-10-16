@@ -143,6 +143,18 @@ pub struct PictureFill {
     /// flipped.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub upright: bool,
+    /// An artistic effect (Picture Format ▸ Artistic Effects). `media` is then the processed
+    /// picture; the original is kept to change or remove the effect.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub artistic: Option<Artistic>,
+}
+
+/// An applied artistic effect: its `a14` name (e.g. `artisticBlur`) and the original picture.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Artistic {
+    pub effect: String,
+    pub original: MediaId,
 }
 
 /// Picture corrections and colour (Picture Format ▸ Corrections / Color / Transparency).

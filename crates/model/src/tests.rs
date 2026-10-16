@@ -37,7 +37,7 @@ fn placeholder_inherits_position_and_styles() {
 fn body_levels_from_master() {
     let mut p = Presentation::default();
     let lay = defaults::layout_of_kind(&p, LayoutType::TitleAndContent).unwrap();
-    let s = defaults::new_slide(&mut p, lay);
+    let s = defaults::new_slide(&mut p, lay).expect("slide");
     let ctx = Ctx::for_slide(&p, &s).unwrap();
     let body = &s.shapes[1];
     assert_eq!(body.ph_type(), Some(PhType::Obj));
@@ -97,16 +97,28 @@ fn serde_roundtrip() {
     assert!(q.slides.is_empty());
 }
 
+/// A deck whose ids are used up (a hostile file can arrive that way) yields no further ids:
+/// allocating never repeats one (#407).
+#[test]
+fn exhausted_id_space_allocates_nothing() {
+    let mut p = Presentation { next_id: u32::MAX, ..Default::default() };
+    assert_eq!(p.alloc_id(), None);
+    assert_eq!(p.alloc_id(), None);
+    assert!(p.add_media("x.png", "image/png", vec![9]).is_none(), "fresh media bytes are refused too");
+    let lay = defaults::layout_of_kind(&p, LayoutType::TitleAndContent).unwrap_or_default();
+    assert!(defaults::new_slide(&mut p, lay).is_none(), "a new slide is refused");
+}
+
 #[test]
 fn ids_are_unique_and_fix_next_id() {
     let mut p = Presentation::default();
-    let a = p.alloc_id();
-    let b = p.alloc_id();
+    let a = p.alloc_id().expect("ids");
+    let b = p.alloc_id().expect("ids");
     assert!(b > a);
     p.next_id = 0;
     p.fix_next_id();
     assert!(p.next_id >= b.min(p.next_id));
-    let c = p.alloc_id();
+    let c = p.alloc_id().expect("ids");
     let mut all = vec![];
     for s in &p.slides {
         all.push(s.id.0);
@@ -165,7 +177,14 @@ fn hyperlinked_runs_take_the_theme_hyperlink_look() {
     let ctx = Ctx::for_slide(&p, s).unwrap();
     let title = &s.shapes[0];
     let para = Paragraph::default();
-    let link = Some(Hyperlink { action: Action::Url { url: "https://example.org".into() }, tooltip: String::new(), highlight_click: false });
+    let link = Some(Hyperlink {
+        action: Action::Url { url: "https://example.org".into() },
+        tooltip: String::new(),
+        highlight_click: false,
+        sound: None,
+        stop_sound: false,
+        zoom_return: None,
+    });
     let hlink = Some(Fill::solid(ColorRef::scheme(SchemeSlot::Hlink)));
     // The title's master style colours its text tx1; a link is hlink and underlined instead.
     assert_eq!(resolve::run(&ctx, title, &para, &RunProps::default()).fill, Some(Fill::solid(ColorRef::scheme(SchemeSlot::Tx1))));
@@ -173,7 +192,14 @@ fn hyperlinked_runs_take_the_theme_hyperlink_look() {
     assert_eq!((r.fill, r.underline.as_deref()), (hlink.clone(), Some("sng")));
     assert_eq!(ctx.color(&ColorRef::scheme(SchemeSlot::Hlink), None), p.masters[0].theme.colors.get(SchemeSlot::Hlink));
     // A slide link looks the same.
-    let slide = Some(Hyperlink { action: Action::Slide { slide: s.id }, tooltip: String::new(), highlight_click: false });
+    let slide = Some(Hyperlink {
+        action: Action::Slide { slide: s.id },
+        tooltip: String::new(),
+        highlight_click: false,
+        sound: None,
+        stop_sound: false,
+        zoom_return: None,
+    });
     assert_eq!(resolve::run(&ctx, title, &para, &RunProps { link: slide, ..Default::default() }).fill, hlink);
     // The run's own colour and underline win; u="none" removes the underline.
     let red = Some(Fill::solid(ColorRef::rgb(deckcraft_color::Rgba::rgb(255, 0, 0))));
@@ -230,4 +256,17 @@ fn sibling_lists_and_parents_reach_into_groups() {
     assert_eq!(sibling_list_mut(&mut tree, ShapeId(4)).map(|v| ids(v)), Some(vec![3, 4]));
     assert_eq!(sibling_list_mut(&mut tree, ShapeId(5)).map(|v| ids(v)), Some(vec![5]));
     assert!(sibling_list_mut(&mut tree, ShapeId(9)).is_none());
+}
+
+#[test]
+fn ink_width_follows_pressure_and_keeps_the_old_placeholder() {
+    assert!(ink_pressure_is_legacy(&[(0.0, 0.0, 0.5), (1.0, 1.0, 0.5)]));
+    assert!(!ink_pressure_is_legacy(&[(0.0, 0.0, 0.5), (1.0, 1.0, 1.0)]));
+    assert!(!ink_pressure_is_legacy(&[]));
+    assert!((ink_sample_width(8.0, 0.5, true) - 8.0).abs() < 1e-9);
+    assert!((ink_sample_width(8.0, 1.0, false) - 8.0).abs() < 1e-9);
+    assert!((ink_sample_width(8.0, 0.25, false) - 2.0).abs() < 1e-9);
+    let floor = ink_sample_width(8.0, 0.0, false);
+    assert!((floor - 0.64).abs() < 1e-4, "a light touch stays visible, got {floor}");
+    assert!((ink_sample_width(8.0, f32::NAN, false) - 8.0).abs() < 1e-9);
 }

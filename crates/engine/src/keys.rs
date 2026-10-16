@@ -57,6 +57,11 @@ impl Session {
         if self.tool.drawing_freeform() && matches!(k, "enter" | "return" | "escape") {
             return self.finish_freeform(false);
         }
+        if self.tool.edit_points.is_some() && matches!(k, "enter" | "return" | "escape") {
+            self.tool.edit_points = None;
+            self.tool.edit_vertex = None;
+            return Ok(json!({"handled": true, "command": "shape.editPoints"}));
+        }
         if editing && let Some((id, params)) = self.text_key(k, mods) {
             let r = self.execute(id, &params)?;
             return Ok(json!({"handled": true, "command": id, "result": r}));
@@ -285,15 +290,22 @@ impl Session {
         let Some(t) = st.selection.text.clone() else { return Ok(Value::Null) };
         let Some((r, c)) = t.cell else { return Ok(Value::Null) };
         let Some(deckcraft_model::ShapeKind::Table(tb)) = st.shape(t.shape).map(|s| s.kind.clone()) else { return Ok(Value::Null) };
-        let (nr, nc) = (tb.n_rows(), tb.n_cols());
+        let (nr, nc) = (tb.n_rows(), tb.n_cols().max(1));
         let idx = r * nc + c;
-        if !back && idx + 1 >= nr * nc {
-            // Tab in the last cell adds a row.
-            self.execute("table.insertRowBelow", &json!({"id": t.shape, "row": r}))?;
-            return self.execute("text.edit", &json!({"id": t.shape, "cell": [r + 1, 0]}));
-        }
-        let ni = if back { idx.saturating_sub(1) } else { idx + 1 };
-        self.execute("text.edit", &json!({"id": t.shape, "cell": [ni / nc.max(1), ni % nc.max(1)]}))?;
+        // Cells hidden under a merged cell are skipped.
+        let visible = |i: &usize| tb.cell(i / nc, i % nc).is_some_and(|x| !x.is_covered());
+        let next = if back { (0..idx).rev().find(visible) } else { (idx + 1..nr * nc).find(visible) };
+        let ni = match next {
+            Some(ni) => ni,
+            None if !back => {
+                // Tab in the last cell adds a row.
+                let last = nr.saturating_sub(1);
+                self.execute("table.insertRowBelow", &json!({"id": t.shape, "row": last}))?;
+                return self.execute("text.edit", &json!({"id": t.shape, "cell": [last + 1, 0]}));
+            }
+            None => idx,
+        };
+        self.execute("text.edit", &json!({"id": t.shape, "cell": [ni / nc, ni % nc]}))?;
         self.execute("text.selectAll", &json!({}))
     }
 }

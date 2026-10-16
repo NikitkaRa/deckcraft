@@ -162,6 +162,86 @@ pub fn format(code: &str, v: f64, lang: Option<&str>) -> String {
         let s: String = toks.iter().filter_map(|t| if let Tok::Lit(s) = t { Some(s.as_str()) } else { None }).collect();
         return s.trim().to_string();
     };
+    let out = sci(&toks, v, sep, dec).unwrap_or_else(|| fixed(&toks, first, last, v, sep, dec));
+    let out = out.trim();
+    if minus && !out.is_empty() { format!("-{out}") } else { out.to_string() }
+}
+
+/// The text of the literal and percent tokens in `ts`.
+fn lits(ts: &[Tok]) -> String {
+    ts.iter()
+        .filter_map(|t| match t {
+            Tok::Lit(s) => Some(s.clone()),
+            Tok::Percent => Some("%".into()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Scientific notation (`0.00E+00`, `##0.0E-0`): the mantissa takes the placeholders before the `E`,
+/// the exponent's sign and minimum width come from what follows it; with several integer
+/// placeholders the exponent is a multiple of their count (engineering notation). `None` if the
+/// section has no exponent part.
+fn sci(toks: &[Tok], v: f64, sep: char, dec: char) -> Option<String> {
+    let e = toks.iter().position(|t| matches!(t, Tok::Lit(s) if s.as_str() == "E" || s.as_str() == "e"))?;
+    let e_char = if let Some(Tok::Lit(s)) = toks.get(e) { s.as_str() } else { "E" };
+    let plus = match toks.get(e + 1)? {
+        Tok::Lit(s) if s.as_str() == "+" => true,
+        Tok::Lit(s) if s.as_str() == "-" => false,
+        _ => return None,
+    };
+    let mant = toks.get(..e)?;
+    let mfirst = mant.iter().position(|t| matches!(t, Tok::Digit(_)))?;
+    let mlast = mant.iter().rposition(|t| matches!(t, Tok::Digit(_)))?;
+    let exp_toks = toks.get(e + 2..)?;
+    let exp_len = exp_toks.iter().take_while(|t| matches!(t, Tok::Digit(_))).count();
+    if exp_len == 0 {
+        return None;
+    }
+    let width = exp_toks.iter().take(exp_len).filter(|t| **t == Tok::Digit('0')).count();
+    let rest = exp_toks.get(exp_len..).unwrap_or(&[]);
+    let mant_frac = mant.iter().skip_while(|t| **t != Tok::Dot).filter(|t| matches!(t, Tok::Digit(_))).count();
+    let (mut m, mut exp) = (0.0, 0i32);
+    if v != 0.0 {
+        exp = v.log10().floor() as i32;
+        m = v / 10f64.powi(exp);
+        if !m.is_finite() {
+            m = 0.0;
+            exp = 0;
+        }
+        if m >= 10.0 {
+            m /= 10.0;
+            exp += 1;
+        } else if m < 1.0 {
+            m *= 10.0;
+            exp -= 1;
+        }
+        // Rounding the mantissa to its digits can reach 10 (9.999 as `0.00`).
+        if format!("{m:.mant_frac$}").starts_with("10") {
+            m /= 10.0;
+            exp += 1;
+        }
+    }
+    let step = mant.iter().take_while(|t| **t != Tok::Dot).filter(|t| matches!(t, Tok::Digit(_))).count().max(1) as i32;
+    let shift = exp.rem_euclid(step);
+    exp -= shift;
+    m *= 10f64.powi(shift);
+    let mantissa = fixed(mant, mfirst, mlast, m, sep, dec);
+    let sign = if exp < 0 {
+        "-"
+    } else if plus {
+        "+"
+    } else {
+        ""
+    };
+    let digits = exp.unsigned_abs().to_string();
+    let pad = "0".repeat(width.saturating_sub(digits.len()));
+    Some(format!("{mantissa}{e_char}{sign}{pad}{digits}{}", lits(rest)))
+}
+
+/// `v` (not negative) in the fixed-point format whose tokens are `toks`, with its digits from
+/// `first` to `last`.
+fn fixed(toks: &[Tok], first: usize, last: usize, v: f64, sep: char, dec: char) -> String {
     let percent = toks.contains(&Tok::Percent);
     let number = toks.get(first..=last).unwrap_or(&[]);
     let dot = number.iter().position(|t| *t == Tok::Dot);
@@ -195,20 +275,9 @@ pub fn format(code: &str, v: f64, lang: Option<&str>) -> String {
         num.push(dec);
         num.push_str(&fp);
     }
-    let lits = |ts: &[Tok]| -> String {
-        ts.iter()
-            .filter_map(|t| match t {
-                Tok::Lit(s) => Some(s.clone()),
-                Tok::Percent => Some("%".into()),
-                _ => None,
-            })
-            .collect()
-    };
     let before = lits(toks.get(..first).unwrap_or(&[]));
     let after = lits(toks.get(last + 1..).unwrap_or(&[]));
-    let out = format!("{before}{num}{after}");
-    let out = out.trim();
-    if minus && !out.is_empty() { format!("-{out}") } else { out.to_string() }
+    format!("{before}{num}{after}")
 }
 
 #[cfg(test)]
@@ -243,6 +312,24 @@ mod tests {
         assert_eq!(format("0;0", -3.0, None), "3");
         assert_eq!(format("0", -3.0, None), "-3");
         assert_eq!(format("\"x\"0", 5.0, None), "x5");
+    }
+
+    #[test]
+    fn scientific_formats() {
+        assert_eq!(format("0.00E+00", 1234.0, None), "1.23E+03");
+        assert_eq!(format("0.00E+00", 1234.0, Some("ru-RU")), "1,23E+03");
+        assert_eq!(format("0.00E+00", 0.00012, None), "1.20E-04");
+        assert_eq!(format("0.00E+00", -1234.0, None), "-1.23E+03");
+        assert_eq!(format("0.00E+00", 0.0, None), "0.00E+00");
+        assert_eq!(format("0.0E+000", 5e10, None), "5.0E+010");
+        assert_eq!(format("0.0E-0", 1234.0, None), "1.2E3");
+        assert_eq!(format("0.0E-0", 0.0012, None), "1.2E-3");
+        assert_eq!(format("0E+00", 9999.0, None), "1E+04");
+        assert_eq!(format("0.00E+00", 9.999, None), "1.00E+01");
+        assert_eq!(format("0.00e+00", 1234.0, None), "1.23e+03");
+        assert_eq!(format("##0.0E+0", 12_345.0, None), "12.3E+3");
+        assert_eq!(format("##0.0E+0", 0.012, None), "12.0E-3");
+        assert_eq!(format("##0.0E+0", 999.96, None), "1.0E+3");
     }
 
     #[test]

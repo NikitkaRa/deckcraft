@@ -794,7 +794,11 @@ fn honeycomb(t: f64, a: f64) -> Vec<Layer> {
     let cols = 11usize;
     let w = 1.0 / cols as f64;
     let rh = w * a * 0.5;
-    let rows = (1.0 / (rh * 1.5)).ceil() as usize + 2;
+    // Rows sit 0.866*rh apart; a settled hex reaches only 0.577*rh from its centre at the side
+    // vertices, and the flat bottom zone 0.289*rh. Count the rows whose FLAT zone still covers
+    // the slide's bottom: counting the vertex reach instead left V-notches of black above the
+    // bottom edge on about a third of the aspect ratios (#420).
+    let rows = ((1.0 / (rh * 0.866) - 1.0 / 3.0).ceil().max(1.0)) as usize + 1;
     let mut v = vec![Layer::full(Black, 1.0)];
     let seam = ss(win(t, 0.0, 0.12)) * (1.0 - ss(win(t, 0.85, 1.0)));
     let hex = |cx: f64, cy: f64, s: f64| -> Vec<[f64; 2]> {

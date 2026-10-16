@@ -618,3 +618,29 @@ fn slices_without_tiles() {
     ];
     run("slices", None, false, segs);
 }
+
+/// Decode with a memory budget of `budget` bytes; true if every picture came out without error.
+fn decodes_within(stream: &[u8], budget: u64) -> bool {
+    let mut dec = Decoder::with_threads(1);
+    dec.set_memory_budget(budget);
+    let mut pics = match dec.decode(stream, 0) {
+        Ok(p) => p,
+        Err(_) => return false,
+    };
+    pics.extend(dec.flush());
+    dec.take_error().is_none() && pics.len() == 5
+}
+
+#[test]
+fn picture_store_is_checked_against_the_memory_budget() {
+    let (stream, _) = sequence(&None, true, whole(WC * HC));
+    let sps_nal = sps(true);
+    let parsed = crate::params::Sps::parse(&deckcraft_bitstream::unescape_rbsp(&sps_nal[6..])).unwrap();
+    // 96x64 4:2:0 in 16-bit samples; the decoder holds the DPB, the current picture and up to
+    // threads + 2 in flight.
+    let one = (W * H + 2 * (W / 2) * (H / 2)) as u64 * 2;
+    let pictures = u64::from(parsed.max_dec_pic_buffering) + 1 + 3;
+    assert!(decodes_within(&stream, pictures * one));
+    assert!(!decodes_within(&stream, pictures * one - 1));
+    assert!(decodes_within(&stream, deckcraft_bitstream::budget::DECODE_MEMORY_BUDGET));
+}

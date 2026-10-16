@@ -539,3 +539,74 @@ fn poc_type1_reordering() {
         }
     }
 }
+
+/// One IDR picture of PCM macroblocks.
+fn idr_stream(max_refs: u32) -> Vec<u8> {
+    let mut seed = 5u32;
+    let mbs: Vec<Option<Vec<u8>>> = (0..NMB).map(|_| Some(random_mb(&mut seed))).collect();
+    let mut stream = sps(66, max_refs, false, PocType::T2);
+    stream.extend(pps(false, false));
+    stream.extend(slice_nal(&Pic { idr: true, frame_num: 0, ref_idc: 3, mbs, ..Default::default() }, false));
+    stream
+}
+
+fn decodes_within(stream: &[u8], budget: u64) -> bool {
+    let mut dec = Decoder::with_threads(1);
+    dec.set_memory_budget(budget);
+    let Ok(mut out) = dec.decode(stream, 0) else { return false };
+    out.extend(dec.flush());
+    dec.take_error().is_none() && out.len() == 1
+}
+
+#[test]
+fn picture_store_is_checked_against_the_memory_budget() {
+    let stream = idr_stream(4);
+    let sps_nal = sps(66, 4, false, PocType::T2);
+    let parsed = crate::params::Sps::parse(&deckcraft_bitstream::unescape_rbsp(&sps_nal[5..])).unwrap();
+    // 4:2:0, 8-bit: luma plus two quarter-size chroma planes per picture; the DPB, the current
+    // picture and threads + 2 in flight.
+    let one = (NMB * 256 + 2 * NMB * 64) as u64;
+    let pictures = (parsed.max_dpb_frames() + 1 + 3) as u64;
+    assert!(decodes_within(&stream, pictures * one));
+    assert!(!decodes_within(&stream, pictures * one - 1));
+    assert!(decodes_within(&stream, deckcraft_bitstream::budget::DECODE_MEMORY_BUDGET));
+}
+
+#[test]
+fn largest_accepted_h264_size_is_over_the_default_budget() {
+    // 1024 x 1024 macroblocks (16384 x 16384) with 16 references and 3 in flight.
+    let shape =
+        deckcraft_bitstream::budget::PictureShape { width: 16384, height: 16384, shift_x: 1, shift_y: 1, chroma_planes: 2, bytes_per_sample: 1 };
+    assert!(!shape.fits(16 + 1 + 3, deckcraft_bitstream::budget::DECODE_MEMORY_BUDGET));
+}
+
+fn gap_stream(gaps: bool) -> Vec<u8> {
+    let mut seed = 7u32;
+    let a: Vec<Option<Vec<u8>>> = (0..NMB).map(|_| Some(random_mb(&mut seed))).collect();
+    let mut stream = sps(66, 2, gaps, PocType::T2);
+    stream.extend(pps(false, false));
+    stream.extend(slice_nal(&Pic { idr: true, frame_num: 0, ref_idc: 3, mbs: a, ..Default::default() }, false));
+    // frame_num 1..=9 are missing.
+    stream.extend(slice_nal(&Pic { frame_num: 10, ref_idc: 2, mbs: vec![None; NMB], ..Default::default() }, false));
+    stream
+}
+
+#[test]
+fn frame_num_gap_is_concealed_even_when_the_sps_forbids_gaps() {
+    // A cut or lossy stream: the gap is filled (bounded) instead of dropping the picture.
+    let mut dec = Decoder::with_threads(1);
+    let mut out = dec.decode(&gap_stream(false), 0).unwrap();
+    out.extend(dec.flush());
+    assert_eq!(out.len(), 2);
+    assert_eq!(dec.stats().frame_num_gaps, 1);
+}
+
+#[test]
+fn frame_num_gap_is_filled_when_the_sps_allows_gaps() {
+    let mut dec = Decoder::with_threads(1);
+    let mut out = dec.decode(&gap_stream(true), 0).unwrap();
+    out.extend(dec.flush());
+    assert!(dec.take_error().is_none());
+    assert_eq!(out.len(), 2);
+    assert_eq!(dec.stats().frame_num_gaps, 1);
+}

@@ -166,6 +166,9 @@ pub struct Backstage {
     pub print_layout: &'static str,
     pub print_hidden: bool,
     pub print_frame: bool,
+    /// Notes and handouts: a paper id from [`deckcraft_engine::cmd::file::PAPERS`] and its orientation.
+    pub print_paper: &'static str,
+    pub print_landscape: bool,
     pub preview_page: usize,
     pub export: ExportTask,
     /// Export › Change File Type / Save As: the chosen type (an [`SAVE_TYPES`] id).
@@ -187,6 +190,8 @@ impl Backstage {
             print_layout: "slides",
             print_hidden: false,
             print_frame: true,
+            print_paper: "letter",
+            print_landscape: false,
             preview_page: 0,
             export: ExportTask::Pdf,
             file_type: "pptx",
@@ -353,6 +358,7 @@ pub fn show(app: &mut SlideApp, ui: &mut Ui) {
             }
             if nav_item(ui, *nav, &bs, index, &t).clicked() {
                 bs.focus = None;
+                commit_props(app, &bs);
                 match act(app, *nav, bs.page) {
                     None => out.close = true,
                     Some(p) => out.page = Some(p),
@@ -367,6 +373,7 @@ pub fn show(app: &mut SlideApp, ui: &mut Ui) {
             for (k, nav) in bottom.iter().enumerate().rev() {
                 if nav_item(ui, *nav, &bs, first_bottom + k, &t).clicked() {
                     bs.focus = None;
+                    commit_props(app, &bs);
                     match act(app, *nav, bs.page) {
                         None => out.close = true,
                         Some(p) => out.page = Some(p),
@@ -390,6 +397,14 @@ pub fn show(app: &mut SlideApp, ui: &mut Ui) {
                 if bs.page != Page::Home {
                     ui.label(RichText::new(bs.page.label()).font(theme::bold(22.0)).color(t.text));
                     ui.add_space(16.0);
+                }
+                // Errors raised on a backstage page (a missing recent file, a failed open) would
+                // otherwise vanish: the status bar only draws once the backstage is closed (#172).
+                // A real label, not painted text, so screen readers see it too.
+                if let Some(msg) = app.fresh_status() {
+                    ui.label(RichText::new(&msg).font(theme::font(12.0)).color(t.accent));
+                    ui.add_space(8.0);
+                    ui.ctx().request_repaint_after(std::time::Duration::from_millis(500));
                 }
                 match bs.page {
                     Page::Home => home(app, ui, &mut bs, &mut out),
@@ -497,15 +512,14 @@ fn tile(ui: &mut Ui, label: &str, theme: Option<&deckcraft_model::Theme>, big: b
 }
 
 /// The built-in themes and the sample deck, filtered by `query` (after a blank presentation when
-/// `blank`); at most `limit` theme tiles.
-fn new_tiles(app: &mut SlideApp, ui: &mut Ui, query: &str, limit: usize, blank: bool) {
+/// `blank`); at most `limit` theme tiles. False when nothing matched.
+fn new_tiles(app: &mut SlideApp, ui: &mut Ui, query: &str, limit: usize, blank: bool) -> bool {
     let q = query.trim().to_lowercase();
     let themes: Vec<deckcraft_model::Theme> =
         deckcraft_model::theme::builtin_themes().into_iter().filter(|th| q.is_empty() || th.name.to_lowercase().contains(&q)).collect();
     let sample = q.is_empty() || "sample deck northern lights".contains(&q);
     if themes.is_empty() && !sample {
-        dim(ui, &format!("No themes match “{}”.", query.trim()));
-        return;
+        return false;
     }
     ui.horizontal_wrapped(|ui| {
         ui.spacing_mut().item_spacing = vec2(10.0, 10.0);
@@ -531,6 +545,25 @@ fn new_tiles(app: &mut SlideApp, ui: &mut Ui, query: &str, limit: usize, blank: 
             }
         }
     });
+    true
+}
+
+/// Starter decks whose name, summary, theme or a slide title matches `query`, at most `limit` tiles.
+fn template_tiles(app: &mut SlideApp, ui: &mut Ui, query: &str, limit: usize) -> bool {
+    let list = deckcraft_engine::templates::matching(query);
+    if list.is_empty() {
+        return false;
+    }
+    ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().item_spacing = vec2(10.0, 10.0);
+        for starter in list.into_iter().take(limit) {
+            let theme = deckcraft_model::theme::builtin_themes().into_iter().find(|th| th.name == starter.theme);
+            if tile(ui, starter.name, theme.as_ref(), false).on_hover_text(starter.summary).clicked() {
+                let _ = app.run("file.new", json!({"template": starter.name}));
+            }
+        }
+    });
+    true
 }
 
 /// File name and folder of a recent path, split as text (nothing on disk is read).
@@ -558,6 +591,7 @@ fn recent_list(app: &mut SlideApp, ui: &mut Ui, query: &str, limit: usize) {
     }
     let width = ui.available_width().min(CONTENT_W);
     for path in list {
+        let missing = !app.recent_exists(&path);
         let (name, folder) = split_path(&path);
         let (rect, resp) = ui.allocate_exact_size(vec2(width, 44.0), Sense::click());
         resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, &name));
@@ -565,13 +599,37 @@ fn recent_list(app: &mut SlideApp, ui: &mut Ui, query: &str, limit: usize) {
         if resp.hovered() {
             p.rect_filled(rect, CornerRadius::same(3), t.hover);
         }
-        icons::paint(p, Rect::from_center_size(pos2(rect.left() + 20.0, rect.center().y), vec2(22.0, 22.0)), Icon::Slide, t.text, false);
-        p.text(pos2(rect.left() + 44.0, rect.center().y - 8.0), Align2::LEFT_CENTER, &name, theme::font(13.0), t.text);
-        p.text(pos2(rect.left() + 44.0, rect.center().y + 9.0), Align2::LEFT_CENTER, &folder, theme::font(11.0), t.text_dim);
-        if resp.on_hover_text(&path).clicked()
-            && let Err(e) = app.open_path(&path)
+        let ink = if missing { t.text_dim } else { t.text };
+        // The row is as wide as the page's content, which a narrow window clips: keep the mark
+        // and the remove button inside the visible part of the row.
+        let visible_right = rect.right().min(ui.clip_rect().right() - 6.0);
         {
-            app.set_status(e);
+            let p = ui.painter();
+            icons::paint(p, Rect::from_center_size(pos2(rect.left() + 20.0, rect.center().y), vec2(22.0, 22.0)), Icon::Slide, ink, false);
+            p.text(pos2(rect.left() + 44.0, rect.center().y - 8.0), Align2::LEFT_CENTER, &name, theme::font(13.0), ink);
+            p.text(pos2(rect.left() + 44.0, rect.center().y + 9.0), Align2::LEFT_CENTER, &folder, theme::font(11.0), t.text_dim);
+            // A missing file says so before it is clicked (#172).
+            if missing {
+                p.text(pos2(visible_right - 82.0, rect.center().y), Align2::RIGHT_CENTER, "(missing)", theme::font(11.0), t.text_dim);
+            }
+        }
+        let resp = if missing { resp.on_hover_text(format!("{path} — this file can't be found")) } else { resp.on_hover_text(&path) };
+        // Remove from the list: a real labelled widget on top of the row, with a code-drawn icon
+        // (a text glyph would need a font that has it).
+        let x = ui.allocate_rect(
+            Rect::from_min_max(pos2(visible_right - 32.0, rect.top() + 5.0), pos2(visible_right, rect.bottom() - 5.0)),
+            Sense::click(),
+        );
+        x.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, "Remove from Recent"));
+        if x.hovered() {
+            ui.painter().rect_filled(x.rect, CornerRadius::same(3), t.hover);
+        }
+        icons::paint(ui.painter(), Rect::from_center_size(x.rect.center(), vec2(14.0, 14.0)), Icon::Close, t.text_dim, false);
+        if x.on_hover_text("Remove from Recent").clicked() {
+            app.forget_recent(&path);
+        }
+        if resp.clicked() {
+            app.open_path_in_background(&path);
         }
     }
 }
@@ -649,6 +707,17 @@ fn home(app: &mut SlideApp, ui: &mut Ui, bs: &mut Backstage, out: &mut Outcome) 
     new_tiles(app, ui, "", 5, true);
     ui.add_space(22.0);
     ui.horizontal(|ui| {
+        ui.label(RichText::new("Templates").font(theme::bold(16.0)).color(t.text));
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if arrow_link(ui, "More templates") {
+                out.page = Some(Page::New);
+            }
+        });
+    });
+    ui.add_space(6.0);
+    template_tiles(app, ui, "", 3);
+    ui.add_space(22.0);
+    ui.horizontal(|ui| {
         ui.label(RichText::new("Recent").font(theme::bold(16.0)).color(t.text));
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             search(ui, &mut bs.query, "Search for a file", 280.0);
@@ -668,7 +737,7 @@ fn home(app: &mut SlideApp, ui: &mut Ui, bs: &mut Backstage, out: &mut Outcome) 
     ui.hyperlink_to("Join the ArtCraft community on Discord", deckcraft_engine::links::DISCORD);
 }
 
-/// New: a blank presentation, then every theme with a search box.
+/// New: a blank presentation, then every theme and starter template, with a search box.
 fn new_page(app: &mut SlideApp, ui: &mut Ui, bs: &mut Backstage) {
     let t = Tokens::get(ui.ctx());
     if tile(ui, "Blank Presentation", None, true).clicked() {
@@ -679,10 +748,20 @@ fn new_page(app: &mut SlideApp, ui: &mut Ui, bs: &mut Backstage) {
     let (r, _) = ui.allocate_exact_size(vec2(w, 1.0), Sense::hover());
     ui.painter().line_segment([r.left_center(), r.right_center()], Stroke::new(1.0, t.separator));
     ui.add_space(14.0);
-    search(ui, &mut bs.query, "Search for themes", 380.0);
+    search(ui, &mut bs.query, "Search for themes and templates", 380.0);
     ui.add_space(14.0);
     let q = bs.query.clone();
-    new_tiles(app, ui, &q, usize::MAX, false);
+    let themes = new_tiles(app, ui, &q, usize::MAX, false);
+    let templates = if q.trim().is_empty() || !deckcraft_engine::templates::matching(&q).is_empty() {
+        ui.add_space(18.0);
+        heading(ui, "Templates");
+        template_tiles(app, ui, &q, usize::MAX)
+    } else {
+        false
+    };
+    if !themes && !templates {
+        dim(ui, &format!("No themes or templates match “{}”.", q.trim()));
+    }
 }
 
 /// Open: Recent and Browse on the left; the recent presentations (with a search box) on the right.
@@ -796,15 +875,16 @@ fn info(app: &mut SlideApp, ui: &mut Ui, bs: &mut Backstage) {
                     let Some(draft) = bs.props.get_mut(i) else { continue };
                     let l = ui.label(RichText::new(*label).color(t.text_dim));
                     let id = ui.make_persistent_id(("backstage_prop", *key));
-                    // Show the presentation's value unless the field is being edited (undo…).
-                    if !ui.ctx().memory(|m| m.has_focus(id)) {
-                        draft.clone_from(&saved);
-                    }
                     let resp = ui.add(egui::TextEdit::singleline(draft).id(id).hint_text(*hint).desired_width(300.0)).labelled_by(l.id);
                     if resp.lost_focus() && *draft != saved {
+                        // Commit first: a click on another field takes the focus before this one is drawn.
                         let mut p = serde_json::Map::new();
                         p.insert((*key).to_string(), json!(draft.clone()));
                         let _ = app.run("file.properties", Value::Object(p));
+                    } else if !resp.has_focus() && *draft != saved {
+                        // Show the presentation's value unless the field is being edited (undo...).
+                        draft.clone_from(&saved);
+                        ui.ctx().request_repaint();
                     }
                     ui.end_row();
                 }
@@ -812,6 +892,24 @@ fn info(app: &mut SlideApp, ui: &mut Ui, bs: &mut Backstage) {
             });
         });
     });
+}
+
+/// Commits what the Info page's property fields hold and the presentation does not: a side-menu
+/// action such as Save runs before the field that is being left is drawn again (#422).
+fn commit_props(app: &mut SlideApp, bs: &Backstage) {
+    if bs.page != Page::Info {
+        return;
+    }
+    let Ok(v) = app.session.execute("file.info", &json!({})) else { return };
+    let mut p = serde_json::Map::new();
+    for ((key, _, _), draft) in PROPERTIES.iter().zip(&bs.props) {
+        if v["properties"].get(*key).and_then(Value::as_str).unwrap_or("") != *draft {
+            p.insert((*key).to_string(), json!(draft));
+        }
+    }
+    if !p.is_empty() {
+        let _ = app.run("file.properties", Value::Object(p));
+    }
 }
 
 /// `1234567` → `1.2 MB`.
@@ -890,7 +988,24 @@ pub fn print_params(bs: &Backstage, slides: &[usize]) -> Value {
         _ => ("slides", 0),
     };
     // The list is already filtered for hidden slides, so the PDF takes it as it is.
-    json!({"layout": layout, "perPage": per, "slides": slides, "includeHidden": true, "frame": bs.print_frame})
+    json!({
+        "layout": layout,
+        "perPage": per,
+        "slides": slides,
+        "includeHidden": true,
+        "frame": bs.print_frame,
+        "paper": bs.print_paper,
+        "orientation": if bs.print_landscape { "landscape" } else { "portrait" },
+    })
+}
+
+/// The printed page size in points: the slide size for full-page slides, else the chosen paper.
+pub fn print_page_size(bs: &Backstage, doc: &deckcraft_model::Presentation) -> (f32, f32) {
+    if bs.print_layout == "slides" {
+        return (doc.slide_size.width as f32, doc.slide_size.height as f32);
+    }
+    let (w, h) = deckcraft_engine::cmd::file::paper_size(bs.print_paper, bs.print_landscape).unwrap_or((612.0, 792.0));
+    (w as f32, h as f32)
 }
 
 const LAYOUTS: [(&str, &str); 8] = [
@@ -968,6 +1083,28 @@ fn print(app: &mut SlideApp, ui: &mut Ui, bs: &mut Backstage) {
                 }
             });
             ui.add_space(4.0);
+            // PowerPoint prints full-page slides on slide-shaped pages; paper and orientation are
+            // for notes pages and handouts.
+            ui.add_enabled_ui(bs.print_layout != "slides", |ui| {
+                let paper = deckcraft_engine::cmd::file::PAPERS.iter().find(|p| p.0 == bs.print_paper).map_or("Letter", |p| p.1);
+                egui::ComboBox::from_id_salt("backstage_print_paper").width(240.0).selected_text(paper).show_ui(ui, |ui| {
+                    for (id, label, _) in deckcraft_engine::cmd::file::PAPERS {
+                        if ui.selectable_label(bs.print_paper == id, label).clicked() {
+                            bs.print_paper = id;
+                        }
+                    }
+                });
+                ui.add_space(4.0);
+                let orient = if bs.print_landscape { "Landscape Orientation" } else { "Portrait Orientation" };
+                egui::ComboBox::from_id_salt("backstage_print_orientation").width(240.0).selected_text(orient).show_ui(ui, |ui| {
+                    for (land, label) in [(false, "Portrait Orientation"), (true, "Landscape Orientation")] {
+                        if ui.selectable_label(bs.print_landscape == land, label).clicked() {
+                            bs.print_landscape = land;
+                        }
+                    }
+                });
+            });
+            ui.add_space(4.0);
             if ui.checkbox(&mut bs.print_hidden, "Print Hidden Slides").changed() {
                 bs.preview_page = 0;
             }
@@ -1000,8 +1137,8 @@ fn preview(app: &mut SlideApp, ui: &mut Ui, bs: &mut Backstage, doc: &deckcraft_
     let last = pages.len().saturating_sub(1);
     bs.preview_page = bs.preview_page.min(last);
     let Some(on_page) = pages.get(bs.preview_page).copied() else { return };
-    // Full-page slides print on slide-shaped pages; notes and handouts on portrait Letter.
-    let (pw, ph) = if bs.print_layout == "slides" { (doc.slide_size.width as f32, doc.slide_size.height as f32) } else { (612.0, 792.0) };
+    // Full-page slides print on slide-shaped pages; notes and handouts on the chosen paper.
+    let (pw, ph) = print_page_size(bs, doc);
     let avail_w = ui.available_width().clamp(200.0, 760.0);
     let scale = (avail_w / pw.max(1.0)).min(520.0 / ph.max(1.0));
     let (area, _) = ui.allocate_exact_size(vec2(avail_w, ph * scale + 24.0), Sense::hover());

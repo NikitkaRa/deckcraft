@@ -3,11 +3,14 @@
 //! - [`BitReader`]: MSB-first reader with Exp-Golomb (`ue(v)`, `se(v)`), as used by H.264/HEVC/AV1 headers.
 //! - [`BitWriter`]: the matching writer (for encoders and header rewriting).
 //! - [`unescape_rbsp`] / [`escape_rbsp`]: remove/insert H.264/HEVC emulation-prevention bytes.
+//! - [`budget`]: the memory budget video decoders check their picture store against.
 //! - [`annexb_nals`] / [`length_prefixed_nals`]: split Annex-B byte streams and AVCC/HVCC samples into NAL units.
 
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable))]
 
 use std::fmt;
+
+pub mod budget;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BitError {
@@ -15,6 +18,8 @@ pub enum BitError {
     Eof,
     /// An Exp-Golomb code longer than 32 leading zeros.
     InvalidExpGolomb,
+    /// A NAL length prefix width outside 1..=4 bytes.
+    InvalidLengthSize,
 }
 
 impl fmt::Display for BitError {
@@ -22,6 +27,7 @@ impl fmt::Display for BitError {
         match self {
             BitError::Eof => f.write_str("unexpected end of bitstream"),
             BitError::InvalidExpGolomb => f.write_str("invalid Exp-Golomb code"),
+            BitError::InvalidLengthSize => f.write_str("unsupported NAL length prefix size"),
         }
     }
 }
@@ -140,10 +146,11 @@ impl<'a> BitReader<'a> {
         self.read_ue()?.checked_add(add).ok_or(BitError::InvalidExpGolomb)
     }
 
-    /// Signed Exp-Golomb `se(v)`.
+    /// Signed Exp-Golomb `se(v)`. Codes whose value does not fit an `i32` (the code for `2^31`) are rejected.
     pub fn read_se(&mut self) -> Result<i32> {
         let k = self.read_ue()? as i64;
-        Ok(if k & 1 == 1 { ((k + 1) / 2) as i32 } else { -((k / 2) as i32) })
+        let v = if k & 1 == 1 { (k + 1) / 2 } else { -(k / 2) };
+        i32::try_from(v).map_err(|_| BitError::InvalidExpGolomb)
     }
 
     /// Truncated Exp-Golomb `te(v)` with range `max`.
@@ -202,7 +209,10 @@ impl BitWriter {
         self.write_bits(b as u32, 1);
     }
     pub fn write_ue(&mut self, v: u32) {
-        let x = v as u64 + 1;
+        self.write_ue_u64(v as u64);
+    }
+    fn write_ue_u64(&mut self, v: u64) {
+        let x = v + 1;
         let len = 64 - x.leading_zeros();
         let zeros = len - 1;
         for _ in 0..zeros {
@@ -215,9 +225,11 @@ impl BitWriter {
             self.write_bits(x as u32, len);
         }
     }
+    /// Signed Exp-Golomb `se(v)`. `i32::MIN` needs a code above `u32::MAX`, which `read_se` rejects.
     pub fn write_se(&mut self, v: i32) {
-        let k = if v > 0 { (v as u32) * 2 - 1 } else { (-(v as i64) as u32) * 2 };
-        self.write_ue(k);
+        let v = v as i64;
+        let k = if v > 0 { (v as u64) * 2 - 1 } else { ((-v) as u64) * 2 };
+        self.write_ue_u64(k);
     }
     pub fn bit_len(&self) -> usize {
         self.buf.len() * 8 + self.nbits as usize
@@ -310,12 +322,15 @@ pub fn annexb_nals(data: &[u8]) -> Vec<&[u8]> {
     out
 }
 
-/// Split a length-prefixed sample (AVCC/HVCC, `length_size` 1/2/4 bytes) into NAL units.
+/// Split a length-prefixed sample (AVCC/HVCC, `length_size` 1..=4 bytes, as the 2-bit `lengthSizeMinusOne` allows) into NAL units.
 pub fn length_prefixed_nals(data: &[u8], length_size: usize) -> Result<Vec<&[u8]>> {
+    if !(1..=4).contains(&length_size) {
+        return Err(BitError::InvalidLengthSize);
+    }
     let mut out = Vec::new();
     let mut i = 0;
     while i < data.len() {
-        if i + length_size > data.len() {
+        if length_size > data.len() - i {
             return Err(BitError::Eof);
         }
         let mut len = 0usize;
@@ -323,7 +338,7 @@ pub fn length_prefixed_nals(data: &[u8], length_size: usize) -> Result<Vec<&[u8]
             len = (len << 8) | data[i + k] as usize;
         }
         i += length_size;
-        if i + len > data.len() {
+        if len > data.len() - i {
             return Err(BitError::Eof);
         }
         out.push(&data[i..i + len]);
@@ -359,6 +374,35 @@ mod tests {
         let mut r = BitReader::new(&b);
         assert_eq!(r.read_ue_plus(1).unwrap(), 8);
         assert!(r.read_ue_plus(1).is_err());
+    }
+
+    #[test]
+    fn signed_exp_golomb_extremes() {
+        let mut w = BitWriter::new();
+        for v in [i32::MAX, i32::MIN + 1, i32::MIN] {
+            w.write_se(v);
+        }
+        w.rbsp_trailing();
+        let b = w.finish();
+        let mut r = BitReader::new(&b);
+        assert_eq!(r.read_se().unwrap(), i32::MAX);
+        assert_eq!(r.read_se().unwrap(), i32::MIN + 1);
+        assert_eq!(r.read_se(), Err(BitError::InvalidExpGolomb));
+        // ue code 0xFFFF_FFFF maps to +2^31, which must not wrap to a negative i32.
+        let mut w = BitWriter::new();
+        w.write_ue(u32::MAX);
+        w.rbsp_trailing();
+        let b = w.finish();
+        assert_eq!(BitReader::new(&b).read_se(), Err(BitError::InvalidExpGolomb));
+    }
+
+    #[test]
+    fn length_prefixed_rejects_bad_width_and_oversized_length() {
+        assert_eq!(length_prefixed_nals(&[1, 2, 3, 4, 5, 6], 5), Err(BitError::InvalidLengthSize));
+        assert_eq!(length_prefixed_nals(&[1, 2, 3], 0), Err(BitError::InvalidLengthSize));
+        assert_eq!(length_prefixed_nals(&[0, 0, 1, 7], 3).unwrap(), vec![&[7u8][..]]);
+        assert_eq!(length_prefixed_nals(&[0xFF, 0xFF, 0xFF, 0xFF, 1], 4), Err(BitError::Eof));
+        assert_eq!(length_prefixed_nals(&[0, 0, 0, 1, 9], 4).unwrap(), vec![&[9u8][..]]);
     }
 
     #[test]

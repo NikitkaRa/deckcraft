@@ -213,3 +213,42 @@ fn synthetic_file() {
     assert_eq!(d.next_packet().unwrap().unwrap().pts, 1120);
     assert!(d.file().indexed);
 }
+
+fn one_block(ts: u64, rel: i16) -> Vec<u8> {
+    let mut f = Vec::new();
+    let mut h = Vec::new();
+    el_str(&mut h, DOC_TYPE, "matroska");
+    el(&mut f, EBML, &h);
+    write_id(&mut f, SEGMENT);
+    write_unknown_size(&mut f, 8);
+    let mut info = Vec::new();
+    el_uint(&mut info, TIMESTAMP_SCALE, 1_000_000);
+    el(&mut f, INFO, &info);
+    let mut v = Vec::new();
+    el_uint(&mut v, TRACK_NUMBER, 1);
+    el_uint(&mut v, TRACK_UID, 1);
+    el_uint(&mut v, TRACK_TYPE, 1);
+    el_str(&mut v, CODEC_ID, "V_UNCOMPRESSED");
+    let mut tr = Vec::new();
+    el(&mut tr, TRACK_ENTRY, &v);
+    el(&mut f, TRACKS, &tr);
+    write_id(&mut f, CLUSTER);
+    write_unknown_size(&mut f, 8);
+    el_uint(&mut f, TIMESTAMP, ts);
+    el(&mut f, SIMPLE_BLOCK, &block(1, rel, 0x80, &[0]));
+    f
+}
+
+#[test]
+fn block_timestamp_addition_does_not_overflow() {
+    let bytes = one_block(1000, 5);
+    let d = Demuxer::from_slice(&bytes).unwrap();
+    let p: Vec<Packet> = d.map(|p| p.unwrap()).collect();
+    assert_eq!(p[0].pts, 1005);
+    let edge = one_block(i64::MAX as u64, 0);
+    let d = Demuxer::from_slice(&edge).unwrap();
+    let p: Vec<Packet> = d.map(|p| p.unwrap()).collect();
+    assert_eq!(p[0].pts, i64::MAX);
+    assert!(Demuxer::from_slice(&one_block(i64::MAX as u64, 1)).is_err());
+    assert!(Demuxer::from_slice(&one_block(u64::MAX, 0)).is_err());
+}

@@ -41,3 +41,16 @@ sync_github_name = true
 [people.Silvertree2010]
 display_name = "Netter"
 sync_github_name = false
+
+[people.dotCooCoo]
+real_name = "Robert Lee"
+sync_github_name = true
+
+[people.Momentum96]
+sync_github_name = true
+
+[people.NikitkaRa]
+real_name = "Nikita Rakitin"
+
+[people.RCShoemaker]
+real_name = "Ryan C. Shoemaker"

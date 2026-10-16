@@ -179,6 +179,21 @@ fn every_page_renders() {
     assert!(h.state_mut().run("app.backstage", json!({"page": "share"})).is_err(), "Share (cloud) isn't offered");
 }
 
+/// A starter template from File › New opens its deck and leaves the File tab.
+#[test]
+fn new_template_opens_a_starter_deck() {
+    let mut h = harness(new_app());
+    h.state_mut().run("app.backstage", json!({"page": "new"})).unwrap();
+    h.run_steps(3);
+    h.get_by_label("Briefing").click();
+    h.run_steps(3);
+    let doc = &h.state().session.active().unwrap().doc;
+    assert_eq!(doc.masters[0].theme.name, "Harbor");
+    assert_eq!(doc.slides[0].title(), "Weekly briefing");
+    assert_eq!(doc.slides.len(), 5);
+    assert!(h.state().backstage.is_none(), "the starter deck shows");
+}
+
 /// New and Home create presentations, which leaves the File tab.
 #[test]
 fn new_creates_a_presentation() {
@@ -217,6 +232,15 @@ fn open_lists_recent_files_and_opens_one() {
     h.run_steps(2);
     assert!(h.query_by_label("Other.pptx").is_none(), "the search box filters by name");
     h.get_by_label("Quarterly review.pptx").click();
+    h.run_steps(1);
+    // The file is read in the background (#350); its progress window shows meanwhile.
+    for _ in 0..300 {
+        if h.state().opening.is_none() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        h.run_steps(1);
+    }
     h.run_steps(3);
     assert_eq!(h.state().session.documents().len(), 2);
     assert_eq!(h.state().session.active().unwrap().path.as_deref(), Some(path.as_str()));
@@ -347,6 +371,44 @@ fn info_shows_and_edits_the_properties() {
     assert!(h.state().backstage_open());
 }
 
+/// Leaving a property field with a click on another field keeps what was typed.
+#[test]
+fn info_keeps_a_property_draft_when_another_field_is_clicked() {
+    let mut h = harness(new_app());
+    h.state_mut().run("app.backstage", json!({"page": "info"})).unwrap();
+    h.run_steps(3);
+    h.get_by_role_and_label(Role::TextInput, "Author").click();
+    h.run_steps(2);
+    h.get_by_role_and_label(Role::TextInput, "Author").type_text("Ada");
+    h.run_steps(2);
+    h.get_by_role_and_label(Role::TextInput, "Title").click();
+    h.run_steps(4);
+    assert_eq!(h.state().session.active().unwrap().doc.props.author, "Ada");
+}
+
+/// Save straight from a property field saves what was typed (the side menu acts before the field
+/// is drawn again).
+#[test]
+fn info_saves_a_property_draft_when_save_is_clicked() {
+    let dir = temp_dir("info-save");
+    let path = dir.join("Draft.pptx").to_string_lossy().to_string();
+    let mut s = Session::with_new();
+    s.execute("file.saveAs", &json!({"path": path})).unwrap();
+    let mut h = harness(SlideApp::new(s, Services::default()));
+    h.state_mut().run("app.backstage", json!({"page": "info"})).unwrap();
+    h.run_steps(3);
+    h.get_by_role_and_label(Role::TextInput, "Author").click();
+    h.run_steps(2);
+    h.get_by_role_and_label(Role::TextInput, "Author").type_text("Ada");
+    h.run_steps(2);
+    click_nav(&h, "Save");
+    h.run_steps(3);
+    let doc = h.state().session.active().unwrap();
+    assert_eq!(doc.doc.props.author, "Ada");
+    assert!(!doc.is_dirty(), "the author went into the saved file");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// With nothing open the File tab is the start screen: Home, New and Open, no back arrow, and Esc
 /// has nowhere to go.
 #[test]
@@ -366,6 +428,34 @@ fn the_start_screen_is_file_home() {
     h.run_steps(3);
     assert_eq!(h.state().session.documents().len(), 1);
     assert!(h.state().backstage.is_none());
+}
+
+/// #346: a file picked in Open that can't be read used to drop back to the start screen without
+/// a word. The reason now shows over the start screen.
+#[test]
+fn a_file_that_cant_be_opened_says_why() {
+    let dir = temp_dir("unreadable");
+    let path = dir.join("Notes.pptx");
+    std::fs::write(&path, b"not a presentation").unwrap();
+    let picked = path.to_string_lossy().to_string();
+    let services = Services { pick_open: Some(Box::new(move |_: &str| Some(picked.clone()))), ..Default::default() };
+    let mut h = harness(SlideApp::new(Session::new(), services));
+    h.state_mut().run("app.backstage", json!({"page": "open"})).unwrap();
+    h.run_steps(2);
+    h.get_by_label("Browse").click();
+    h.run_steps(3);
+    // The file is read in the background (#350): wait for it.
+    for _ in 0..500 {
+        if h.state().opening.is_none() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        h.run_steps(1);
+    }
+    h.run_steps(2);
+    assert!(h.state().session.documents().is_empty());
+    assert!(h.query_by_label_contains("not a presentation DeckCraft can read").is_some(), "the error is on screen");
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Print previews the pages its settings make and prints through a PDF opened in the system
@@ -435,4 +525,13 @@ fn print_slides_follow_the_settings() {
     bs.print_layout = "h6";
     assert_eq!(print_params(&bs, &[1, 3])["perPage"], 6);
     assert_eq!(print_params(&bs, &[1, 3])["layout"], "handouts");
+    assert_eq!(print_params(&bs, &[1])["paper"], "letter");
+    assert_eq!(print_page_size(&bs, &doc), (612.0, 792.0));
+    bs.print_paper = "a4";
+    bs.print_landscape = true;
+    assert_eq!(print_params(&bs, &[1])["orientation"], "landscape");
+    let (w, h) = print_page_size(&bs, &doc);
+    assert!((w - 841.89).abs() < 0.01 && (h - 595.28).abs() < 0.01);
+    bs.print_layout = "slides";
+    assert_eq!(print_page_size(&bs, &doc), (doc.slide_size.width as f32, doc.slide_size.height as f32), "slides print slide-shaped");
 }

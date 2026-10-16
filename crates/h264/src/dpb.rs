@@ -133,7 +133,27 @@ impl Dpb {
         make_frame: &mut dyn FnMut(u32) -> (FrameRef, Arc<OutputMeta>),
         poc_state: &mut dyn FnMut(u32),
     ) {
+        if max_frame_num == 0 {
+            return;
+        }
         let mut unused = (prev_ref_frame_num + 1) % max_frame_num;
+        // Only the last `max_num_ref_frames` "non-existing" frames can survive the sliding window, and
+        // inserting more than that evicts every earlier short-term reference. Skip straight to that tail
+        // (keeping the POC state walk for every missing frame_num) so a hostile gap of up to 65535
+        // frames costs at most `max_num_ref_frames` frame allocations instead of one per missing frame.
+        let gap = frame_num.wrapping_add(max_frame_num).wrapping_sub(unused) % max_frame_num;
+        let keep = u32::try_from(max_num_ref_frames.max(1)).unwrap_or(u32::MAX);
+        let skip = gap.saturating_sub(keep);
+        if skip > 0 {
+            for e in self.entries.iter_mut().filter(|e| e.mark == RefMark::Short) {
+                e.mark = RefMark::Unused;
+            }
+            self.prune();
+            for _ in 0..skip {
+                poc_state(unused);
+                unused = (unused + 1) % max_frame_num;
+            }
+        }
         let mut guard = 0;
         while unused != frame_num && guard < max_frame_num {
             self.sliding_window(unused, max_frame_num, max_num_ref_frames);
@@ -416,5 +436,101 @@ impl Dpb {
 impl Default for Dpb {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::picture::Frame;
+
+    fn meta() -> Arc<OutputMeta> {
+        Arc::new(OutputMeta {
+            pts: 0,
+            key: false,
+            crop: (0, 0, 0, 0),
+            full_range: false,
+            colour_primaries: 2,
+            transfer_characteristics: 2,
+            matrix_coefficients: 2,
+            sar: (1, 1),
+            draft: false,
+        })
+    }
+
+    fn short(dpb: &mut Dpb, id: u32, frame_num: u32) {
+        dpb.entries.push(DpbEntry {
+            frame: Arc::new(Frame::new(id, 0, 1, 1)),
+            poc: 0,
+            frame_num,
+            long_term_frame_idx: 0,
+            mark: RefMark::Short,
+            needed_for_output: false,
+            non_existing: false,
+            meta: meta(),
+        });
+    }
+
+    /// Fill a gap and return (frames made, POC walk, reference frame_nums left in the DPB).
+    fn fill(dpb: &mut Dpb, prev: u32, cur: u32, max: u32, refs: usize) -> (u32, Vec<u32>, Vec<(u32, bool)>) {
+        let mut made = 0u32;
+        let mut walk = Vec::new();
+        let mut make = |_f: u32| {
+            made += 1;
+            (Arc::new(Frame::new(1000 + made, 0, 1, 1)), meta())
+        };
+        let mut poc = |f: u32| walk.push(f);
+        dpb.fill_frame_num_gap(prev, cur, max, refs, &mut make, &mut poc);
+        let left = dpb.entries.iter().filter(|e| e.mark != RefMark::Unused).map(|e| (e.frame_num, e.non_existing)).collect();
+        (made, walk, left)
+    }
+
+    #[test]
+    fn huge_gap_makes_only_the_frames_that_stay_referenced() {
+        let mut dpb = Dpb::new();
+        short(&mut dpb, 1, 0);
+        short(&mut dpb, 2, 1);
+        let (made, walk, left) = fill(&mut dpb, 1, 65535, 65536, 4);
+        assert_eq!(made, 4);
+        // The POC state still walks every missing frame_num, in order.
+        assert_eq!(walk.len(), 65533);
+        assert_eq!(walk.first(), Some(&2));
+        assert_eq!(walk.last(), Some(&65534));
+        assert_eq!(left, vec![(65531, true), (65532, true), (65533, true), (65534, true)]);
+    }
+
+    #[test]
+    fn huge_gap_across_wraparound_matches_the_frame_by_frame_result() {
+        let mut dpb = Dpb::new();
+        short(&mut dpb, 1, 65000);
+        let (made, walk, left) = fill(&mut dpb, 65000, 3, 65536, 2);
+        assert_eq!(made, 2);
+        assert_eq!(walk.len(), 538);
+        assert_eq!(walk.first(), Some(&65001));
+        assert_eq!(walk.last(), Some(&2));
+        assert_eq!(left, vec![(1, true), (2, true)]);
+    }
+
+    #[test]
+    fn small_gap_keeps_earlier_references() {
+        let mut dpb = Dpb::new();
+        short(&mut dpb, 1, 0);
+        short(&mut dpb, 2, 1);
+        let (made, walk, left) = fill(&mut dpb, 1, 4, 16, 4);
+        assert_eq!(made, 2);
+        assert_eq!(walk, vec![2, 3]);
+        assert_eq!(left, vec![(0, false), (1, false), (2, true), (3, true)]);
+    }
+
+    #[test]
+    fn long_term_references_survive_a_huge_gap() {
+        let mut dpb = Dpb::new();
+        short(&mut dpb, 1, 0);
+        if let Some(e) = dpb.entries.last_mut() {
+            e.mark = RefMark::Long;
+        }
+        let (made, _, left) = fill(&mut dpb, 0, 1000, 1024, 3);
+        assert!(made <= 3);
+        assert_eq!(left, vec![(0, false), (998, true), (999, true)]);
     }
 }

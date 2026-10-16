@@ -40,6 +40,43 @@ pub fn japanese_fonts() -> impl Iterator<Item = &'static CraftFont> {
     CRAFT_FONTS.iter().filter(|f| f.scripts.contains(&"Jpan"))
 }
 
+/// The TrueType or OpenType font inside a PresentationML embedded-font part
+/// (`application/x-fontdata`).
+///
+/// The part is the font itself, or an Embedded OpenType wrapper around it (the `0x504C` magic
+/// at byte 34, from the W3C Embedded OpenType submission). A MicroType Express subset is neither,
+/// so this returns none; the original part stays in the file for the round trip.
+pub fn embedded_sfnt(part: &[u8]) -> Option<&[u8]> {
+    eot_payload(part).or_else(|| sfnt_or_collection(part).then_some(part))
+}
+
+fn sfnt_or_collection(b: &[u8]) -> bool {
+    b.len() >= 12
+        && (b.starts_with(&[0x00, 0x01, 0x00, 0x00])
+            || b.starts_with(b"OTTO")
+            || b.starts_with(b"true")
+            || b.starts_with(b"typ1")
+            || b.starts_with(b"ttcf"))
+}
+
+/// Font data at the end of an Embedded OpenType blob, when the header is one.
+fn eot_payload(b: &[u8]) -> Option<&[u8]> {
+    if b.len() < 82 || u16::from_le_bytes([b[34], b[35]]) != 0x504C {
+        return None;
+    }
+    let version = u32::from_le_bytes(b.get(8..12)?.try_into().ok()?);
+    if !matches!(version, 0x0001_0000 | 0x0002_0001 | 0x0002_0002) {
+        return None;
+    }
+    let eot_size = u32::from_le_bytes(b.get(0..4)?.try_into().ok()?) as usize;
+    let font_size = u32::from_le_bytes(b.get(4..8)?.try_into().ok()?) as usize;
+    if font_size < 12 || eot_size < font_size.saturating_add(82) || eot_size > b.len() {
+        return None;
+    }
+    let font = b.get(eot_size - font_size..eot_size)?;
+    sfnt_or_collection(font).then_some(font)
+}
+
 /// Japanese faces in document-fallback order: Mincho (serif) families first, matching the
 /// serif default text font, then the others; Regular before other styles.
 pub fn japanese_document_fonts() -> Vec<&'static CraftFont> {
@@ -190,6 +227,63 @@ mod tests {
     }
 
     #[test]
+    fn filtered_fallback_continues_after_a_rejected_loaded_face() {
+        let db = FontDb::with_font_dirs(Vec::new());
+        db.set_system_fallback(false);
+        assert_eq!(db.add_font(include_bytes!("../tests/fixtures/legacy-regular.ttf").to_vec()), 1);
+        let first = db.fallback_for('A', u32::MAX).unwrap();
+        let accepted_family = if first.family == LAST_RESORT_FAMILY { "DeckCraft Legacy" } else { LAST_RESORT_FAMILY };
+        let fallback = db.fallback_for_filtered('A', u32::MAX, |f| f.family == accepted_family).unwrap();
+        assert_eq!(fallback.family, accepted_family);
+        assert!(fallback.covers('A'));
+        assert_ne!(fallback.id(), first.id());
+        assert_eq!(db.fallback_for('A', u32::MAX).unwrap().id(), first.id(), "document fallback order is unchanged");
+        assert!(db.fallback_for_filtered('A', fallback.id(), |f| f.family == accepted_family).is_none(), "the excluded face stays excluded");
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn filtered_fallback_loads_an_eligible_system_face_and_does_not_cache_policy_misses() {
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+        let db = FontDb::with_font_dirs(vec![dir]);
+        let first = db.fallback_for('A', u32::MAX).unwrap();
+        assert_ne!(first.family, "DeckCraft Legacy");
+        assert!(db.fallback_for_filtered('A', u32::MAX, |_| false).is_none());
+        assert!(db.fallback_for('A', u32::MAX).is_some(), "an interface policy miss does not hide document glyphs");
+        let accepted = db.fallback_for_filtered('A', u32::MAX, |f| f.family == "DeckCraft Legacy").unwrap();
+        assert_eq!(accepted.family, "DeckCraft Legacy");
+        assert!(accepted.covers('A'));
+    }
+
+    #[test]
+    fn concurrent_lookups_all_find_an_installed_family() {
+        // Threads resolving an installed family nobody had loaded yet used to fall back to
+        // another face when a different thread finished loading it first, so the same text was
+        // laid out in different fonts depending on timing.
+        let dir = std::env::temp_dir().join(format!("deckcraft-fonts-concurrent-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("Hack-Regular.ttf"), epaint_default_fonts::HACK_REGULAR).unwrap();
+        for _ in 0..20 {
+            let db = FontDb::with_font_dirs(vec![dir.clone()]);
+            db.set_system_fallback(false);
+            let start = std::sync::Barrier::new(8);
+            let got: Vec<String> = std::thread::scope(|s| {
+                let threads: Vec<_> = (0..8)
+                    .map(|_| {
+                        s.spawn(|| {
+                            start.wait();
+                            db.face("Hack", "Regular").family.clone()
+                        })
+                    })
+                    .collect();
+                threads.into_iter().map(|t| t.join().unwrap()).collect()
+            });
+            assert!(got.iter().all(|f| f == "Hack"), "{got:?}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn windows_family_names_find_their_faces() {
         // Documents name fonts by their Windows family ("Segoe UI Semibold"); the font's
         // typographic family is "Segoe UI" with a "Semibold" style. The fixture is named the same way.
@@ -222,6 +316,36 @@ mod tests {
             assert_eq!(db.face("DeckCraft Legacy Semibold", "Regular").style, "Semibold");
             let regular = db.face("DeckCraft Legacy", "Regular");
             assert_eq!((regular.style.as_str(), regular.weight), ("Regular", 400.0));
+        }
+    }
+
+    #[test]
+    fn faces_without_outlines_are_not_cataloged() {
+        // Rename the Semibold's `glyf` table, as in fonts whose glyphs are bitmaps or are stored in
+        // Apple's `hvgl` table. The face still maps "A", but its outline is empty. The new tag
+        // keeps the table directory sorted.
+        let mut semibold = include_bytes!("../tests/fixtures/legacy-semibold.ttf").to_vec();
+        let tables = u16::from_be_bytes([semibold[4], semibold[5]]) as usize;
+        let glyf = (0..tables).map(|i| 12 + 16 * i).find(|&r| &semibold[r..r + 4] == b"glyf").unwrap();
+        semibold[glyf..glyf + 4].copy_from_slice(b"gxyz");
+        let loaded = FontDb::with_font_dirs(Vec::new());
+        assert_eq!(loaded.add_font(semibold.clone()), 1);
+        let face = loaded.face("DeckCraft Legacy", "Semibold");
+        assert!(face.covers('A'));
+        assert!(loaded.outline(&face, face.glyph_for('A')).elements().is_empty());
+        // The system font scan lists the Regular, which has outlines, and leaves out the Semibold
+        // under both of its names.
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let dir = std::env::temp_dir().join(format!("deckcraft-fonts-outlines-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("legacy-semibold.ttf"), &semibold).unwrap();
+            std::fs::write(dir.join("legacy-regular.ttf"), include_bytes!("../tests/fixtures/legacy-regular.ttf")).unwrap();
+            let db = FontDb::with_font_dirs(vec![dir.clone()]);
+            db.set_system_fallback(false);
+            assert_eq!(db.styles("DeckCraft Legacy"), ["Regular"]);
+            assert!(!db.has_family("DeckCraft Legacy Semibold"));
+            let _ = std::fs::remove_dir_all(&dir);
         }
     }
 
@@ -298,5 +422,56 @@ mod tests {
         if CRAFT_FONTS.iter().any(|f| f.family == "Carlito") {
             assert_eq!(db.face("Calibri", "Bold").family, "Carlito");
         }
+    }
+
+    /// An Embedded OpenType header of `version` around `font`, with the font at the end.
+    fn wrap_eot(font: &[u8], version: u32) -> Vec<u8> {
+        let mut h = vec![0u8; 82];
+        let total = 82 + font.len();
+        h[0..4].copy_from_slice(&(total as u32).to_le_bytes());
+        h[4..8].copy_from_slice(&(font.len() as u32).to_le_bytes());
+        h[8..12].copy_from_slice(&version.to_le_bytes());
+        h[34..36].copy_from_slice(&0x504Cu16.to_le_bytes());
+        h.extend_from_slice(font);
+        h
+    }
+
+    #[test]
+    fn embedded_open_type_yields_the_font() {
+        let font = epaint_default_fonts::UBUNTU_LIGHT;
+        assert_eq!(embedded_sfnt(font), Some(font));
+        assert_eq!(embedded_sfnt(&wrap_eot(font, 0x0002_0001)), Some(font));
+        assert_eq!(embedded_sfnt(&wrap_eot(font, 0x0001_0000)), Some(font));
+        assert!(embedded_sfnt(b"not a font file").is_none());
+        assert!(embedded_sfnt(&wrap_eot(b"hello world!!", 0x0002_0002)).is_none());
+        let mut truncated = wrap_eot(font, 0x0002_0001);
+        truncated.truncate(40);
+        assert!(embedded_sfnt(&truncated).is_none());
+    }
+
+    /// A FIFO, a folder and a link loop dressed up as font files: the system scan skips them
+    /// instead of blocking forever on the FIFO (start-up hung when one sat in `~/.fonts`), and
+    /// still finds the real font beside them.
+    #[cfg(unix)]
+    #[test]
+    fn the_font_scan_skips_fifos_folders_and_link_loops() {
+        let dir = std::env::temp_dir().join(format!("deckcraft-fontscan-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        std::fs::copy(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/legacy-semibold.ttf"), dir.join("sub/real.ttf")).unwrap();
+        let fifo = std::process::Command::new("mkfifo").arg(dir.join("trap.ttf")).status().is_ok_and(|s| s.success());
+        std::fs::create_dir(dir.join("folder.ttf")).unwrap();
+        std::fs::write(dir.join("empty.otf"), b"").unwrap();
+        std::os::unix::fs::symlink(&dir, dir.join("sub/loop")).unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let scan_dir = dir.clone();
+        std::thread::spawn(move || {
+            let db = FontDb::with_font_dirs(vec![scan_dir]);
+            let _ = tx.send(db.load_system_fonts());
+        });
+        let n = rx.recv_timeout(std::time::Duration::from_secs(30)).expect("the font scan hung");
+        assert!(n >= 1, "the real font was found");
+        assert!(fifo || n >= 1);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

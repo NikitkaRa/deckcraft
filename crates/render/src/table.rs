@@ -224,7 +224,7 @@ fn edges(sizes: &[f64]) -> Vec<f64> {
 }
 
 /// A cell's text as drawn: its margins, anchor and direction, plus the table style's text colour and bold.
-pub(crate) fn cell_body(rctx: &Ctx, t: &Table, r: usize, c: usize, cell: &Cell) -> TextBody {
+pub fn cell_body(rctx: &Ctx, t: &Table, r: usize, c: usize, cell: &Cell) -> TextBody {
     let lk = look(rctx, t, r, c);
     let mut body = cell.text.clone();
     let [ml, mr, mt, mb] = cell.margins.unwrap_or([7.2, 7.2, 3.6, 3.6]);
@@ -297,6 +297,25 @@ pub fn cell_rects(t: &Table, heights: &[f64]) -> Vec<(usize, usize, Rect)> {
     out
 }
 
+/// Can a cell's text be left undrawn because it lands wholly outside the `target` (pixels)? Only
+/// for cells whose text stays inside the cell: its row grew to fit it (one row, horizontal text,
+/// not at the height cap), so nothing overflows. A margin covers italic overhang and the like.
+/// A table of thousands of rows otherwise lays out every cell's text off the slide's bottom.
+fn text_off_target(cell: &Cell, rect: Rect, m: Affine, target: (u16, u16)) -> bool {
+    if cell.row_span > 1 || !matches!(cell.vertical, None | Some(TextDir::Horizontal)) || rect.height() >= 20_000.0 {
+        return false;
+    }
+    let b = m.transform_rect_bbox(rect).inflate(64.0, 64.0);
+    let view = Rect::new(0.0, 0.0, f64::from(target.0), f64::from(target.1));
+    b.is_finite() && (b.x1 < view.x0 || b.y1 < view.y0 || b.x0 > view.x1 || b.y0 > view.y1)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Cells whose text `draw` laid out on this thread (tests check off-slide cells are skipped).
+    pub(crate) static TEXT_CELLS_DRAWN: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// Draws the table; returns the box its cells cover (table space), which grows with their text.
 #[allow(clippy::too_many_arguments)]
 pub fn draw(
@@ -308,6 +327,7 @@ pub fn draw(
     _w: f64,
     _h: f64,
     fields: &dyn deckcraft_text::Fields,
+    editing: bool,
 ) -> Option<kurbo::Rect> {
     let _ = pres;
     let rects = cell_rects(t, &row_heights(rctx, t, fields));
@@ -399,12 +419,18 @@ pub fn draw(
     // Text.
     for (r, c, rect) in &rects {
         let Some(cell) = t.cell(*r, *c) else { continue };
-        if cell.text.is_empty() {
+        if (cell.text.is_empty() && !editing) || text_off_target(cell, *rect, m, (ctx.width(), ctx.height())) {
             continue;
         }
         let body = cell_body(rctx, t, *r, *c, cell);
         let tmp = Shape { text: Some(body.clone()), ..Default::default() };
-        crate::draw_text(ctx, rctx, &tmp, &body, *rect, m, fields, None);
+        #[cfg(test)]
+        TEXT_CELLS_DRAWN.with(|n| n.set(n.get() + 1));
+        let mut l = deckcraft_text::layout(rctx, &tmp, &body, &deckcraft_text::Opts { rect: *rect, fields, prompt_color: None, no_shrink: false });
+        if editing {
+            crate::preview_empty_bullets(&mut l);
+        }
+        crate::draw_layout(ctx, &l, *rect, m);
         let _ = peniko::Fill::NonZero;
     }
     covered

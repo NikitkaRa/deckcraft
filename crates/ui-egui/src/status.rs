@@ -20,15 +20,17 @@ pub fn status_bar(app: &mut SlideApp, ui: &mut Ui) {
         };
         let p = ui.painter();
         p.text(pos2(rect.min.x + 14.0, rect.center().y), Align2::LEFT_CENTER, &left, theme::font(12.0), t.text_dim);
-        p.text(pos2(rect.min.x + 120.0, rect.center().y), Align2::LEFT_CENTER, "English (United States)", theme::font(12.0), t.text_dim);
+        // The selection's proofing language; a click opens Review › Language.
+        let (lang, no_proof) = crate::dialogs::selected_language(app);
+        let name = crate::squiggles::lang_name(&lang) + if no_proof { " (not checked)" } else { "" };
+        let lr = p.text(pos2(rect.min.x + 120.0, rect.center().y), Align2::LEFT_CENTER, &name, theme::font(12.0), t.text_dim);
+        if ui.interact(lr.expand(3.0), ui.id().with("status_lang"), Sense::click()).on_hover_text("Language").clicked() {
+            app.dialog = Some(crate::dialogs::Dialog::new("language"));
+        }
         // Transient status message.
-        if let Some((msg, at)) = app.status.clone() {
-            if crate::now_ms() - at < 6000.0 {
-                p.text(pos2(rect.min.x + 290.0, rect.center().y), Align2::LEFT_CENTER, &msg, theme::font(12.0), t.accent);
-                ui.ctx().request_repaint_after(std::time::Duration::from_millis(500));
-            } else {
-                app.status = None;
-            }
+        if let Some(msg) = app.fresh_status() {
+            p.text(pos2(rect.min.x + 290.0, rect.center().y), Align2::LEFT_CENTER, &msg, theme::font(12.0), t.accent);
+            ui.ctx().request_repaint_after(std::time::Duration::from_millis(500));
         }
         let mut right = ui.new_child(
             egui::UiBuilder::new()
@@ -39,10 +41,10 @@ pub fn status_bar(app: &mut SlideApp, ui: &mut Ui) {
         if small_icon(&mut right, Icon::FitSmall, "Fit slide to current window", false).clicked() {
             app.ui.zoom = None;
         }
-        let pct = (app.ui.zoom.unwrap_or(app.canvas_scale) * 100.0).round();
+        let pct = (app.canvas_scale * 100.0).round();
         let lbl = right.add(egui::Label::new(egui::RichText::new(format!("{pct}%")).size(12.0).color(t.text_dim)).sense(Sense::click()));
         if lbl.clicked() {
-            app.dialog = Some(crate::dialogs::Dialog::new("zoom"));
+            let _ = app.run("view.zoomDialog", json!({}));
         }
         if small_icon(&mut right, Icon::ZoomIn, "Zoom In", false).clicked() {
             let _ = app.run("view.zoomIn", json!({}));
@@ -108,6 +110,11 @@ fn labeled(ui: &mut Ui, icon: Icon, label: &str, on: bool) -> egui::Response {
     resp
 }
 
+/// The language of a slide's notes: the first notes run that has one.
+fn notes_lang(s: &deckcraft_model::Slide) -> Option<String> {
+    s.notes.paragraphs.iter().flat_map(|p| &p.runs).find_map(|r| r.props.lang.clone())
+}
+
 /// The speaker notes editor under the slide.
 pub fn notes_pane(app: &mut SlideApp, ui: &mut Ui) {
     let t = Tokens::get(ui.ctx());
@@ -115,9 +122,18 @@ pub fn notes_pane(app: &mut SlideApp, ui: &mut Ui) {
     if st.selection.target != deckcraft_engine::Target::Slides {
         return;
     }
-    let idx = st.selection.slide;
-    let uid = st.uid;
-    let current = st.current_slide().map(|s| s.notes_text()).unwrap_or_default();
+    let (idx, uid) = (st.selection.slide, st.uid);
+    // Save an edited draft once the field has lost focus or another slide is shown (before
+    // anything reloads it), to the slide it was written on.
+    let id = egui::Id::new("notes_edit");
+    let focused = ui.ctx().memory(|m| m.has_focus(id));
+    if app.notes_buf.2.edited && (!focused || app.notes_buf.0 != uid || app.notes_buf.1 != idx) {
+        app.notes_buf.2.edited = false;
+        if app.notes_buf.0 == uid {
+            let _ = app.run("slide.notes", json!({"body": app.notes_buf.2.body, "index": app.notes_buf.1}));
+        }
+    }
+    let notes = app.session.active().and_then(|st| st.current_slide()).map(|s| s.notes.clone()).unwrap_or_default();
     egui::Panel::bottom("notes")
         .resizable(true)
         .default_size(app.ui.notes_height)
@@ -128,35 +144,107 @@ pub fn notes_pane(app: &mut SlideApp, ui: &mut Ui) {
             let rect = ui.max_rect();
             ui.painter()
                 .line_segment([pos2(rect.min.x - 8.0, rect.min.y - 6.0), pos2(rect.max.x + 8.0, rect.min.y - 6.0)], Stroke::new(1.0, t.separator));
-            // Keep a local buffer per slide; commit when it changes and the field loses focus.
-            let id = egui::Id::new("notes_edit");
-            let focused = ui.ctx().memory(|m| m.has_focus(id));
-            // Focus can leave in the frame before the field is drawn (Escape, a click on a
-            // thumbnail): what was typed is still committed, to the slide it was typed for.
-            let was_focused = ui.ctx().memory(|m| m.had_focus_last_frame(id));
-            if app.notes_buf.0 != uid || app.notes_buf.1 != idx {
-                let (old_uid, old_idx, typed) = std::mem::replace(&mut app.notes_buf, (uid, idx, current.clone()));
-                let old = app.session.active().and_then(|d| d.doc.slides.get(old_idx)).map(|s| s.notes_text());
-                if was_focused && old_uid == uid && old.is_some_and(|o| o != typed) {
-                    let _ = app.run("slide.notes", json!({"text": typed, "index": old_idx}));
+            // Keep a local draft per slide, following the notes while the field isn't focused.
+            if app.notes_buf.0 != uid || app.notes_buf.1 != idx || (!focused && app.notes_buf.2.body != notes) {
+                app.notes_buf = (uid, idx, crate::notes::Draft::new(&notes));
+            }
+            let mut draft = app.notes_buf.2.clone();
+            let look = crate::notes::Look { size: 13.0, color: None };
+            // Long notes scroll inside the pane instead of spilling over the slide (#221).
+            let out = egui::ScrollArea::vertical()
+                .max_height(ui.available_height())
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    crate::notes::editor(ui, &mut draft, &look, |e| {
+                        e.id(id).hint_text("Click to add notes").frame(egui::Frame::NONE).desired_width(f32::INFINITY).desired_rows(2)
+                    })
+                })
+                .inner;
+            let r = out.response.response.clone();
+            let mut buf = draft.text.clone();
+            // Spelling squiggles under misspelt words of the notes.
+            let lang = app.session.active().and_then(|d| d.doc.slides.get(idx)).and_then(|s| notes_lang(s)).unwrap_or_else(|| "en-US".into());
+            let caret = out.cursor_range.map(|c| c.primary.index.0);
+            for (a, b) in app.squiggles.notes(&buf, &lang, caret, Some(ui.ctx())) {
+                let (ra, rb) = (out.galley.pos_from_cursor(egui::text::CCursor::new(a)), out.galley.pos_from_cursor(egui::text::CCursor::new(b)));
+                // One underline per row the word is on (a word doesn't wrap, so normally one).
+                if (ra.bottom() - rb.bottom()).abs() < 1.0 {
+                    let y = ra.bottom() - 1.0;
+                    let o = out.galley_pos.to_vec2();
+                    crate::squiggles::paint(ui.painter(), egui::pos2(ra.left(), y) + o, egui::pos2(rb.left(), y) + o, 1.0);
                 }
             }
-            if !focused && !was_focused && app.notes_buf.2 != current {
-                app.notes_buf.2 = current.clone();
+            // Right-click on a flagged word: its corrections, Ignore All, Add to Dictionary.
+            if r.secondary_clicked()
+                && let Some(pos) = r.interact_pointer_pos()
+            {
+                let at = out.galley.cursor_from_pos(pos - out.galley_pos).index.0;
+                let hit = app.squiggles.notes(&buf, &lang, None, None).into_iter().find(|(a, b)| at >= *a && at <= *b);
+                app.squiggles.notes_menu = hit.and_then(|(a, _)| {
+                    let before: String = buf.chars().take(a).collect();
+                    let line_start = before.rfind('\n').map_or(0, |i| before[..i].chars().count() + 1);
+                    let line = buf.chars().skip(line_start).take_while(|c| *c != '\n').collect::<String>();
+                    crate::squiggles::menu_word(
+                        &deckcraft_model::Paragraph::new(&line),
+                        &lang,
+                        crate::squiggles::Tag::Notes { start: line_start },
+                        a - line_start,
+                    )
+                });
             }
-            let mut buf = app.notes_buf.2.clone();
-            let r = ui.add(
-                egui::TextEdit::multiline(&mut buf)
-                    .id(id)
-                    .hint_text("Click to add notes")
-                    .frame(egui::Frame::NONE)
-                    .desired_width(f32::INFINITY)
-                    .desired_rows(2)
-                    .font(theme::font(13.0)),
-            );
-            app.notes_buf.2 = buf.clone();
-            if r.lost_focus() && buf != current {
-                let _ = app.run("slide.notes", json!({"text": buf, "index": idx}));
+            let mut changed: Option<String> = None;
+            if app.squiggles.notes_menu.is_some() {
+                r.context_menu(|ui| {
+                    let Some(w) = app.squiggles.notes_menu.clone() else { return };
+                    let crate::squiggles::Tag::Notes { start: ls } = w.tag else { return };
+                    let chars: Vec<char> = buf.chars().collect();
+                    let end = ls + w.start + w.word.chars().count();
+                    let splice = |from: usize, to: &str| -> String {
+                        chars[..from.min(chars.len())]
+                            .iter()
+                            .chain(to.chars().collect::<Vec<_>>().iter())
+                            .chain(chars[end.min(chars.len())..].iter())
+                            .collect()
+                    };
+                    if let Some(from) = w.delete_from {
+                        if ui.button(egui::RichText::new("Delete Repeated Word").strong()).clicked() {
+                            changed = Some(splice(ls + from, ""));
+                            ui.close();
+                        }
+                    } else if w.suggestions.is_empty() {
+                        ui.label(egui::RichText::new("(no spelling suggestions)").weak());
+                    }
+                    for to in &w.suggestions {
+                        if ui.button(egui::RichText::new(to).strong()).clicked() {
+                            changed = Some(splice(ls + w.start, to));
+                            ui.close();
+                        }
+                    }
+                    if ui.button("Ignore All").clicked() {
+                        app.squiggles.ignore(&w.word);
+                        ui.close();
+                    }
+                    if w.delete_from.is_none() && ui.button("Add to Dictionary").clicked() {
+                        if let Err(e) = app.session.execute("review.addToDictionary", &json!({"word": w.word})) {
+                            app.set_status(e.to_string());
+                        }
+                        ui.close();
+                    }
+                });
             }
+            if let Some(new) = changed {
+                // A correction is typed into the formatted draft, then saved.
+                buf = new;
+                app.squiggles.notes_menu = None;
+                draft.text = buf.clone();
+                deckcraft_model::edit::replace_text(&mut draft.body, &buf);
+                draft.edited = false;
+                let _ = app.run("slide.notes", json!({"body": draft.body, "index": idx}));
+            }
+            if r.lost_focus() && draft.edited {
+                draft.edited = false;
+                let _ = app.run("slide.notes", json!({"body": draft.body, "index": idx}));
+            }
+            app.notes_buf.2 = draft;
         });
 }

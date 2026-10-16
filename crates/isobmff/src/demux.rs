@@ -699,13 +699,14 @@ fn parse_stbl(stbl: &[u8], t: &mut Track, is_qt: bool, file_len: u64) -> Result<
     if let Some(p) = pcm {
         t.pcm_chunked = true;
         let a = t.audio().cloned().unwrap_or_default();
-        let frame_bytes = |frames: u64| -> u64 {
+        let bpf = p.bytes_per_frame().ok_or_else(|| Error::Invalid("PCM frame size overflows".into()))?;
+        let frame_bytes = |frames: u64| -> Option<u64> {
             if a.qt_version == 1 && a.bytes_per_frame > 0 && a.samples_per_packet > 0 {
-                frames / a.samples_per_packet as u64 * a.bytes_per_frame as u64
+                frames.checked_div(u64::from(a.samples_per_packet))?.checked_mul(u64::from(a.bytes_per_frame))
             } else if const_size > 1 {
-                frames * const_size as u64
+                frames.checked_mul(u64::from(const_size))
             } else {
-                frames * p.bytes_per_frame() as u64
+                frames.checked_mul(u64::from(bpf))
             }
         };
         if chunks.len() > MAX_SAMPLES {
@@ -721,7 +722,7 @@ fn parse_stbl(stbl: &[u8], t: &mut Track, is_qt: bool, file_len: u64) -> Result<
                 continue;
             }
             let dur = stts_c.take(spc as u64);
-            let size = frame_bytes(spc as u64).min(u32::MAX as u64) as u32;
+            let size = frame_bytes(spc as u64).ok_or_else(|| Error::Invalid("PCM sample size overflows".into()))?.min(u64::from(u32::MAX)) as u32;
             samples.push(Sample {
                 offset: off,
                 size,

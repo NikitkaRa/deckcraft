@@ -36,8 +36,8 @@ fn png() -> Vec<u8> {
 /// A deck with one shape filled with a stretched picture, exported.
 fn deck() -> Vec<u8> {
     let mut p = defaults::new_presentation(None);
-    let media = p.add_media("tile.png", "image/png", png());
-    let id = ShapeId(p.alloc_id());
+    let media = p.add_media("tile.png", "image/png", png()).expect("media");
+    let id = ShapeId(p.alloc_id().expect("ids"));
     let first = p.slides[0].id;
     p.slide_mut(first).expect("slide").shapes.push(Shape {
         id,
@@ -86,7 +86,7 @@ fn a_gradient_without_stops_is_saved_without_stops() {
     // must not turn it into a gradient of its own (it used to become solid white).
     use deckcraft_model::style::{Gradient, GradientShape};
     let mut p = defaults::new_presentation(None);
-    let id = ShapeId(p.alloc_id());
+    let id = ShapeId(p.alloc_id().expect("ids"));
     let first = p.slides[0].id;
     let own = Gradient { tile: [0.0; 4], stops: vec![], shape: GradientShape::Linear { angle: 45.0, scaled: true }, rotate_with_shape: true };
     p.slide_mut(first).expect("slide").shapes.push(Shape {
@@ -107,7 +107,7 @@ fn a_gradient_without_stops_is_saved_without_stops() {
 fn a_fill_overlay_round_trips() {
     use deckcraft_model::style::{FillOverlay, Gradient, GradientShape, GradientStop};
     let mut p = defaults::new_presentation(None);
-    let id = ShapeId(p.alloc_id());
+    let id = ShapeId(p.alloc_id().expect("ids"));
     let first = p.slides[0].id;
     let overlay = FillOverlay {
         blend: "mult".into(),
@@ -150,7 +150,7 @@ fn a_gradient_tile_rect_is_read_and_round_trips() {
         tile: [-1.0, -1.0, 0.0, 0.0],
     };
     let mut p = defaults::new_presentation(None);
-    let id = ShapeId(p.alloc_id());
+    let id = ShapeId(p.alloc_id().expect("ids"));
     let first = p.slides[0].id;
     p.slide_mut(first).expect("slide").shapes.push(Shape {
         id,
@@ -174,7 +174,7 @@ fn a_gradient_tile_rect_is_read_and_round_trips() {
 #[test]
 fn a_table_naming_no_style_is_drawn_with_the_table_grid() {
     let mut p = defaults::new_presentation(None);
-    let id = ShapeId(p.alloc_id());
+    let id = ShapeId(p.alloc_id().expect("ids"));
     let first = p.slides[0].id;
     let mut t = deckcraft_model::Table::new(2, 2, 200.0, 40.0);
     t.style = "none".into();
@@ -207,8 +207,8 @@ fn a_table_naming_no_style_is_drawn_with_the_table_grid() {
 #[test]
 fn black_and_white_and_inverted_alpha_pictures_round_trip() {
     let mut p = defaults::new_presentation(None);
-    let media = p.add_media("tile.png", "image/png", png());
-    let id = ShapeId(p.alloc_id());
+    let media = p.add_media("tile.png", "image/png", png()).expect("media");
+    let id = ShapeId(p.alloc_id().expect("ids"));
     let first = p.slides[0].id;
     let mut pf = PictureFill { media, ..Default::default() };
     pf.adjust.bilevel = Some(0.3);
@@ -255,8 +255,8 @@ fn textured_fill(bytes: &[u8]) -> Option<Fill> {
 fn an_svg_icon_round_trips_ahead_of_its_png_fallback() {
     let svg = br#"<svg xmlns="http://www.w3.org/2000/svg" width="8" height="8"><rect width="8" height="8" fill="red"/></svg>"#.to_vec();
     let mut p = defaults::new_presentation(None);
-    let media = p.add_media("icon.svg", "image/svg+xml", svg.clone());
-    let id = ShapeId(p.alloc_id());
+    let media = p.add_media("icon.svg", "image/svg+xml", svg.clone()).expect("media");
+    let id = ShapeId(p.alloc_id().expect("id"));
     let first = p.slides[0].id;
     p.slide_mut(first).expect("slide").shapes.push(Shape {
         id,
@@ -319,8 +319,8 @@ fn an_svgz_icon_is_stored_as_svg_markup() {
     );
     assert!(gz.starts_with(&[0x1f, 0x8b]));
     let mut p = defaults::new_presentation(None);
-    let media = p.add_media("icon.svgz", "image/svg+xml", gz);
-    let id = ShapeId(p.alloc_id());
+    let media = p.add_media("icon.svgz", "image/svg+xml", gz).expect("media");
+    let id = ShapeId(p.alloc_id().expect("id"));
     let first = p.slides[0].id;
     p.slide_mut(first).expect("slide").shapes.push(Shape {
         id,

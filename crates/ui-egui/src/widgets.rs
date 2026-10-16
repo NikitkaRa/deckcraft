@@ -39,6 +39,9 @@ pub fn big_button_ex(ui: &mut Ui, icon: Icon, label: &str, enabled: bool, split:
     let text_w = lines.iter().map(|l| ui.fonts_mut(|f| f.layout_no_wrap(l.to_string(), font.clone(), t.text).size().x)).fold(0.0f32, f32::max);
     let w = (text_w + 10.0 + if split && lines.len() == 1 { 10.0 } else { 0.0 }).max(40.0);
     let (rect, resp) = ui.allocate_exact_size(vec2(w, RIBBON_H - 2.0), if enabled { Sense::click() } else { Sense::hover() });
+    // Named for screen readers and UI tests ("Ink to\nShape" reads "Ink to Shape").
+    let spoken = label.replace('\n', " ");
+    resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, enabled, &spoken));
     let painter = ui.painter_at(rect.expand(1.0));
     let (main_rect, arrow_rect) = if split {
         (Rect::from_min_max(rect.min, pos2(rect.max.x, rect.min.y + 38.0)), Some(Rect::from_min_max(pos2(rect.min.x, rect.min.y + 38.0), rect.max)))
@@ -117,6 +120,9 @@ pub fn small_button_ex(ui: &mut Ui, icon: Icon, label: &str, enabled: bool, sele
     let arrow_w = if split { 12.0 } else { 0.0 };
     let w = 24.0 + tw + arrow_w;
     let (rect, resp) = ui.allocate_exact_size(vec2(w, 22.0), if enabled { Sense::click() } else { Sense::hover() });
+    if !label.is_empty() {
+        resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, enabled, label));
+    }
     let painter = ui.painter_at(rect);
     let main_rect = Rect::from_min_max(rect.min, pos2(rect.max.x - arrow_w, rect.max.y));
     let main_resp =
@@ -155,6 +161,8 @@ pub fn icon_toggle(ui: &mut Ui, icon: Icon, tip: &str, enabled: bool, on: bool) 
         painter.rect_filled(rect, CornerRadius::same(4), c);
     }
     icons::paint(&painter, rect.shrink(3.0), icon, t.text, !enabled);
+    // Named for screen readers (and tests) by its tooltip.
+    resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, enabled, tip));
     resp.on_hover_text(tip)
 }
 
@@ -243,12 +251,25 @@ pub fn dropdown(ui: &mut Ui, id: &str, current: &str, width: f32, enabled: bool,
 /// (egui menus close on any click inside). Picking a colour closes it (`color_grid` calls
 /// `ui.close()`); other buttons in it must close it themselves.
 pub fn color_popup(button: &Response) -> egui::Popup<'_> {
-    egui::Popup::menu(button).close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+    let mut popup = egui::Popup::menu(button).close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside);
+    // A colour the Eyedropper took for this menu: open it so `color_grid` hands the colour back.
+    if crate::eyedropper::result_waits_for(&button.ctx, button.id) {
+        popup = popup.open_memory(egui::SetOpenCommand::Bool(true));
+    }
+    if popup.is_open() {
+        crate::eyedropper::note_open_menu(&button.ctx, button.id);
+    }
+    popup
 }
 
 /// The colour grid popup body: theme colours with tints/shades, standard colours, extra entries.
 /// Returns the picked colour (`Some(None)` = "No Fill"/"Automatic" when `none_label` is given).
 pub fn color_grid(ui: &mut Ui, scheme: &ColorScheme, none_label: Option<&str>) -> Option<Option<ColorRef>> {
+    // The Eyedropper's colour, handed back as if its swatch had been clicked.
+    if let Some(c) = crate::eyedropper::take_result(ui.ctx()).and_then(|hex| Rgba::from_hex(&hex)) {
+        ui.close();
+        return Some(Some(ColorRef::rgb(c)));
+    }
     let t = Tokens::get(ui.ctx());
     let mut out = None;
     ui.set_min_width(220.0);
@@ -343,6 +364,10 @@ pub fn color_grid(ui: &mut Ui, scheme: &ColorScheme, none_label: Option<&str>) -
         }
     });
     ui.data_mut(|d| d.insert_temp(id, hex));
+    if ui.button("Eyedropper").on_hover_text("Click the slide to take the colour under the pointer").clicked() {
+        crate::eyedropper::request(ui.ctx());
+        ui.close();
+    }
     if out.is_some() {
         ui.close();
     }
@@ -423,6 +448,15 @@ pub fn fmt_num(v: f64, suffix: &str) -> String {
     format!("{s}{suffix}")
 }
 
+/// The text a kept-open text box shows: the typed draft while the stored value is still what the
+/// draft started from, otherwise the stored value (another document, a reorder or an undo changed it).
+pub fn text_draft(stored: Option<(String, String)>, current: &str) -> String {
+    match stored {
+        Some((base, buf)) if base == current => buf,
+        _ => current.to_string(),
+    }
+}
+
 /// Section header inside panes.
 pub fn section(ui: &mut Ui, title: &str, open: bool) -> bool {
     let t = Tokens::get(ui.ctx());
@@ -484,5 +518,52 @@ mod tests {
         harness.run();
         assert_eq!(*picked.borrow(), Some(Some(ColorRef::rgb(Rgba::from_hex("00FF00").unwrap()))));
         assert!(harness.query_by_role(Role::TextInput).is_none(), "picking a colour closes the menu");
+    }
+
+    /// Choosing Eyedropper closes the menu and asks for it; the colour it takes comes back through
+    /// the same menu, as if its swatch had been clicked.
+    #[test]
+    fn the_eyedroppers_colour_comes_back_through_the_menu_that_asked() {
+        let picked = RefCell::new(None);
+        let scheme = deckcraft_model::Theme::default().colors;
+        let mut harness = egui_kittest::Harness::builder().with_size(vec2(400.0, 500.0)).build_ui(|ui| {
+            theme::install_fonts(ui.ctx());
+            let r = ui.button("Pick");
+            color_popup(&r).show(|ui| {
+                if let Some(c) = color_grid(ui, &scheme, None) {
+                    *picked.borrow_mut() = Some(c);
+                }
+            });
+        });
+        harness.get_by_label("Pick").click();
+        harness.run();
+        harness.get_by_label("Eyedropper").click();
+        harness.run();
+        assert!(harness.query_by_label("Eyedropper").is_none(), "choosing it closes the menu");
+        assert!(picked.borrow().is_none(), "nothing is picked yet");
+        // The app starts the Eyedropper from this request; here the colour is taken at once.
+        assert!(harness.ctx.data_mut(|d| d.remove_temp::<bool>(egui::Id::new("deckcraft.eyedropper.request"))).unwrap_or(false));
+        let menu = crate::eyedropper::open_menu(&harness.ctx).expect("the open menu noted its button");
+        crate::eyedropper::store_result(&harness.ctx, menu, "00FF00");
+        harness.run();
+        assert_eq!(*picked.borrow(), Some(Some(ColorRef::rgb(Rgba::from_hex("00FF00").unwrap()))));
+        assert!(harness.query_by_label("Eyedropper").is_none(), "the menu closes again");
+        harness.run();
+        assert_eq!(picked.borrow().iter().count(), 1, "the colour is handed back once");
+    }
+
+    /// #413: a draft is kept while the stored text is unchanged ...
+    #[test]
+    fn text_draft_keeps_typing_while_the_stored_text_is_unchanged() {
+        let stored = Some(("old".to_string(), "old plus typing".to_string()));
+        assert_eq!(text_draft(stored, "old"), "old plus typing");
+    }
+
+    /// ... and dropped when the stored text changes underneath it.
+    #[test]
+    fn text_draft_drops_a_stale_draft_when_the_stored_text_changes() {
+        let stored = Some(("old".to_string(), "old plus typing".to_string()));
+        assert_eq!(text_draft(stored, "undone"), "undone");
+        assert_eq!(text_draft(None, "fresh"), "fresh");
     }
 }

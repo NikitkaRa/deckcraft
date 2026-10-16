@@ -7,7 +7,8 @@
 //! Differences from the desktop app:
 //! - no TCP control channel (browsers can't listen on sockets);
 //! - File → Open and Insert → Pictures/Audio/Video use the browser file picker; bytes arrive
-//!   asynchronously through `Services::inbox` (presentations open, media is inserted);
+//!   asynchronously through `Services::inbox`, applied to the document, slide and operation
+//!   that started the pick (a dismissed picker or a closed document drops the file);
 //! - Save and Export trigger a browser download;
 //! - dropped files are read asynchronously by `web::WebShell` and delivered through the inbox;
 //! - preferences are not persisted.

@@ -16,13 +16,18 @@ pub fn transition(w: &mut W, x: &mut Exp, o: &mut Out, t: &Transition) {
         601..=900 => "med",
         _ => "slow",
     };
-    let sound = t.sound.and_then(|m| x.media_rel(o, m, "audio"));
+    let sound = t.sound.and_then(|m| x.media_rel(o, m, "audio").map(|r| (r, x.p.media(m).map(|i| i.name.clone()).unwrap_or_default())));
     let snd = |w: &mut W| {
-        if let Some(r) = &sound {
+        if let Some((r, name)) = &sound {
             w.open0("p:sndAc");
-            w.open0("p:stSnd");
-            w.empty("p:snd", A::new().a("r:embed", r).a("name", "sound.wav"));
+            w.open("p:stSnd", A::new().t("loop", t.sound_loop));
+            let name = if name.is_empty() { "sound.wav" } else { name.as_str() };
+            w.empty("p:snd", A::new().a("r:embed", r).a("name", name));
             w.close("p:stSnd");
+            w.close("p:sndAc");
+        } else if t.stop_sound {
+            w.open0("p:sndAc");
+            w.empty0("p:endSnd");
             w.close("p:sndAc");
         }
     };
@@ -208,14 +213,14 @@ fn filter_for(effect: &str, option: &str) -> &'static str {
                 "randombar(horizontal)"
             }
         }
-        "blinds" => {
+        "blinds" | "blindsOut" => {
             if option == "vert" {
                 "blinds(vertical)"
             } else {
                 "blinds(horizontal)"
             }
         }
-        "box" => {
+        "box" | "boxOut" => {
             if option == "out" {
                 "box(out)"
             } else {
@@ -229,7 +234,7 @@ fn filter_for(effect: &str, option: &str) -> &'static str {
                 "circle(in)"
             }
         }
-        "diamond" => {
+        "diamond" | "diamondOut" => {
             if option == "out" {
                 "diamond(out)"
             } else {
@@ -246,7 +251,7 @@ fn filter_for(effect: &str, option: &str) -> &'static str {
             "plusOut" => "plus(out)",
             _ => "circle(in)",
         },
-        "checkerboard" => {
+        "checkerboard" | "checkerboardOut" => {
             if option == "down" {
                 "checkerboard(down)"
             } else {
@@ -261,13 +266,13 @@ fn filter_for(effect: &str, option: &str) -> &'static str {
             "8" => "wheel(8)",
             _ => "wheel(1)",
         },
-        "strips" => match option {
+        "strips" | "stripsOut" => match option {
             "ru" => "strips(upRight)",
             "ld" => "strips(downLeft)",
             "rd" => "strips(downRight)",
             _ => "strips(upLeft)",
         },
-        "peek" => match option {
+        "peek" | "peekOut" => match option {
             "t" => "slide(fromTop)",
             "l" => "slide(fromLeft)",
             "r" => "slide(fromRight)",
@@ -328,7 +333,12 @@ fn behaviors(w: &mut W, x: &mut Exp, ids: &mut Ids, e: &Eff) {
                     anim_prop(w, ids, e, dur, "ppt_x", "#ppt_x", fx);
                     anim_prop(w, ids, e, dur, "ppt_y", "#ppt_y", fy);
                 }
-                "zoomOut" | "shrinkTurn" => {
+                "floatOut" | "sinkDown" => {
+                    let to = if a.effect == "sinkDown" || a.option == "d" { "#ppt_y+.1" } else { "#ppt_y-.1" };
+                    anim_prop(w, ids, e, dur, "ppt_y", "#ppt_y", to);
+                    anim_effect(w, ids, e, dur, "fade", true);
+                }
+                "zoomOut" | "shrinkTurn" | "spinnerOut" | "contract" => {
                     anim_prop(w, ids, e, dur, "ppt_w", "#ppt_w", "0");
                     anim_prop(w, ids, e, dur, "ppt_h", "#ppt_h", "0");
                     anim_effect(w, ids, e, dur, "fade", true);
@@ -353,6 +363,25 @@ fn behaviors(w: &mut W, x: &mut Exp, ids: &mut Ids, e: &Eff) {
                 w.val("p:strVal", format!("{:.2}", (1.0 - a.amount.unwrap_or(0.5)).clamp(0.0, 1.0)));
                 w.close("p:to");
                 w.close("p:set");
+            }
+            "colorPulse" => {
+                // As PowerPoint writes it: text and fill go to the colour and back (autoRev). The behaviour
+                // duration is the one import reads as the effect duration.
+                let c = a.color.clone().unwrap_or(deckcraft_model::ColorRef::rgb(deckcraft_color::Rgba::rgb(0xC0, 0x00, 0x00)));
+                for (attr, child) in [("style.color", true), ("fillcolor", false)] {
+                    w.open("p:animClr", A::new().a("clrSpc", "rgb").a("dir", "cw"));
+                    w.open("p:cBhvr", A::new().o("override", child.then_some("childStyle")));
+                    w.empty("p:cTn", A::new().a("id", ids.next()).a("dur", dur.max(1)).a("autoRev", "1").a("fill", "remove"));
+                    tgt(w, e.spid, e.paragraph);
+                    w.open0("p:attrNameLst");
+                    w.elt("p:attrName", attr);
+                    w.close("p:attrNameLst");
+                    w.close("p:cBhvr");
+                    w.open0("p:to");
+                    super::dml::color(w, &c);
+                    w.close("p:to");
+                    w.close("p:animClr");
+                }
             }
             "fillColor" | "objectColor" | "fontColor" | "lineColor" | "complementaryColor" | "darken" | "lighten" => {
                 let attr = match a.effect.as_str() {
@@ -425,7 +454,11 @@ fn effect_par(w: &mut W, x: &mut Exp, ids: &mut Ids, e: &Eff, first_in_click: bo
     };
     let _ = first_in_click;
     let preset = crate::maps::preset_for(a);
-    let sub = crate::maps::subtype_from_option(&a.effect, &a.option).or(a.preset_subtype.filter(|_| a.preset_id == Some(preset))).unwrap_or(0);
+    let sub = if preset == 47 {
+        0
+    } else {
+        crate::maps::subtype_from_option(&a.effect, &a.option).or(a.preset_subtype.filter(|_| a.preset_id == Some(preset))).unwrap_or(0)
+    };
     let repeat = match a.repeat {
         u32::MAX => Some("indefinite".to_string()),
         0 | 1 => None,
@@ -433,6 +466,9 @@ fn effect_par(w: &mut W, x: &mut Exp, ids: &mut Ids, e: &Eff, first_in_click: bo
     };
     let accel = (a.smooth_start > 0.0).then(|| (a.smooth_start.clamp(0.0, 1.0) * 100_000.0).round() as i64);
     let decel = (a.smooth_end > 0.0).then(|| (a.smooth_end.clamp(0.0, 1.0) * 100_000.0).round() as i64);
+    // `bounceEnd` is a positive percentage (100000 = 100%), same scale as accel/decel. The model stores 0–1.
+    let bounce =
+        (a.bounce_end.is_finite() && a.bounce_end > 0.0).then(|| (a.bounce_end.clamp(0.0, 1.0) * 100_000.0).round() as i64).filter(|n| *n > 0);
     w.open0("p:par");
     w.open(
         "p:cTn",
@@ -444,8 +480,9 @@ fn effect_par(w: &mut W, x: &mut Exp, ids: &mut Ids, e: &Eff, first_in_click: bo
             .o("repeatCount", repeat)
             .o("accel", accel)
             .o("decel", decel)
+            .o("bounceEnd", bounce)
             .t("autoRev", a.auto_reverse)
-            .a("fill", "hold")
+            .a("fill", if a.rewind { "remove" } else { "hold" })
             .a("grpId", e.grp)
             .a("nodeType", node),
     );

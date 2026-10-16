@@ -51,7 +51,7 @@ pub fn rasterize(bytes: &[u8], side: u32) -> Option<image::RgbaImage> {
     ctx.push_clip_layer(&r.to_path(0.1));
     for it in pic.place(r, [0.0; 4]) {
         match it {
-            PlacedItem::Path { path, fill, stroke, even_odd } => {
+            PlacedItem::Path { path, fill, stroke, even_odd, region } => clipped(&mut ctx, region.as_ref(), |ctx| {
                 if let Some(f) = fill {
                     ctx.set_paint(rgba(f));
                     ctx.set_fill_rule(if even_odd { peniko::Fill::EvenOdd } else { peniko::Fill::NonZero });
@@ -63,9 +63,9 @@ pub fn rasterize(bytes: &[u8], side: u32) -> Option<image::RgbaImage> {
                     ctx.set_stroke(kurbo::Stroke::new(sw.max(1.0)).with_caps(kurbo::Cap::Round).with_join(kurbo::Join::Round));
                     ctx.stroke_path(&path);
                 }
-            }
-            PlacedItem::Bitmap { index, rect } => {
-                let Some(Some(pm)) = pixmaps.get(index) else { continue };
+            }),
+            PlacedItem::Bitmap { index, rect, region } => clipped(&mut ctx, region.as_ref(), |ctx| {
+                let Some(Some(pm)) = pixmaps.get(index) else { return };
                 let (bw, bh) = (pm.width().max(1) as f64, pm.height().max(1) as f64);
                 ctx.set_paint(vello_cpu::Image {
                     image: vello_cpu::ImageSource::Pixmap(pm.clone()),
@@ -74,9 +74,9 @@ pub fn rasterize(bytes: &[u8], side: u32) -> Option<image::RgbaImage> {
                 ctx.set_paint_transform(Affine::translate((rect.x0, rect.y0)) * Affine::scale_non_uniform(rect.width() / bw, rect.height() / bh));
                 ctx.fill_rect(&rect);
                 ctx.reset_paint_transform();
-            }
-            PlacedItem::Pattern { index, path, even_odd, tile } => {
-                let Some(Item::Pattern { tile: t, .. }) = pic.items.get(index) else { continue };
+            }),
+            PlacedItem::Pattern { index, path, even_odd, tile, region } => clipped(&mut ctx, region.as_ref(), |ctx| {
+                let Some(Item::Pattern { tile: t, .. }) = pic.items.get(index) else { return };
                 let key = Arc::as_ptr(t);
                 let (pm, avg) = tiles.entry(key).or_insert_with(|| (premul(t.width, t.height, &t.rgba), average(&t.rgba))).clone();
                 ctx.set_fill_rule(if even_odd { peniko::Fill::EvenOdd } else { peniko::Fill::NonZero });
@@ -101,17 +101,17 @@ pub fn rasterize(bytes: &[u8], side: u32) -> Option<image::RgbaImage> {
                         ctx.fill_path(&path);
                     }
                 }
-            }
-            PlacedItem::Text { index, transform, clip } => {
-                let Some(Item::Text(t)) = pic.items.get(index) else { continue };
+            }),
+            PlacedItem::Text { index, transform, clip, region } => clipped(&mut ctx, region.as_ref(), |ctx| {
+                let Some(Item::Text(t)) = pic.items.get(index) else { return };
                 if let Some(c) = clip {
                     ctx.push_clip_layer(&c.to_path(0.1));
                 }
-                draw_text(&mut ctx, t, transform);
+                draw_text(ctx, t, transform);
                 if clip.is_some() {
                     ctx.pop_layer();
                 }
-            }
+            }),
         }
     }
     ctx.set_fill_rule(peniko::Fill::NonZero);
@@ -131,6 +131,17 @@ pub fn rasterize(bytes: &[u8], side: u32) -> Option<image::RgbaImage> {
         }
     }
     image::RgbaImage::from_raw(w as u32, h as u32, px)
+}
+
+/// Draws `draw` inside the device-context clip. No region is the default clip.
+fn clipped(ctx: &mut RenderContext, region: Option<&BezPath>, draw: impl FnOnce(&mut RenderContext)) {
+    if let Some(region) = region {
+        ctx.push_clip_layer(region);
+        draw(ctx);
+        ctx.pop_layer();
+    } else {
+        draw(ctx);
+    }
 }
 
 /// One glyph placed in text space (x along the baseline from the string's start, font units at

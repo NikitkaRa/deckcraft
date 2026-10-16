@@ -3,8 +3,8 @@
 //! Methods (JSON lines over the host's transport, see `docs/control-protocol.md`):
 //! - `engine.execute {command, params}` / `ui.menu.invoke {command, params}`: run any command (engine or UI)
 //! - `engine.commands`: engine + UI commands with enablement; `document.inspect`; `ui.inspect`
-//! - `ui.pointer {events:[{kind: down|drag|up|move|doubleclick, x, y}], mods}`: drive the active tool in
-//!   slide points (same path as the mouse)
+//! - `ui.pointer {events:[{kind: down|drag|up|move|doubleclick, x, y, pressure?}], mods}`: drive the active tool in
+//!   slide points (same path as the mouse; `pressure` is `0..=1` when a pen reported one)
 //! - `ui.key {key, shift?, alt?, cmd?}` / `ui.text {text}`: keyboard through the engine
 //! - `ui.tool.select {tool, preset?}`
 //! - `ui.click {x, y, button?, count?}` / `ui.move {x, y}` / `ui.drag {x, y, toX, toY, steps?}`: real egui pointer
@@ -28,12 +28,34 @@ pub struct ControlRequest {
     pub method: String,
     pub params: Value,
     pub reply: Sender<ControlResponse>,
+    /// Who has the request: [`PENDING`], [`TAKEN`] (the app runs it) or [`ABANDONED`] (the
+    /// sender gave up on it, so the app must not run it late: issue #719).
+    pub state: std::sync::Arc<std::sync::atomic::AtomicU8>,
 }
+
+/// Queued, not yet run.
+pub const PENDING: u8 = 0;
+/// The app has started it: it will answer.
+pub const TAKEN: u8 = 1;
+/// Its sender gave up waiting (the reply timeout expired): it is dropped unrun.
+pub const ABANDONED: u8 = 2;
 
 impl ControlRequest {
     pub fn new(method: impl Into<String>, params: Value) -> (Self, std::sync::mpsc::Receiver<ControlResponse>) {
         let (tx, rx) = std::sync::mpsc::channel();
-        (Self { method: method.into(), params, reply: tx }, rx)
+        (Self { method: method.into(), params, reply: tx, state: Default::default() }, rx)
+    }
+
+    /// Claim the request for running; false when its sender already gave up on it.
+    pub fn take(&self) -> bool {
+        use std::sync::atomic::Ordering;
+        self.state.compare_exchange(PENDING, TAKEN, Ordering::SeqCst, Ordering::SeqCst).is_ok() || self.state.load(Ordering::SeqCst) == TAKEN
+    }
+
+    /// Give up on the request; false when the app has already started it (it will answer).
+    pub fn abandon(state: &std::sync::atomic::AtomicU8) -> bool {
+        use std::sync::atomic::Ordering;
+        state.compare_exchange(PENDING, ABANDONED, Ordering::SeqCst, Ordering::SeqCst).is_ok() || state.load(Ordering::SeqCst) == ABANDONED
     }
 }
 
@@ -75,7 +97,15 @@ pub fn inspect(app: &SlideApp, ctx: &egui::Context) -> Value {
         "dialog": app.dialog.as_ref().map(|d| d.id.clone()),
         "home": app.backstage_open(),
         "backstage": app.backstage.as_ref().map(|b| b.page.id()),
-        "showing": app.show.as_ref().map(|s| json!({"slide": s.state.slide, "step": s.state.step, "ended": s.ended})),
+        "showing": app.show.as_ref().map(|s| {
+            let (n, aspect) = app.session.active().map(|d| {
+                let h = d.doc.slide_size.height.max(1.0) as f32;
+                (d.doc.slides.len(), d.doc.slide_size.width as f32 / h)
+            }).unwrap_or((0, 16.0 / 9.0));
+            let now = ctx.input(|i| i.time);
+            s.showing_value(n, aspect, ctx.content_rect(), now)
+        }),
+        "animPreview": app.anim_preview_report().map(|(slide, time, duration)| json!({"slide": slide, "time": time, "duration": duration})),
         "documents": app.session.documents().iter().map(|d| json!({"title": d.title(), "dirty": d.is_dirty(), "path": d.path})).collect::<Vec<_>>(),
         "status": app.status.as_ref().map(|s| s.0.clone()),
         "perf": {"frameMs": app.perf.frame_ms, "renderMs": app.perf.render_ms, "fps": app.perf.fps},
@@ -125,7 +155,8 @@ pub fn handle(app: &mut SlideApp, ctx: &egui::Context, req: &ControlRequest) -> 
                     return err("pointer events need x and y");
                 };
                 let mods = e.get("mods").map(mods_from).unwrap_or(base);
-                match app.session.pointer(PointerEvent { kind, x, y, mods, tol: (4.0 / app.canvas_scale.max(0.05)) as f64 }) {
+                let pressure = e.get("pressure").and_then(Value::as_f64).map(|v| v as f32);
+                match app.session.pointer(PointerEvent { kind, x, y, mods, tol: (4.0 / app.canvas_scale.max(0.05)) as f64, pressure }) {
                     Ok(v) => last = v,
                     Err(e) => return err(e),
                 }
@@ -134,6 +165,10 @@ pub fn handle(app: &mut SlideApp, ctx: &egui::Context, req: &ControlRequest) -> 
         }
         "ui.key" => {
             let Some(k) = s("key") else { return err("missing `key`") };
+            if app.anim_preview_active() && app.show.is_none() && matches!(k.to_ascii_lowercase().as_str(), "escape" | "esc") {
+                app.stop_anim_preview();
+                return ok(json!({"preview": false}));
+            }
             if let Some(show) = app.show.as_ref()
                 && !show.ended
                 && let Some(key) = key_from(k)
@@ -229,7 +264,11 @@ pub fn handle(app: &mut SlideApp, ctx: &egui::Context, req: &ControlRequest) -> 
                 };
             }
             if let Some(z) = p.get("zoom") {
-                app.ui.zoom = z.as_f64().map(|v| v as f32);
+                app.ui.zoom = z
+                    .as_f64()
+                    .map(|v| v as f32)
+                    .filter(|v| v.is_finite() && *v > 0.0)
+                    .map(|v| v.clamp(*crate::ZOOM_RANGE.start(), *crate::ZOOM_RANGE.end()));
             }
             if let Some(d) = p.get("dark").and_then(Value::as_bool) {
                 let _ = app.run("view.dark", json!({"on": d}));
@@ -293,8 +332,15 @@ pub fn handle(app: &mut SlideApp, ctx: &egui::Context, req: &ControlRequest) -> 
             ok(Value::Null)
         }
         "show.start" => {
-            let from = p.get("from").and_then(Value::as_u64).unwrap_or(0) as usize;
-            app.start_show(from, p.get("reading").and_then(Value::as_bool).unwrap_or(false));
+            let reading = p.get("reading").and_then(Value::as_bool).unwrap_or(false);
+            if let Some(name) = p.get("custom").and_then(Value::as_str).filter(|s| !s.is_empty()) {
+                app.start_custom_show(name, reading);
+            } else if p.get("from").is_some() {
+                let from = p.get("from").and_then(Value::as_u64).unwrap_or(0) as usize;
+                app.start_show(from, reading);
+            } else {
+                app.start_show(app.show_start_index(), reading);
+            }
             ok(Value::Null)
         }
         "show.end" => {
@@ -342,6 +388,7 @@ fn deckcraft_mcp_kind(k: &str) -> Option<deckcraft_engine::PointerKind> {
         "move" => Move,
         "doubleclick" | "dblclick" => DoubleClick,
         "tripleclick" => TripleClick,
+        "contextclick" | "rightclick" => ContextClick,
         _ => return None,
     })
 }
@@ -375,5 +422,26 @@ pub fn save_screenshot(app: &mut SlideApp, image: &egui::ColorImage, path: Optio
             Err(e) => json!({"ok": false, "error": e}),
         },
         None => json!({"ok": false, "error": "no writer configured"}),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use super::*;
+
+    /// `take` and `abandon` are exclusive: whoever wins, the request runs at most once (#719).
+    #[test]
+    fn take_and_abandon_are_exclusive() {
+        let (req, _rx) = ControlRequest::new("m", json!({}));
+        assert!(req.take(), "a pending request is taken");
+        assert!(!ControlRequest::abandon(&req.state), "a taken request is not abandoned");
+        assert!(req.take(), "a taken request stays taken");
+
+        let (req, _rx) = ControlRequest::new("m", json!({}));
+        assert!(ControlRequest::abandon(&req.state), "a pending request is abandoned");
+        assert!(!req.take(), "an abandoned request is never taken");
+        assert!(ControlRequest::abandon(&req.state), "abandoning twice stays abandoned");
     }
 }

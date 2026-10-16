@@ -105,6 +105,7 @@ fn copy_opts<'a>(o: &RenderOpts<'a>) -> RenderOpts<'a> {
         state: o.state,
         skip: o.skip,
         skip_text: o.skip_text,
+        editing_text: o.editing_text,
         gif_times: o.gif_times,
         threads: o.threads,
         offset: o.offset,

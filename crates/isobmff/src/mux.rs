@@ -498,7 +498,10 @@ fn validate_track(cfg: &TrackConfig) -> Result<Option<u32>> {
         if (p.sample_rate - cfg.timescale as f64).abs() > 0.5 {
             return Err(Error::Mux("PCM track timescale must equal the sample rate".into()));
         }
-        return Ok(Some(p.bytes_per_frame()));
+        let Some(n) = p.bytes_per_frame() else {
+            return Err(Error::Mux("PCM frame size overflows".into()));
+        };
+        return Ok(Some(n));
     }
     Ok(None)
 }

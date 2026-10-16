@@ -9,6 +9,18 @@ use crate::{Result, Session};
 
 pub fn specs() -> Vec<CommandSpec> {
     vec![
+        cmd!(
+            "guide.add",
+            "Add Guide",
+            ["View", "Show", "Guides"],
+            None,
+            "{vertical: bool, pos?: pt (default: the slide's centre)} → {index}. `defaults: true` adds the two centre guides when there are none",
+            has_doc,
+            guide_add
+        ),
+        cmd!("guide.move", "Move Guide", [], None, "{index, pos: pt}", has_doc, guide_move),
+        cmd!("guide.delete", "Delete Guide", [], None, "{index}", has_doc, guide_delete),
+        cmd!(query "guide.list", "Guides", [], None, "{} → [{vertical, pos}]", has_doc, guide_list),
         cmd!("arrange.bringToFront", "Bring to Front", ["Arrange"], Some("Cmd+Shift+]"), "{ids?}", has_selection, |s, p| order(s, p, 2)),
         cmd!("arrange.bringForward", "Bring Forward", ["Arrange"], Some("Cmd+]"), "{ids?}", has_selection, |s, p| order(s, p, 1)),
         cmd!("arrange.sendBackward", "Send Backward", ["Arrange"], Some("Cmd+["), "{ids?}", has_selection, |s, p| order(s, p, -1)),
@@ -129,7 +141,7 @@ fn order_list(list: &mut Vec<Shape>, ids: &[ShapeId], how: i32) {
 /// Move one shape to `index` among its siblings (0 = back): the Selection pane's drag and drop.
 /// A shape stays in the list that holds it, so a group's child stays in its group.
 fn reorder(s: &mut Session, p: &Value) -> Result<Value> {
-    let id = id_param(p, "id").ok_or_else(|| bad("arrange.reorder", "missing `id`"))?;
+    let id = id_param(p, "id", "arrange.reorder")?.ok_or_else(|| bad("arrange.reorder", "missing `id`"))?;
     let to = usize_param(p, "index").ok_or_else(|| bad("arrange.reorder", "missing `index`"))?;
     let st = s.doc()?;
     let siblings: &[Shape] = match deckcraft_model::parent_of(st.shapes(), id) {
@@ -153,7 +165,7 @@ fn reorder(s: &mut Session, p: &Value) -> Result<Value> {
 }
 
 /// Bounds of shapes (rotation included).
-fn union_bounds(xs: &[Xfrm]) -> Option<Rect> {
+pub(crate) fn union_bounds(xs: &[Xfrm]) -> Option<Rect> {
     let mut it = xs.iter().map(Xfrm::bounds);
     let first = it.next()?;
     Some(it.fold(first, |a, b| a.union(b)))
@@ -177,7 +189,7 @@ fn group(s: &mut Session, p: &Value) -> Result<Value> {
         let xs: Vec<Xfrm> = members.iter().filter_map(|m| m.xfrm).collect();
         let b = union_bounds(&xs).ok_or_else(|| bad("arrange.group", "nothing to group"))?;
         let gx = Xfrm::new(b.x0, b.y0, b.width(), b.height());
-        let id = ShapeId(doc.alloc_id());
+        let id = ShapeId(doc.alloc_id().ok_or_else(|| bad("arrange.group", NO_ID_SPACE))?);
         let n = super::current_shapes(doc, sel).map(|v| v.len()).unwrap_or(0);
         let g = Shape {
             id,
@@ -338,3 +350,76 @@ fn distribute(s: &mut Session, p: &Value) -> Result<Value> {
         Ok(())
     })
 }
+
+/// Guides are kept on the slide; a file can hold at most this many.
+const MAX_GUIDES: usize = 200;
+
+fn guide_limit(s: &Session, vertical: bool) -> Result<f64> {
+    let size = s.doc()?.doc.slide_size;
+    Ok(if vertical { size.width } else { size.height })
+}
+
+fn guide_add(s: &mut Session, p: &Value) -> Result<Value> {
+    if bool_or(p, "defaults", false) {
+        if !s.doc()?.doc.guides.is_empty() {
+            return Ok(json!({"added": 0}));
+        }
+        let size = s.doc()?.doc.slide_size;
+        return s.edit(|doc, _| {
+            doc.guides = vec![
+                deckcraft_model::DrawGuide { vertical: true, pos: size.width / 2.0 },
+                deckcraft_model::DrawGuide { vertical: false, pos: size.height / 2.0 },
+            ];
+            Ok(json!({"added": 2}))
+        });
+    }
+    let vertical = bool_or(p, "vertical", true);
+    let limit = guide_limit(s, vertical)?;
+    let pos = p.get("pos").and_then(Value::as_f64).filter(|v| v.is_finite()).unwrap_or(limit / 2.0).clamp(0.0, limit);
+    if s.doc()?.doc.guides.len() >= MAX_GUIDES {
+        return Err(bad("guide.add", "too many guides"));
+    }
+    s.edit(|doc, _| {
+        doc.guides.push(deckcraft_model::DrawGuide { vertical, pos });
+        Ok(json!({"index": doc.guides.len() - 1}))
+    })
+}
+
+fn guide_index(s: &Session, p: &Value, cmd: &str) -> Result<usize> {
+    let i = usize_param(p, "index").ok_or_else(|| bad(cmd, "missing `index`"))?;
+    if i >= s.doc()?.doc.guides.len() {
+        return Err(bad(cmd, "no such guide"));
+    }
+    Ok(i)
+}
+
+fn guide_move(s: &mut Session, p: &Value) -> Result<Value> {
+    let i = guide_index(s, p, "guide.move")?;
+    let vertical = s.doc()?.doc.guides.get(i).is_some_and(|g| g.vertical);
+    let limit = guide_limit(s, vertical)?;
+    let pos = p.get("pos").and_then(Value::as_f64).filter(|v| v.is_finite()).ok_or_else(|| bad("guide.move", "missing `pos`"))?.clamp(0.0, limit);
+    s.edit(|doc, _| {
+        if let Some(g) = doc.guides.get_mut(i) {
+            g.pos = pos;
+        }
+        Ok(json!({"index": i, "pos": pos}))
+    })
+}
+
+fn guide_delete(s: &mut Session, p: &Value) -> Result<Value> {
+    let i = guide_index(s, p, "guide.delete")?;
+    s.edit(|doc, _| {
+        if i < doc.guides.len() {
+            doc.guides.remove(i);
+        }
+        ok()
+    })
+}
+
+fn guide_list(s: &mut Session, _p: &Value) -> Result<Value> {
+    Ok(serde_json::to_value(&s.doc()?.doc.guides).unwrap_or_default())
+}
+
+#[cfg(test)]
+#[path = "guides_tests.rs"]
+mod guides_tests;

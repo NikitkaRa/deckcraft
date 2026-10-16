@@ -1,7 +1,7 @@
 //! Sample entries (`stsd` children) and codec configuration records: parsing and serialization.
 
 use crate::bytes::{BoxBuf, Cur, FourCc, boxes};
-use crate::error::{Error, Result};
+use crate::error::{Error, Result, invalid};
 use deckcraft_bitstream::BitReader;
 
 /// One sample description (an entry of `stsd`).
@@ -606,8 +606,9 @@ pub struct PcmConfig {
 
 impl PcmConfig {
     /// Bytes per interleaved audio frame (all channels).
-    pub fn bytes_per_frame(&self) -> u32 {
-        (self.bits as u32).div_ceil(8) * self.channels.max(1)
+    /// `None` when `channels` times the bytes per sample does not fit in `u32`.
+    pub fn bytes_per_frame(&self) -> Option<u32> {
+        u32::from(self.bits).div_ceil(8).checked_mul(self.channels.max(1))
     }
 }
 
@@ -888,6 +889,9 @@ pub(crate) fn parse_sample_entry(format: FourCc, payload: &[u8], handler: FourCc
             let _size_of_struct = c.u32()?;
             a.sample_rate = c.f64()?;
             a.channels = c.u32()?;
+            if a.channels > u32::from(u16::MAX) {
+                return invalid("channel count out of range");
+            }
             let _always = c.u32()?;
             a.const_bits_per_channel = c.u32()?;
             a.lpcm_flags = c.u32()?;
@@ -931,7 +935,7 @@ pub(crate) fn parse_sample_entry(format: FourCc, payload: &[u8], handler: FourCc
             },
             b"ac-3" => CodecConfig::Ac3 { dac3: get(b"dac3").unwrap_or(&[]).to_vec() },
             b"ec-3" => CodecConfig::Eac3 { dec3: get(b"dec3").unwrap_or(&[]).to_vec() },
-            b"lpcm" | b"sowt" | b"twos" | b"in24" | b"in32" | b"fl32" | b"fl64" | b"raw " | b"NONE" => CodecConfig::Pcm(qt_pcm(f, &a)),
+            b"lpcm" | b"sowt" | b"twos" | b"in24" | b"in32" | b"fl32" | b"fl64" | b"raw " | b"NONE" => CodecConfig::Pcm(qt_pcm(f, &a)?),
             b"ipcm" | b"fpcm" => {
                 let mut pcm = PcmConfig {
                     bits: a.sample_size,
@@ -948,6 +952,9 @@ pub(crate) fn parse_sample_entry(format: FourCc, payload: &[u8], handler: FourCc
                     pcm.big_endian = flags & 1 == 0;
                     pcm.bits = c.u8()? as u16;
                 }
+                if pcm.bytes_per_frame().is_none() {
+                    return invalid("PCM frame size overflows");
+                }
                 CodecConfig::Pcm(pcm)
             }
             _ => unknown(),
@@ -957,11 +964,11 @@ pub(crate) fn parse_sample_entry(format: FourCc, payload: &[u8], handler: FourCc
     Ok(SampleEntry { format, data_reference_index, codec: unknown(), video: None, audio: None, bitrate: None })
 }
 
-fn qt_pcm(f: &[u8; 4], a: &AudioParams) -> PcmConfig {
+fn qt_pcm(f: &[u8; 4], a: &AudioParams) -> Result<PcmConfig> {
     let mut p = PcmConfig { channels: a.channels, sample_rate: a.sample_rate, signed: true, ..Default::default() };
     match f {
         b"lpcm" => {
-            p.bits = a.const_bits_per_channel as u16;
+            p.bits = u16::try_from(a.const_bits_per_channel).map_err(|_| Error::Invalid("const_bits_per_channel out of range".into()))?;
             p.float = a.lpcm_flags & 1 != 0;
             p.big_endian = a.lpcm_flags & 2 != 0;
             p.signed = a.lpcm_flags & 4 != 0 || p.float;
@@ -992,7 +999,10 @@ fn qt_pcm(f: &[u8; 4], a: &AudioParams) -> PcmConfig {
         }
         _ => {}
     }
-    p
+    if p.bytes_per_frame().is_none() {
+        return invalid("PCM frame size overflows");
+    }
+    Ok(p)
 }
 
 fn parse_btrt(p: &[u8]) -> Result<BitRate> {
@@ -1360,7 +1370,7 @@ impl SampleEntry {
             b.u32(p.bits as u32);
             let flags = (p.float as u32) | ((p.big_endian as u32) << 1) | (((p.signed && !p.float) as u32) << 2) | 8;
             b.u32(flags);
-            b.u32(p.bytes_per_frame());
+            b.u32(p.bytes_per_frame().unwrap_or(0));
             b.u32(1);
         } else {
             b.u16(version);
@@ -1534,6 +1544,40 @@ mod tests {
         }
         assert_eq!(roundtrip(&e, false, b"soun"), e);
         assert_eq!(roundtrip(&e, true, b"soun"), e);
+    }
+
+    fn qt_v2_lpcm(channels: u32, bits: u32) -> Vec<u8> {
+        let mut p = vec![0; 6];
+        let u16b = |p: &mut Vec<u8>, v: u16| p.extend(v.to_be_bytes());
+        let u32b = |p: &mut Vec<u8>, v: u32| p.extend(v.to_be_bytes());
+        u16b(&mut p, 1);
+        u16b(&mut p, 2);
+        u16b(&mut p, 0);
+        u32b(&mut p, 0);
+        u16b(&mut p, 2);
+        u16b(&mut p, 16);
+        u16b(&mut p, 0);
+        u16b(&mut p, 0);
+        u32b(&mut p, 65536);
+        u32b(&mut p, 72);
+        p.extend(48000.0f64.to_be_bytes());
+        u32b(&mut p, channels);
+        u32b(&mut p, 0);
+        u32b(&mut p, bits);
+        u32b(&mut p, 0);
+        u32b(&mut p, 0);
+        u32b(&mut p, 1);
+        p
+    }
+
+    #[test]
+    fn pcm_frame_size_rejects_a_hostile_channel_count() {
+        assert_eq!(PcmConfig { bits: 16, channels: 2, sample_rate: 48000.0, ..Default::default() }.bytes_per_frame(), Some(4));
+        assert!(PcmConfig { bits: 16, channels: u32::MAX, ..Default::default() }.bytes_per_frame().is_none());
+        assert!(parse_sample_entry(FourCc(*b"lpcm"), &qt_v2_lpcm(u32::MAX, 16), FourCc(*b"soun"), true).is_err());
+        assert!(parse_sample_entry(FourCc(*b"lpcm"), &qt_v2_lpcm(2, u32::MAX), FourCc(*b"soun"), true).is_err());
+        let ok = parse_sample_entry(FourCc(*b"lpcm"), &qt_v2_lpcm(2, 16), FourCc(*b"soun"), true).unwrap();
+        assert!(matches!(ok.codec, CodecConfig::Pcm(p) if p.bytes_per_frame() == Some(4)));
     }
 
     #[test]

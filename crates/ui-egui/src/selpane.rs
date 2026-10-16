@@ -28,6 +28,18 @@ pub struct State {
     pub anchor: Option<u32>,
     /// Row being dragged and the drop it would make: (index among siblings, line y).
     pub drag: Option<(u32, Option<(usize, f32)>)>,
+    /// Document (by uid) the state above belongs to.
+    owner: Option<u64>,
+}
+
+impl State {
+    /// Ties the pane state to a document: shape ids repeat between documents, so switching
+    /// documents drops the pending rename, folds, anchor and drag.
+    pub fn bind(&mut self, uid: u64) {
+        if self.owner != Some(uid) {
+            *self = State { owner: Some(uid), ..State::default() };
+        }
+    }
 }
 
 /// One line of the list.
@@ -108,6 +120,7 @@ fn small_icon_button(ui: &mut Ui, icon: Icon, label: &str, enabled: bool) -> egu
 pub fn show(app: &mut SlideApp, ui: &mut Ui) {
     let t = Tokens::get(ui.ctx());
     let Some(st) = app.session.active() else { return };
+    app.selpane.bind(st.uid);
     let rows = rows(st.shapes(), &app.selpane.collapsed);
     let selected: Vec<u32> = st.selection.shapes.iter().map(|i| i.0).collect();
     let has_sel = !selected.is_empty();
@@ -387,6 +400,19 @@ fn context_menu(app: &mut SlideApp, resp: &egui::Response, row: &Row) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn switching_document_drops_a_pending_rename() {
+        let mut s = State::default();
+        s.bind(1);
+        s.renaming = Some((5, "draft".to_string()));
+        s.collapsed.insert(2);
+        s.bind(1);
+        assert!(s.renaming.is_some(), "same document keeps the draft");
+        s.bind(2);
+        assert!(s.renaming.is_none());
+        assert!(s.collapsed.is_empty());
+    }
 
     fn r(id: u32, top: f32) -> (u32, Rect) {
         (id, Rect::from_min_size(pos2(0.0, top), vec2(100.0, ROW_H)))

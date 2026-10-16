@@ -99,7 +99,7 @@ fn opus_pages_packets_and_timing() {
     assert_eq!(st.packets.len(), 10);
     assert!(st.saw_eos);
     assert_eq!(o.read_packet(&f, s, 4).unwrap(), pkt(4, 44));
-    let t = OpusTiming::of(st, 312);
+    let t = OpusTiming::of(st, 312).unwrap();
     assert_eq!(t.durations, vec![960; 10]);
     assert_eq!(t.starts[0], -312);
     assert_eq!(t.starts[9], 9 * 960 - 312);
@@ -129,7 +129,7 @@ fn packets_spanning_pages() {
     assert_eq!(st.packets[0].parts.len(), 2);
     assert_eq!(o.read_packet(&f, 0, 0).unwrap(), big);
     assert_eq!(o.read_packet(&f, 0, 1).unwrap(), small);
-    let t = OpusTiming::of(st, 0);
+    let t = OpusTiming::of(st, 0).unwrap();
     assert_eq!(t.starts, vec![0, 960]);
     assert_eq!(t.total, 1920);
 }
@@ -144,13 +144,13 @@ fn corrupt_pages_are_skipped_and_truncation_is_safe() {
     let o = open(&g).unwrap();
     assert!(o.warnings.iter().any(|w| w.contains("CRC")), "{:?}", o.warnings);
     assert_eq!(o.streams[0].packets.len(), 9);
-    let t = OpusTiming::of(&o.streams[0], 312);
+    let t = OpusTiming::of(&o.streams[0], 312).unwrap();
     // the granules after the gap put the later packets at their true positions
     assert_eq!(*t.starts.last().unwrap(), 11 * 960 - 312);
     for cut in 0..f.len() {
         if let Ok(o) = open(&f[..cut].to_vec()) {
             for st in &o.streams {
-                let t = OpusTiming::of(st, 312);
+                let t = OpusTiming::of(st, 312).unwrap();
                 assert_eq!(t.starts.len(), st.packets.len());
             }
         }
@@ -178,4 +178,21 @@ fn opus_toc_durations() {
     assert_eq!(opus_packet_samples([0x80 | 3, 6], 10), Some(720)); // CELT 2.5 ms × 6
     assert_eq!(opus_packet_samples([0xF8 | 3, 7], 10), None); // 140 ms: invalid
     assert_eq!(opus_packet_samples([0xF8, 0], 0), None);
+}
+
+#[test]
+fn opus_timing_rejects_a_granule_that_overflows() {
+    let packet = |granule: i64| Stream {
+        serial: 1,
+        codec: Codec::Opus,
+        headers: vec![],
+        packets: vec![Packet { parts: vec![], size: 10, granule: Some(granule), page: 0, eos: true, prefix: [0x00, 0] }],
+        pages: 1,
+        last_granule: Some(granule),
+        saw_eos: true,
+    };
+    let ok = OpusTiming::of(&packet(480), 0).unwrap();
+    assert_eq!(ok.starts, vec![0]);
+    assert_eq!(ok.total, 480);
+    assert!(OpusTiming::of(&packet(i64::MIN), 0).is_err());
 }

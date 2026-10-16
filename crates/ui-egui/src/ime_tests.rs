@@ -132,14 +132,14 @@ fn korean_composes_in_the_notes_pane() {
     for pre in ["ㄴ", "노", "놑", "노트"] {
         h.event(preedit(pre));
         h.run_steps(1);
-        assert_eq!(h.state().notes_buf.2, pre, "the preedit replaces the last one");
+        assert_eq!(h.state().notes_buf.2.text, pre, "the preedit replaces the last one");
     }
     let ime = h.output().platform_output.ime.expect("the notes field turns the input method on");
     let slide = h.state().slide_rect.unwrap();
     assert!(ime.cursor_rect.min.y > slide.max.y, "candidate window at the notes caret, under the slide");
     h.event(Event::Ime(ImeEvent::Commit("노트".into())));
     h.run_steps(1);
-    assert_eq!(h.state().notes_buf.2, "노트");
+    assert_eq!(h.state().notes_buf.2.text, "노트");
     // Focus leaves the field (Escape): the notes are committed as one step.
     h.key_press(egui::Key::Escape);
     h.run_steps(2);

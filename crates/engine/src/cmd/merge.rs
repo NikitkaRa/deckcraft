@@ -30,37 +30,85 @@ pub fn specs() -> Vec<CommandSpec> {
     )]
 }
 
-/// The filled outline of `s` in slide points (curves flattened).
+/// The filled outline of `s` in slide points (curves flattened). A text box with no fill and no
+/// outline is its letters, as in PowerPoint (merging text with a picture fills the letters).
 fn area_of(doc: &deckcraft_model::Presentation, sel: &crate::Selection, s: &Shape) -> Area {
+    if let Some((letters, _)) = letters_of(doc, sel, s) {
+        return letters;
+    }
     let x = xfrm_of(doc, sel, s);
     let geo = deckcraft_render::shape_geometry(s, x.w, x.h);
     let a = x.affine();
     let mut out: Area = vec![];
     for sp in geo.paths.iter().filter(|p| p.fill != deckcraft_geom::preset::FillMode::None) {
-        let mut cur: Vec<[f64; 2]> = vec![];
-        let flush = |cur: &mut Vec<[f64; 2]>, out: &mut Area| {
-            if cur.len() > 2 {
-                out.push(std::mem::take(cur));
-            } else {
-                cur.clear();
-            }
-        };
-        deckcraft_geom::preset_flatten(&sp.path, &mut |el| match el {
-            PathEl::MoveTo(p) => {
-                flush(&mut cur, &mut out);
-                let q = a * p;
-                cur.push([q.x, q.y]);
-            }
-            PathEl::LineTo(p) => {
-                let q = a * p;
-                cur.push([q.x, q.y]);
-            }
-            PathEl::ClosePath => flush(&mut cur, &mut out),
-            _ => {}
-        });
-        flush(&mut cur, &mut out);
+        flatten(&sp.path, a, &mut out);
     }
     out
+}
+
+/// The letters of a text box with no fill and no outline, in slide points, and their colour.
+fn letters_of(doc: &deckcraft_model::Presentation, sel: &crate::Selection, s: &Shape) -> Option<(Area, Option<deckcraft_color::Rgba>)> {
+    use deckcraft_model::resolve;
+    use deckcraft_model::style::Fill;
+    if !matches!(s.kind, ShapeKind::Shape) || s.text.as_ref().is_none_or(|t| t.is_empty()) {
+        return None;
+    }
+    let ctx = super::text::ctx_for(doc, sel)?;
+    let none = |f: Option<&Fill>| f.is_none_or(Fill::is_none);
+    if !none(resolve::fill(&ctx, s).0.as_ref()) || !none(resolve::line(&ctx, s).0.fill.as_ref()) {
+        return None;
+    }
+    let (path, colour) = deckcraft_render::text_outline(&ctx, s, xfrm_of(doc, sel, s).affine());
+    let mut out: Area = vec![];
+    flatten(&path, deckcraft_geom::Affine::IDENTITY, &mut out);
+    (!out.is_empty()).then_some((out, colour))
+}
+
+/// Append the closed polygons of `path` (mapped by `a`) to `out`.
+fn flatten(path: &deckcraft_geom::BezPath, a: deckcraft_geom::Affine, out: &mut Area) {
+    let mut cur: Vec<[f64; 2]> = vec![];
+    let flush = |cur: &mut Vec<[f64; 2]>, out: &mut Area| {
+        if cur.len() > 2 {
+            out.push(std::mem::take(cur));
+        } else {
+            cur.clear();
+        }
+    };
+    deckcraft_geom::preset_flatten(path, &mut |el| match el {
+        PathEl::MoveTo(p) => {
+            flush(&mut cur, out);
+            let q = a * p;
+            cur.push([q.x, q.y]);
+        }
+        PathEl::LineTo(p) => {
+            let q = a * p;
+            cur.push([q.x, q.y]);
+        }
+        PathEl::ClosePath => flush(&mut cur, out),
+        _ => {}
+    });
+    flush(&mut cur, out);
+}
+
+/// Keep a picture where it was on the slide when its box becomes `to`: crop it to the new box.
+/// Only for upright, unflipped pictures stretched over their box.
+fn recrop(fill: &mut deckcraft_model::style::PictureFill, from: &Xfrm, to: &Xfrm) {
+    use deckcraft_model::style::PictureMode;
+    if from.rot != 0.0 || from.flip_h || from.flip_v || !matches!(fill.mode, PictureMode::Stretch { fill_rect } if fill_rect == [0.0; 4]) {
+        return;
+    }
+    let [l, t, r, b] = fill.crop;
+    let (fw, fh) = (1.0 - l - r, 1.0 - t - b);
+    if !(fw > 1e-9 && fh > 1e-9 && from.w > 0.0 && from.h > 0.0) {
+        return;
+    }
+    // The whole image in slide points.
+    let (iw, ih) = (from.w / fw, from.h / fh);
+    let (ix, iy) = (from.x - l * iw, from.y - t * ih);
+    let c = [(to.x - ix) / iw, (to.y - iy) / ih, (ix + iw - to.x - to.w) / iw, (iy + ih - to.y - to.h) / ih];
+    if c.iter().all(|v| v.is_finite()) {
+        fill.crop = c;
+    }
 }
 
 fn overlay(a: &Area, b: &Area, rule: OverlayRule) -> Area {
@@ -155,7 +203,17 @@ fn merge(s: &mut Session, p: &Value) -> Result<Value> {
     }
     let areas: Vec<Area> = shapes.iter().map(|x| area_of(&st.doc, &st.selection, x)).collect();
     let results = merge_areas(&op, &areas);
-    let template = shapes[0].clone();
+    let mut template = shapes[0].clone();
+    let template_box = xfrm_of(&st.doc, &st.selection, &template);
+    // Letters merged become shapes filled with the text's colour.
+    let letters = letters_of(&st.doc, &st.selection, &template);
+    if let Some((_, colour)) = &letters {
+        use deckcraft_model::style::{ColorRef, Fill, Line};
+        template.fill = Some(Fill::solid(ColorRef::rgb(colour.unwrap_or(deckcraft_color::Rgba::BLACK))));
+        template.line = Some(Line { fill: Some(Fill::None), ..Default::default() });
+        template.text_box = false;
+    }
+    let drop_text = letters.is_some() || shapes.iter().skip(1).any(|x| letters_of(&st.doc, &st.selection, x).is_some());
     let mut new_ids = vec![];
     s.edit(|doc, sel| {
         let list = crate::shapes_mut(doc, sel).ok_or_else(|| bad("shape.merge", "no slide"))?;
@@ -169,14 +227,17 @@ fn merge(s: &mut Session, p: &Value) -> Result<Value> {
             sh.xfrm = Some(x);
             sh.geom = geom;
             sh.name = format!("Freeform {}", k + 1);
-            // Text stays with the first piece only.
-            if k > 0 {
+            if let ShapeKind::Picture { fill } = &mut sh.kind {
+                recrop(fill, &template_box, &x);
+            }
+            // Text stays with the first piece only, and not at all once it became outlines.
+            if k > 0 || drop_text {
                 sh.text = None;
             }
             made.push(sh);
         }
         for sh in &mut made {
-            sh.id = ShapeId(doc.alloc_id());
+            sh.id = ShapeId(doc.alloc_id().ok_or_else(|| bad("shape.merge", NO_ID_SPACE))?);
             new_ids.push(sh.id);
         }
         let list = crate::shapes_mut(doc, sel).ok_or_else(|| bad("shape.merge", "no slide"))?;
@@ -215,5 +276,61 @@ mod tests {
         assert!((frags.iter().map(area_size).sum::<f64>() - 175.0).abs() < 1e-6);
         // Disjoint intersect is empty.
         assert!(merge_areas("intersect", &[square(0.0, 0.0, 1.0), square(5.0, 5.0, 1.0)]).is_empty());
+    }
+
+    fn picture_and_text(s: &mut Session) -> (ShapeId, ShapeId) {
+        let mut png = Vec::new();
+        image::RgbaImage::from_pixel(40, 20, image::Rgba([0, 128, 255, 255]))
+            .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .expect("png");
+        let _ = s.execute("slide.new", &json!({"layout": "blank"}));
+        let r = s
+            .execute("insert.picture", &json!({"name": "a.png", "data": base64_encode(&png), "rect": [100.0, 100.0, 400.0, 200.0]}))
+            .expect("picture");
+        let pic = ShapeId(r["id"].as_u64().expect("id") as u32);
+        let r = s.execute("insert.textBox", &json!({"rect": [150.0, 120.0, 300.0, 100.0], "text": "HI"})).expect("text box");
+        let text = ShapeId(r["id"].as_u64().expect("id") as u32);
+        (pic, text)
+    }
+
+    #[test]
+    fn a_picture_intersected_with_text_fills_the_letters() {
+        // #653: the letters didn't change and the picture vanished (the text box counted as its
+        // whole box, and the merge took the text's outline but kept the box's formatting).
+        let mut s = Session::with_new();
+        let (pic, text) = picture_and_text(&mut s);
+        let st = s.doc().expect("doc");
+        let letters = letters_of(&st.doc, &st.selection, st.shape(text).expect("text")).expect("the text box is its letters").0;
+        let box_area = 300.0 * 100.0;
+        assert!(area_size(&letters) > 10.0 && area_size(&letters) < box_area * 0.5, "{}", area_size(&letters));
+        let r = s.execute("shape.merge", &json!({"op": "intersect", "ids": [pic.0, text.0]})).expect("merge");
+        let ids = r["ids"].as_array().expect("ids");
+        assert_eq!(ids.len(), 1);
+        let st = s.doc().expect("doc");
+        let out = st.shape(ShapeId(ids[0].as_u64().expect("id") as u32)).expect("result").clone();
+        let ShapeKind::Picture { fill } = &out.kind else { panic!("the picture fills the letters: {:?}", out.kind) };
+        assert!(out.text.is_none(), "the letters are outlines now");
+        // The result is the letters' outline, well inside the text box.
+        let x = out.xfrm.expect("box");
+        assert!(x.x >= 150.0 && x.y >= 120.0 && x.x + x.w <= 450.0 && x.y + x.h <= 220.0, "{x:?}");
+        let merged = area_of(&st.doc, &st.selection, &out);
+        assert!((area_size(&merged) - area_size(&letters)).abs() < area_size(&letters) * 0.05, "{} vs {}", area_size(&merged), area_size(&letters));
+        // The picture stays where it was on the slide: cropped to the new box.
+        let [l, t, rr, b] = fill.crop;
+        let iw = x.w / (1.0 - l - rr);
+        let ih = x.h / (1.0 - t - b);
+        assert!((x.x - l * iw - 100.0).abs() < 1e-6 && (iw - 400.0).abs() < 1e-6, "{:?}", fill.crop);
+        assert!((x.y - t * ih - 100.0).abs() < 1e-6 && (ih - 200.0).abs() < 1e-6, "{:?}", fill.crop);
+    }
+
+    #[test]
+    fn text_merged_first_becomes_shapes_in_its_colour() {
+        let mut s = Session::with_new();
+        let (pic, text) = picture_and_text(&mut s);
+        let r = s.execute("shape.merge", &json!({"op": "union", "ids": [text.0, pic.0]})).expect("merge");
+        let st = s.doc().expect("doc");
+        let out = st.shape(ShapeId(r["ids"][0].as_u64().expect("id") as u32)).expect("result");
+        assert!(matches!(out.kind, ShapeKind::Shape) && out.text.is_none());
+        assert!(matches!(out.fill, Some(deckcraft_model::style::Fill::Solid { .. })), "{:?}", out.fill);
     }
 }

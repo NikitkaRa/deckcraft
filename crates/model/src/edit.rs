@@ -88,7 +88,8 @@ pub fn insert(body: &mut TextBody, pos: Pos, text: &str, props: Option<RunProps>
             let Some(p) = body.paragraphs.get_mut(pi) else { break };
             let idx = split_at(p, ch);
             let tail: Vec<Run> = p.runs.drain(idx..).collect();
-            let newp = Paragraph { level: p.level, props: p.props.clone(), runs: tail, end_props: p.end_props.clone() };
+            let newp =
+                Paragraph { level: p.level, props: p.props.clone(), runs: tail, def_props: p.def_props.clone(), end_props: p.end_props.clone() };
             p.end_props = props.clone();
             body.paragraphs.insert(pi + 1, newp);
             pi += 1;
@@ -400,6 +401,44 @@ pub fn char_move(body: &TextBody, pos: Pos, forward: bool) -> Pos {
     }
 }
 
+/// The position of the `n`th character of the body's plain text (`\n` between paragraphs).
+fn pos_of_char(body: &TextBody, mut n: usize) -> Pos {
+    for (pi, p) in body.paragraphs.iter().enumerate() {
+        let len = p.char_len();
+        if n <= len {
+            return (pi, n);
+        }
+        n -= len + 1;
+    }
+    end(body)
+}
+
+/// Make the body's plain text (paragraphs joined by `\n`) read `text`, as if it had been typed in
+/// place: only the span between the longest common prefix and suffix changes, so untouched text
+/// keeps its run and paragraph formatting and new text takes the formatting where it lands. Text
+/// that shares nothing with the old text replaces it as plain text.
+pub fn replace_text(body: &mut TextBody, text: &str) {
+    let old: Vec<char> = body.text().chars().collect();
+    let new: Vec<char> = text.chars().collect();
+    if old == new {
+        return;
+    }
+    let pre = old.iter().zip(&new).take_while(|(a, b)| a == b).count();
+    let room = old.len().min(new.len()) - pre;
+    let suf = old.iter().rev().zip(new.iter().rev()).take(room).take_while(|(a, b)| a == b).count();
+    if pre == 0 && suf == 0 {
+        *body = TextBody { body: body.body.clone(), list_style: body.list_style.clone(), ..TextBody::from_text(text) };
+        return;
+    }
+    let a = pos_of_char(body, pre);
+    let b = pos_of_char(body, old.len() - suf);
+    let at = delete(body, a, b);
+    let mid: String = new.get(pre..new.len() - suf).unwrap_or(&[]).iter().collect();
+    if !mid.is_empty() {
+        insert(body, at, &mid, None);
+    }
+}
+
 /// End of the body.
 pub fn end(body: &TextBody) -> Pos {
     let pi = body.paragraphs.len().saturating_sub(1);
@@ -674,5 +713,54 @@ mod tests {
         assert_eq!(next_case("hELLO wORLD"), "upper");
         assert_eq!(next_case("hello. world is HERE"), "upper");
         assert_eq!(next_case("123"), "upper");
+    }
+
+    /// Speaker notes: a bold heading over indented bullet points.
+    fn notes() -> TextBody {
+        use crate::text::{Bullet, ParaProps};
+        let mut b = body("Overview\nFirst point\nSecond point");
+        format(&mut b, (0, 0), (0, 8), &|p| p.bold = Some(true));
+        for p in b.paragraphs.iter_mut().skip(1) {
+            p.level = 1;
+            p.props =
+                ParaProps { margin_left: Some(36.0), indent: Some(-18.0), bullet: Some(Bullet::Char { char: "•".into() }), ..Default::default() };
+        }
+        b
+    }
+
+    #[test]
+    fn replace_text_keeps_formatting() {
+        let before = notes();
+        // Same text: nothing changes.
+        let mut b = before.clone();
+        replace_text(&mut b, "Overview\nFirst point\nSecond point");
+        assert_eq!(b, before);
+        // A word typed into a bullet: heading stays bold, bullets keep level, indent and bullet.
+        replace_text(&mut b, "Overview\nFirst main point\nSecond point");
+        assert_eq!(b.text(), "Overview\nFirst main point\nSecond point");
+        assert_eq!(b.paragraphs[0].runs[0].props.bold, Some(true));
+        assert_eq!(b.paragraphs[1].props, before.paragraphs[1].props);
+        assert_eq!((b.paragraphs[1].level, b.paragraphs[2].level), (1, 1));
+        // Typing at the end of the heading continues it in bold.
+        replace_text(&mut b, "Overview (5 min)\nFirst main point\nSecond point");
+        assert_eq!(b.paragraphs[0].runs.len(), 1);
+        assert_eq!(b.paragraphs[0].runs[0].props.bold, Some(true));
+        // Enter after a bullet starts another bullet; deleting one joins nothing else.
+        replace_text(&mut b, "Overview (5 min)\nFirst main point\nThird\nSecond point");
+        assert_eq!(b.paragraphs.len(), 4);
+        assert_eq!((b.paragraphs[2].level, &b.paragraphs[2].props), (1, &before.paragraphs[1].props));
+        replace_text(&mut b, "Overview (5 min)\nSecond point");
+        assert_eq!(b.text(), "Overview (5 min)\nSecond point");
+        assert_eq!(b.paragraphs[0].runs[0].props.bold, Some(true));
+        assert_eq!(b.paragraphs[1].level, 1);
+        // Text with nothing in common is new plain text.
+        replace_text(&mut b, "Plain");
+        assert_eq!(b, body("Plain"));
+        replace_text(&mut b, "");
+        assert!(b.is_empty());
+        // Into an empty body.
+        let mut e = TextBody::default();
+        replace_text(&mut e, "a\nb");
+        assert_eq!(e.text(), "a\nb");
     }
 }

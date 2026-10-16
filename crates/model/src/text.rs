@@ -41,8 +41,14 @@ impl Anchor {
 pub enum AutoFit {
     /// Do not autofit.
     None,
-    /// Shrink text on overflow: font scale and line-spacing reduction (0–1).
-    Shrink { font_scale: f64, line_reduction: f64 },
+    /// Shrink text on overflow: font scale and line-spacing reduction (0–1). `font_scale` is
+    /// `None` for a file's `<a:normAutofit/>` with no `fontScale`: the schema default 100 %,
+    /// which PowerPoint draws as it is and only fits again when the text changes (#724).
+    Shrink {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        font_scale: Option<f64>,
+        line_reduction: f64,
+    },
     /// Resize shape to fit text.
     Shape,
 }
@@ -113,6 +119,8 @@ pub struct BodyProps {
     pub rtl_col: Option<bool>,
     /// Keep text upright when the shape rotates.
     pub upright: Option<bool>,
+    /// Space before the first paragraph and after the last count too (`spcFirstLastPara`).
+    pub space_first_last: Option<bool>,
 }
 
 impl BodyProps {
@@ -135,6 +143,7 @@ impl BodyProps {
         }
         self.rtl_col = self.rtl_col.or(p.rtl_col);
         self.upright = self.upright.or(p.upright);
+        self.space_first_last = self.space_first_last.or(p.space_first_last);
     }
 }
 
@@ -295,17 +304,36 @@ pub enum Strike {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", tag = "kind")]
 pub enum Action {
-    Url { url: String },
-    Slide { slide: crate::SlideId },
+    Url {
+        url: String,
+    },
+    Slide {
+        slide: crate::SlideId,
+    },
     NextSlide,
     PreviousSlide,
     FirstSlide,
     LastSlide,
     EndShow,
     LastViewed,
-    CustomShow { name: String },
-    Program { path: String },
+    /// Run a custom show. `returns` is PowerPoint's "Show and return".
+    CustomShow {
+        name: String,
+        #[serde(default = "custom_show_returns", skip_serializing_if = "is_true")]
+        returns: bool,
+    },
+    Program {
+        path: String,
+    },
     PlayMedia,
+}
+
+fn custom_show_returns() -> bool {
+    true
+}
+
+fn is_true(v: &bool) -> bool {
+    *v
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -316,6 +344,16 @@ pub struct Hyperlink {
     pub tooltip: String,
     #[serde(default)]
     pub highlight_click: bool,
+    /// Sound played when the action runs (`a:snd`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sound: Option<crate::MediaId>,
+    /// `endSnd`: stop the sound that is already playing.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub stop_sound: bool,
+    /// Zoom (Insert ▸ Zoom) with Return to Zoom: in the show, after this slide is shown and
+    /// advanced past, go back to the slide with the zoom. Saved to .pptx as a plain slide link.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub zoom_return: Option<crate::SlideId>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -345,9 +383,16 @@ pub struct RunProps {
     pub outline: Option<Line>,
     pub highlight: Option<ColorRef>,
     pub link: Option<Hyperlink>,
+    /// Action on mouse over (Insert ▸ Action ▸ Mouse Over on selected text, `a:hlinkMouseOver`).
+    pub hover: Option<Hyperlink>,
     pub lang: Option<String>,
     pub shadow: Option<crate::style::Shadow>,
+    /// `a:innerShdw` on the run. Outer shadow stays in `shadow`.
+    pub inner_shadow: Option<crate::style::Shadow>,
     pub glow: Option<crate::style::Glow>,
+    pub reflection: Option<crate::style::Reflection>,
+    /// Soft-edge radius in points (`a:softEdge`).
+    pub soft_edge: Option<f64>,
     /// Spelling/grammar errors are not flagged.
     pub no_proof: Option<bool>,
 }
@@ -376,9 +421,13 @@ impl RunProps {
             outline,
             highlight,
             link,
+            hover,
             lang,
             shadow,
+            inner_shadow,
             glow,
+            reflection,
+            soft_edge,
             no_proof
         );
     }
@@ -448,6 +497,10 @@ pub struct Paragraph {
     #[serde(skip_serializing_if = "is_default_para")]
     pub props: ParaProps,
     pub runs: Vec<Run>,
+    /// `a:defRPr`: defaults for runs in this paragraph that omit a property. Sits above the
+    /// placeholder's list style, so a layout can still supply what this paragraph leaves unset.
+    #[serde(skip_serializing_if = "is_default_props")]
+    pub def_props: RunProps,
     /// Properties of the paragraph end mark (used for an empty paragraph's caret).
     #[serde(skip_serializing_if = "is_default_props")]
     pub end_props: RunProps,
@@ -460,6 +513,21 @@ fn is_default_para(p: &ParaProps) -> bool {
 impl Paragraph {
     pub fn new(text: &str) -> Self {
         Paragraph { runs: if text.is_empty() { vec![] } else { vec![Run::new(text)] }, ..Default::default() }
+    }
+    /// Leading tabs are the outline level (at most 8), the same rule as a typed indent.
+    /// Returns whether any tab was consumed.
+    pub fn promote_leading_tabs(&mut self) -> bool {
+        let Some(r) = self.runs.first_mut() else { return false };
+        if r.kind != RunKind::Text {
+            return false;
+        }
+        let tabs = r.text.chars().take_while(|c| *c == '\t').count();
+        if tabs == 0 {
+            return false;
+        }
+        r.text = r.text.trim_start_matches('\t').to_string();
+        self.level = tabs.min(8) as u8;
+        true
     }
     pub fn text(&self) -> String {
         self.runs.iter().map(|r| r.content()).collect()

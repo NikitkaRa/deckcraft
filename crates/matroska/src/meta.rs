@@ -241,7 +241,10 @@ pub(crate) fn parse_cues(d: &[u8], out: &mut Vec<CuePoint>) {
     }
 }
 
-fn parse_chapter(d: &[u8]) -> Chapter {
+/// Deepest nesting of `ChapterAtom` / `SimpleTag` we follow. Deeper children are ignored so a hostile file cannot overflow the stack.
+const MAX_NESTING_DEPTH: usize = 32;
+
+fn parse_chapter(d: &[u8], depth: usize) -> Chapter {
     let mut c =
         Chapter { uid: 0, string_uid: None, start_ns: 0, end_ns: None, hidden: false, enabled: true, displays: Vec::new(), children: Vec::new() };
     for e in Children::new(d) {
@@ -268,7 +271,7 @@ fn parse_chapter(d: &[u8]) -> Chapter {
                 }
                 c.displays.push(disp);
             }
-            CHAPTER_ATOM => c.children.push(parse_chapter(e.data)),
+            CHAPTER_ATOM if depth + 1 < MAX_NESTING_DEPTH => c.children.push(parse_chapter(e.data, depth + 1)),
             _ => {}
         }
     }
@@ -284,7 +287,7 @@ pub(crate) fn parse_chapters(d: &[u8], out: &mut Vec<Edition>) {
                 EDITION_FLAG_HIDDEN => edition.hidden = uint(e.data) != 0,
                 EDITION_FLAG_DEFAULT => edition.default = uint(e.data) != 0,
                 EDITION_FLAG_ORDERED => edition.ordered = uint(e.data) != 0,
-                CHAPTER_ATOM => edition.chapters.push(parse_chapter(e.data)),
+                CHAPTER_ATOM => edition.chapters.push(parse_chapter(e.data, 0)),
                 _ => {}
             }
         }
@@ -292,7 +295,7 @@ pub(crate) fn parse_chapters(d: &[u8], out: &mut Vec<Edition>) {
     }
 }
 
-fn parse_simple_tag(d: &[u8]) -> SimpleTag {
+fn parse_simple_tag(d: &[u8], depth: usize) -> SimpleTag {
     let mut t = SimpleTag { name: String::new(), language: "und".into(), default: true, string: None, binary: None, children: Vec::new() };
     for e in Children::new(d) {
         match e.id {
@@ -301,7 +304,7 @@ fn parse_simple_tag(d: &[u8]) -> SimpleTag {
             TAG_DEFAULT => t.default = uint(e.data) != 0,
             TAG_STRING => t.string = Some(string(e.data)),
             TAG_BINARY => t.binary = Some(e.data.to_vec()),
-            SIMPLE_TAG => t.children.push(parse_simple_tag(e.data)),
+            SIMPLE_TAG if depth + 1 < MAX_NESTING_DEPTH => t.children.push(parse_simple_tag(e.data, depth + 1)),
             _ => {}
         }
     }
@@ -326,7 +329,7 @@ pub(crate) fn parse_tags(d: &[u8], out: &mut Vec<Tag>) {
                         }
                     }
                 }
-                SIMPLE_TAG => tag.simple.push(parse_simple_tag(e.data)),
+                SIMPLE_TAG => tag.simple.push(parse_simple_tag(e.data, 0)),
                 _ => {}
             }
         }
@@ -548,4 +551,62 @@ pub(crate) fn parse_tracks(d: &[u8], timestamp_scale: u64) -> Vec<Track> {
         out.push(t);
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ebml::{write_id, write_size};
+
+    /// `levels` elements with id `id`, each holding the next; the innermost is empty.
+    fn nested(id: u32, levels: usize) -> Vec<u8> {
+        let mut inner = Vec::new();
+        for _ in 0..levels {
+            let mut e = Vec::new();
+            write_id(&mut e, id);
+            write_size(&mut e, inner.len() as u64, 1);
+            e.extend_from_slice(&inner);
+            inner = e;
+        }
+        inner
+    }
+
+    fn chapter_depth(c: &Chapter) -> usize {
+        1 + c.children.iter().map(chapter_depth).max().unwrap_or(0)
+    }
+
+    fn tag_depth(t: &SimpleTag) -> usize {
+        1 + t.children.iter().map(tag_depth).max().unwrap_or(0)
+    }
+
+    fn chapters_of(levels: usize) -> usize {
+        let mut edition = Vec::new();
+        write_id(&mut edition, EDITION_ENTRY);
+        let atoms = nested(CHAPTER_ATOM, levels);
+        write_size(&mut edition, atoms.len() as u64, 1);
+        edition.extend_from_slice(&atoms);
+        let mut out = Vec::new();
+        parse_chapters(&edition, &mut out);
+        chapter_depth(&out[0].chapters[0])
+    }
+
+    #[test]
+    fn chapter_nesting_is_bounded() {
+        assert_eq!(chapters_of(MAX_NESTING_DEPTH), MAX_NESTING_DEPTH);
+        assert_eq!(chapters_of(MAX_NESTING_DEPTH + 50), MAX_NESTING_DEPTH);
+    }
+
+    #[test]
+    fn simple_tag_nesting_is_bounded() {
+        for (levels, expected) in [(MAX_NESTING_DEPTH, MAX_NESTING_DEPTH), (MAX_NESTING_DEPTH + 50, MAX_NESTING_DEPTH)] {
+            let mut tag = Vec::new();
+            write_id(&mut tag, TAG);
+            let simple = nested(SIMPLE_TAG, levels);
+            write_size(&mut tag, simple.len() as u64, 1);
+            tag.extend_from_slice(&simple);
+            let mut out = Vec::new();
+            parse_tags(&tag, &mut out);
+            assert_eq!(tag_depth(&out[0].simple[0]), expected);
+        }
+    }
 }

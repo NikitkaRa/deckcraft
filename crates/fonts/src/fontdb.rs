@@ -318,6 +318,11 @@ pub struct FontDb {
     /// System fallback state: enabled, and characters no system font covers.
     #[cfg(not(target_arch = "wasm32"))]
     sys: Mutex<SysFallback>,
+    /// Held while installed fonts are loaded, so threads that need the same family wait for one
+    /// load instead of racing it: what a lookup finds doesn't depend on which thread got there
+    /// first.
+    #[cfg(not(target_arch = "wasm32"))]
+    loading: Mutex<()>,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -388,9 +393,16 @@ fn legacy_names(f: &skrifa::FontRef<'_>, family: &str) -> Option<(String, String
     Some((legacy, name(f, &[StringId::SUBFAMILY_NAME]).unwrap_or_else(|| "Regular".into())))
 }
 
+/// The tables skrifa reads glyph outlines from: `glyf` (TrueType), `CFF `, `CFF2` and `VARC`. For a
+/// face with none of them (bitmaps only, or outlines in Apple's `hvgl` table), [`FontDb::outline`]
+/// returns an empty path for every glyph.
+#[cfg(not(target_arch = "wasm32"))]
+const OUTLINE_TABLES: [&[u8; 4]; 4] = [b"glyf", b"CFF ", b"CFF2", b"VARC"];
+
 /// (family, style) of every face in the font file at `path`, reading only its table directories
 /// and `name` tables: a scan opens hundreds of font files, many of them megabytes long. A
 /// variable font is cataloged under its default style; its named instances appear once it loads.
+/// Faces with none of the [`OUTLINE_TABLES`] are left out.
 #[cfg(not(target_arch = "wasm32"))]
 fn file_face_names(path: &std::path::Path) -> Vec<(String, String)> {
     use std::io::{Read, Seek, SeekFrom};
@@ -419,6 +431,9 @@ fn file_face_names(path: &std::path::Path) -> Vec<(String, String)> {
             let dir = read_at(start.into(), 12)?;
             let tables = u16::from_be_bytes(dir.get(4..6)?.try_into().ok()?) as usize;
             let records = read_at(u64::from(start) + 12, tables * 16)?;
+            if !records.as_chunks::<16>().0.iter().any(|r| OUTLINE_TABLES.iter().any(|t| r.starts_with(*t))) {
+                return None;
+            }
             let rec = records.as_chunks::<16>().0.iter().find(|r| r.starts_with(b"name"))?;
             let (offset, len) = (be32(rec, 8)?, be32(rec, 12)?);
             if len > MAX_NAME_TABLE {
@@ -442,6 +457,22 @@ fn file_face_names(path: &std::path::Path) -> Vec<(String, String)> {
         })
         .flatten()
         .collect()
+}
+
+/// Folder depth below a font folder that the system scan descends.
+#[cfg(not(target_arch = "wasm32"))]
+const MAX_SCAN_DEPTH: usize = 12;
+/// Directory entries the system scan looks at in all.
+#[cfg(not(target_arch = "wasm32"))]
+const MAX_SCAN_ENTRIES: usize = 200_000;
+/// The largest font file read (the biggest CJK collections are a few hundred MB).
+#[cfg(not(target_arch = "wasm32"))]
+pub const MAX_FONT_FILE: u64 = 512 << 20;
+
+/// A regular file of a size a font can have.
+#[cfg(not(target_arch = "wasm32"))]
+fn font_file_ok(meta: &std::fs::Metadata) -> bool {
+    meta.is_file() && meta.len() > 12 && meta.len() <= MAX_FONT_FILE
 }
 
 /// The platform's font folders (the system's and the user's), scanned by [`FontDb::global`].
@@ -488,8 +519,85 @@ pub fn system_font_dirs() -> Vec<std::path::PathBuf> {
             dirs.push(h.join(".fonts"));
             dirs.push(h.join(".local/share/fonts"));
         }
+        let env = |k: &str| std::env::var_os(k).map(|v| v.to_string_lossy().into_owned());
+        dirs.extend(xdg_font_dirs(env("XDG_DATA_HOME").as_deref(), env("XDG_DATA_DIRS").as_deref(), home.as_deref()));
+        // Inside Flatpak the host's fonts are mounted here.
+        dirs.extend(["/run/host/fonts", "/run/host/local-fonts", "/run/host/user-fonts"].map(Into::into));
+        // Folders fontconfig is configured with (NixOS, Guix, custom setups).
+        for conf in fontconfig_files() {
+            if let Ok(text) = std::fs::read_to_string(&conf) {
+                dirs.extend(fontconfig_dirs(&text, env("XDG_DATA_HOME").as_deref(), home.as_deref()));
+            }
+        }
     }
+    let mut seen = std::collections::HashSet::new();
+    dirs.retain(|d| seen.insert(d.clone()));
     dirs
+}
+
+/// `<data dir>/fonts` for `XDG_DATA_HOME` (default `~/.local/share`) and each `XDG_DATA_DIRS`
+/// entry (default `/usr/local/share:/usr/share`).
+fn xdg_font_dirs(data_home: Option<&str>, data_dirs: Option<&str>, home: Option<&std::path::Path>) -> Vec<std::path::PathBuf> {
+    let mut v = vec![];
+    match data_home.filter(|d| !d.is_empty()) {
+        Some(d) => v.push(std::path::Path::new(d).join("fonts")),
+        None => {
+            if let Some(h) = home {
+                v.push(h.join(".local/share/fonts"));
+            }
+        }
+    }
+    let dirs = data_dirs.filter(|d| !d.is_empty()).unwrap_or("/usr/local/share:/usr/share");
+    v.extend(dirs.split(':').filter(|d| d.starts_with('/')).take(64).map(|d| std::path::Path::new(d).join("fonts")));
+    v
+}
+
+/// The fontconfig configuration files: `/etc/fonts/fonts.conf` and `/etc/fonts/conf.d/*.conf`.
+fn fontconfig_files() -> Vec<std::path::PathBuf> {
+    let mut v = vec![std::path::PathBuf::from("/etc/fonts/fonts.conf"), std::path::PathBuf::from("/etc/fonts/local.conf")];
+    if let Ok(entries) = std::fs::read_dir("/etc/fonts/conf.d") {
+        let mut files: Vec<_> = entries.flatten().map(|e| e.path()).filter(|p| p.extension().is_some_and(|x| x == "conf")).collect();
+        files.sort();
+        files.truncate(512);
+        v.extend(files);
+    }
+    v
+}
+
+/// The `<dir>` folders of a fontconfig file (`prefix="xdg"` is under `XDG_DATA_HOME`, a leading
+/// `~` under home; relative and `cachedir` entries are skipped).
+fn fontconfig_dirs(text: &str, data_home: Option<&str>, home: Option<&std::path::Path>) -> Vec<std::path::PathBuf> {
+    let mut v = vec![];
+    let mut rest = text;
+    while let Some(start) = rest.find("<dir") {
+        let after = &rest[start + 4..];
+        // `<dir>` or `<dir …>`, not `<dirname>`.
+        if !(after.starts_with('>') || after.starts_with(' ')) {
+            rest = after;
+            continue;
+        }
+        let Some(gt) = after.find('>') else { break };
+        let attrs = &after[..gt];
+        let body = &after[gt + 1..];
+        let Some(end) = body.find("</dir>") else { break };
+        let path = body[..end].trim();
+        rest = &body[end..];
+        if attrs.trim_end().ends_with('/') || path.is_empty() || v.len() >= 64 {
+            continue;
+        }
+        let p = if attrs.contains("prefix=\"xdg\"") {
+            let base = data_home.filter(|d| !d.is_empty()).map(std::path::PathBuf::from).or_else(|| home.map(|h| h.join(".local/share")));
+            base.map(|b| b.join(path))
+        } else if let Some(r) = path.strip_prefix("~/") {
+            home.map(|h| h.join(r))
+        } else if path.starts_with('/') {
+            Some(std::path::PathBuf::from(path))
+        } else {
+            None
+        };
+        v.extend(p);
+    }
+    v
 }
 
 /// One face found in a font file: index, family, style and (variable fonts) the named instance's
@@ -689,6 +797,8 @@ impl FontDb {
             loaded_families: Mutex::new(std::collections::HashSet::new()),
             #[cfg(not(target_arch = "wasm32"))]
             sys: Mutex::new(SysFallback { enabled: true, ..Default::default() }),
+            #[cfg(not(target_arch = "wasm32"))]
+            loading: Mutex::new(()),
         }
     }
 
@@ -754,14 +864,33 @@ impl FontDb {
     /// Add a user font (TTF/OTF/TTC bytes). Returns the number of faces added (0 if unparseable or
     /// every face was already present).
     pub fn add_font(&self, bytes: Vec<u8>) -> usize {
-        let data = Arc::new(bytes);
-        let mut added = 0;
-        for (i, family, style, coords) in enumerate_faces(&data) {
-            if self.read_faces().iter().any(|f| f.family.eq_ignore_ascii_case(&family) && f.style.eq_ignore_ascii_case(&style)) {
-                continue;
+        self.add_fonts(vec![bytes])
+    }
+
+    /// Add font files together: lookups see all of their faces or none, never part of a family.
+    /// Returns the number of faces added.
+    fn add_fonts(&self, files: Vec<Vec<u8>>) -> usize {
+        let present = |faces: &[Arc<FontFace>], family: &str, style: &str| {
+            faces.iter().any(|f| f.family.eq_ignore_ascii_case(family) && f.style.eq_ignore_ascii_case(style))
+        };
+        let mut new = Vec::new();
+        for bytes in files {
+            let data = Arc::new(bytes);
+            for (i, family, style, coords) in enumerate_faces(&data) {
+                if present(&self.read_faces(), &family, &style) {
+                    continue;
+                }
+                if let Some(f) = make_face(FontBytes::Owned(data.clone()), i, family, style, coords) {
+                    new.push(Arc::new(f));
+                }
             }
-            if let Some(f) = make_face(FontBytes::Owned(data.clone()), i, family, style, coords) {
-                self.faces.write().unwrap_or_else(|e| e.into_inner()).push(Arc::new(f));
+        }
+        let mut faces = self.faces.write().unwrap_or_else(|e| e.into_inner());
+        let mut added = 0;
+        for f in new {
+            // Checked again under the lock: another thread may have added the same face.
+            if !present(&faces, &f.family, &f.style) {
+                faces.push(f);
                 added += 1;
             }
         }
@@ -804,22 +933,39 @@ impl FontDb {
     #[cfg(not(target_arch = "wasm32"))]
     fn scan_font_dirs(&self) -> usize {
         let mut found = Vec::new();
-        let mut stack = self.font_dirs.clone();
+        let mut stack: Vec<(std::path::PathBuf, usize)> = self.font_dirs.iter().map(|d| (d.clone(), 0)).collect();
         // Each folder once, however links lead back to it.
         let mut visited = std::collections::HashSet::new();
-        while let Some(d) = stack.pop() {
+        let mut entries = 0usize;
+        while let Some((d, depth)) = stack.pop() {
             if !visited.insert(std::fs::canonicalize(&d).unwrap_or_else(|_| d.clone())) {
                 continue;
             }
             let Ok(rd) = std::fs::read_dir(&d) else { continue };
             for e in rd.flatten() {
+                // A link to `/` or a vast tree mustn't turn start-up into a disk crawl.
+                entries += 1;
+                if entries > MAX_SCAN_ENTRIES {
+                    log::warn!("font scan stopped after {MAX_SCAN_ENTRIES} entries");
+                    stack.clear();
+                    break;
+                }
                 let p = e.path();
-                if p.is_dir() {
-                    stack.push(p);
+                // Follows links: what matters is what the entry leads to.
+                let Ok(meta) = std::fs::metadata(&p) else { continue };
+                if meta.is_dir() {
+                    if depth < MAX_SCAN_DEPTH {
+                        stack.push((p, depth + 1));
+                    }
                     continue;
                 }
                 let ext = p.extension().and_then(|e| e.to_str()).map(|e| e.to_ascii_lowercase());
                 if !matches!(ext.as_deref(), Some("ttf" | "otf" | "ttc" | "otc")) {
+                    continue;
+                }
+                // Only regular files: opening a FIFO named like a font blocks until something
+                // writes to it (start-up hung), and a device never ends.
+                if !font_file_ok(&meta) {
                     continue;
                 }
                 for (family, style) in file_face_names(&p) {
@@ -833,9 +979,19 @@ impl FontDb {
         n
     }
 
-    /// Load the files of the installed `family`. Returns whether any face was added.
+    /// Load the files of the installed `family` (faces already loaded are kept). Returns whether
+    /// it is loaded.
     #[cfg(not(target_arch = "wasm32"))]
     fn load_cataloged(&self, family: &str) -> bool {
+        let loading = self.loading.lock().unwrap_or_else(|e| e.into_inner());
+        self.load_family(family, &loading)
+    }
+
+    /// [`FontDb::load_cataloged`] for a caller already holding `loading`.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn load_family(&self, family: &str, _loading: &std::sync::MutexGuard<'_, ()>) -> bool {
+        // Not skipped when some face of the family is loaded: a lookup by a Windows family name
+        // loads only that style's file, and the family's other files must still load later.
         let paths: Vec<std::path::PathBuf> = {
             let cat = self.read_catalog();
             let mut p: Vec<_> = cat.iter().filter(|c| c.family.eq_ignore_ascii_case(family)).map(|c| c.path.clone()).collect();
@@ -843,13 +999,8 @@ impl FontDb {
             p.dedup();
             p
         };
-        let mut any = false;
-        for p in paths {
-            if let Ok(data) = std::fs::read(&p) {
-                any |= self.add_font(data) > 0;
-            }
-        }
-        any
+        self.add_fonts(paths.iter().filter(|p| std::fs::metadata(p).is_ok_and(|m| font_file_ok(&m))).filter_map(|p| std::fs::read(p).ok()).collect());
+        self.is_loaded(family)
     }
 
     /// Resolve a family + style to a face, falling back to the closest style of the family, then to
@@ -1024,31 +1175,64 @@ impl FontDb {
         None
     }
 
+    /// A covering fallback accepted by the caller (for example, an interface that cannot use
+    /// colour or very large faces). Rejected faces do not stop the search for another face.
+    /// A policy-specific miss is not stored as a general document-font miss.
+    pub fn fallback_for_filtered(&self, c: char, exclude: u32, accept: impl Fn(&FontFace) -> bool) -> Option<Arc<FontFace>> {
+        if let Some(f) = self.loaded_fallback_filtered(c, exclude, &accept) {
+            return Some(f);
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        if self.system_fallback_filtered(c, &|f| f.id != exclude && accept(f), false) {
+            return self.loaded_fallback_filtered(c, exclude, &accept);
+        }
+        None
+    }
+
     fn loaded_fallback(&self, c: char, exclude: u32) -> Option<Arc<FontFace>> {
+        self.loaded_fallback_filtered(c, exclude, &|_| true)
+    }
+
+    fn loaded_fallback_filtered(&self, c: char, exclude: u32, accept: &impl Fn(&FontFace) -> bool) -> Option<Arc<FontFace>> {
         let faces = self.read_faces();
         let mut order: Vec<&Arc<FontFace>> = faces.iter().filter(|f| f.id != exclude).collect();
         order.sort_by_key(|f| (!f.family.eq_ignore_ascii_case(FALLBACK_FAMILY), f.italic, (f.weight - 400.0).abs() as i32));
-        order.into_iter().find(|f| f.covers(c)).cloned()
+        order.into_iter().find(|f| f.covers(c) && accept(f)).cloned()
     }
 
     /// Load a system font covering `c` (preferred fallback families first, then any cataloged
     /// file under 40 MB). Returns true if one was loaded. Misses are remembered.
     #[cfg(not(target_arch = "wasm32"))]
     pub(crate) fn system_fallback(&self, c: char) -> bool {
+        self.system_fallback_filtered(c, &|_| true, true)
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn system_fallback_filtered(&self, c: char, accept: &impl Fn(&FontFace) -> bool, remember_miss: bool) -> bool {
         if c.is_control() || c.is_whitespace() {
             return false;
         }
+        let seen = self.read_faces().len();
         {
             let sys = self.sys.lock().unwrap_or_else(|e| e.into_inner());
             if !sys.enabled || sys.misses.contains(&c) {
                 return false;
             }
         }
-        let covered = |db: &FontDb| db.read_faces().iter().any(|f| f.covers(c));
+        let covered = |db: &FontDb| db.read_faces().iter().any(|f| f.covers(c) && accept(f));
         let cataloged: Vec<String> = self.read_catalog().iter().map(|e| e.family.clone()).collect();
+        let loading = self.loading.lock().unwrap_or_else(|e| e.into_inner());
+        // Another thread may have loaded a face for `c` (faces are only ever added), or found
+        // there is none, while this one waited.
+        if self.read_faces().len() != seen && covered(self) {
+            return true;
+        }
+        if self.sys.lock().unwrap_or_else(|e| e.into_inner()).misses.contains(&c) {
+            return false;
+        }
         for fam in SYSTEM_FALLBACKS {
             if !self.is_loaded(fam) && cataloged.iter().any(|f| f.eq_ignore_ascii_case(fam)) {
-                self.load_cataloged(fam);
+                self.load_family(fam, &loading);
                 if covered(self) {
                     return true;
                 }
@@ -1068,7 +1252,9 @@ impl FontDb {
                 return true;
             }
         }
-        self.sys.lock().unwrap_or_else(|e| e.into_inner()).misses.insert(c);
+        if remember_miss {
+            self.sys.lock().unwrap_or_else(|e| e.into_inner()).misses.insert(c);
+        }
         false
     }
 
@@ -1239,5 +1425,55 @@ impl OutlinePen for FlipPen {
     }
     fn close(&mut self) {
         self.0.close_path();
+    }
+}
+
+#[cfg(test)]
+mod font_dir_tests {
+    use std::path::{Path, PathBuf};
+
+    use super::*;
+
+    #[test]
+    fn xdg_data_dirs_contribute_their_fonts_folders() {
+        let home = Path::new("/home/ann");
+        assert_eq!(
+            xdg_font_dirs(None, None, Some(home)),
+            [home.join(".local/share/fonts"), "/usr/local/share/fonts".into(), "/usr/share/fonts".into()]
+        );
+        let v = xdg_font_dirs(Some("/data/ann"), Some("/nix/profile/share:relative:/var/lib/flatpak/exports/share"), Some(home));
+        assert_eq!(v, [PathBuf::from("/data/ann/fonts"), "/nix/profile/share/fonts".into(), "/var/lib/flatpak/exports/share/fonts".into()]);
+    }
+
+    #[test]
+    fn fontconfig_dir_entries_are_read() {
+        let conf = r#"<?xml version="1.0"?>
+<fontconfig>
+  <dir>/usr/share/fonts</dir>
+  <dir prefix="xdg">fonts</dir>
+  <dir>~/.fonts</dir>
+  <dir>relative/fonts</dir>
+  <cachedir>/var/cache/fontconfig</cachedir>
+  <dirname>ignored</dirname>
+  <dir>/nix/store/abc-fonts/share/fonts</dir>
+</fontconfig>"#;
+        let home = Path::new("/home/ann");
+        let v = fontconfig_dirs(conf, None, Some(home));
+        assert_eq!(
+            v,
+            [PathBuf::from("/usr/share/fonts"), home.join(".local/share/fonts"), home.join(".fonts"), "/nix/store/abc-fonts/share/fonts".into()]
+        );
+        assert!(fontconfig_dirs("<dir>/never closed", None, Some(home)).is_empty());
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn linux_dirs_include_flatpak_host_fonts_without_duplicates() {
+        let d = system_font_dirs();
+        assert!(d.contains(&PathBuf::from("/run/host/user-fonts")));
+        let mut u = d.clone();
+        u.sort();
+        u.dedup();
+        assert_eq!(u.len(), d.len());
     }
 }
